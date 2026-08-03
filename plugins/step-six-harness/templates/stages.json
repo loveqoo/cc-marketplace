@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "prefix_format": "[{index}/6 {label}]",
+  "path_classes": {
+    "docs": ["docs/**"],
+    "dev": [".dev/**"],
+    "tests": ["tests/**", "test/**", "**/*_test.*", "**/*.test.*", "**/*.spec.*"],
+    "context": [".claude/**", "CLAUDE.md", "**/CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"]
+  },
+  "folder_rules": {
+    "dev_subdirs": [
+      "plan",
+      "learning",
+      "troubleshooting",
+      "retrospect",
+      "log",
+      "experiment",
+      "scratch"
+    ],
+    "docs_subdirs": ["spec", "adr", "retrospect"],
+    "numbered_name_pattern": "^[0-9]{3}-[a-z0-9][a-z0-9-]*\\.md$",
+    "new_toplevel_dir_stages": ["scaffolding"]
+  },
+  "stages": [
+    {
+      "id": "scaffolding",
+      "label": "Scaffolding",
+      "summary": "작업할 구조인지 확인하고, 필요하면 이때 구조를 바꾼다. 역할별 폴더링.",
+      "write": ["source", "tests", "context", "dev"],
+      "exit_criteria": [],
+      "stop_requires": []
+    },
+    {
+      "id": "context",
+      "label": "Context",
+      "summary": "유저/프로젝트/폴더 스코프로 계층 기록. 전부 싣지 말고 '이럴 때 이걸 봐라'로 유도.",
+      "write": ["context", "dev"],
+      "exit_criteria": [],
+      "stop_requires": []
+    },
+    {
+      "id": "planning",
+      "label": "Planning",
+      "summary": "모호한 지점을 질문으로 끌어내고 계획을 파일로 떨군다. 인간 검토·승인 후 실행.",
+      "write": ["dev", "context"],
+      "exit_criteria": ["plan_file", "plan_approved"],
+      "stop_requires": []
+    },
+    {
+      "id": "execution",
+      "label": "Execution",
+      "summary": "계획대로 실행. 중요 기능은 테스트로 먼저 동작 확인. 병렬·Ralph Loop 고려.",
+      "write": ["source", "tests", "dev"],
+      "exit_criteria": [],
+      "stop_requires": []
+    },
+    {
+      "id": "verification",
+      "label": "Verification",
+      "summary": "완료 조건 대조. 자기검증 회피 — 서브에이전트/타 모델/브라우저/dry-run.",
+      "write": ["tests", "dev"],
+      "exit_criteria": ["verification_evidence"],
+      "stop_requires": ["verification_evidence"]
+    },
+    {
+      "id": "compounding",
+      "label": "Compounding",
+      "summary": "회고를 기록. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
+      "write": ["dev", "context", "tests"],
+      "exit_criteria": ["retro_file"],
+      "stop_requires": ["retro_file"]
+    }
+  ],
+  "evidence_signals": {
+    "plan_file": { "write_glob": [".dev/plan/**/*.md"] },
+    "retro_file": {
+      "write_glob": [".dev/retrospect/**/*.md", ".dev/learning/**/*.md"]
+    },
+    "verification_evidence": {
+      "bash_pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?test\\b|\\bpytest\\b|\\bgo\\s+test\\b|\\bcargo\\s+test\\b|\\bmake\\s+(test|check|lint)\\b|\\bvitest\\b|\\bjest\\b|\\bruff\\b|\\bmypy\\b|\\btsc\\b|--dry-run\\b",
+      "tools": ["Agent", "Task"],
+      "tool_pattern": "^mcp__claude-in-chrome__|^mcp__playwright__"
+    }
+  }
+}

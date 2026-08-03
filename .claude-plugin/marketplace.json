@@ -1,0 +1,18 @@
+{
+  "name": "cc-marketplace",
+  "description": "Claude Code plugin marketplace",
+  "owner": {
+    "name": "loveqoo",
+    "email": "gunam.jung@gmail.com",
+    "url": "https://github.com/loveqoo"
+  },
+  "plugins": [
+    {
+      "name": "step-six-harness",
+      "source": "./plugins/step-six-harness",
+      "description": "6단계 선형 작업 원칙을 훅으로 강제하는 하네스. 폴더 규칙 가드, 스킵 사유·승인 요구, 검증 증거 없이 단계 종료 차단.",
+      "category": "workflow",
+      "keywords": ["harness", "workflow", "guardrails", "hooks"]
+    }
+  ]
+}
