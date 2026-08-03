@@ -417,7 +417,7 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
         "이 단계 쓰기 허용: %s. `.dev/` 산출물 파일명은 `%s-` 로 시작해야 한다. "
         "근거 문서: `.claude/harness/rationale.md`"
         % (", ".join(stage.get("write", [])) or "(없음)", lid),
-        "모든 답변 말머리에 [%s] 를 붙여라." % label_of(cfg, sid),
+        "모든 답변 말머리에 [%s] 를 붙여라." % stage["label"],
     ]
     if stage.get("hint"):
         lines.append(stage["hint"])
@@ -620,15 +620,18 @@ def hook_stop(inp, con, cfg, root, lid, sid):
 
     problems = []
     if msg:
-        # 이 프롬프트 동안 관여한 단계의 말머리는 모두 허용한다 (턴 중 전이 대응)
+        # 번호가 아니라 단계 이름으로 검증한다. 번호만 보면 `[3/6` 처럼 라벨을 빼도
+        # 통과해서 "현재 단계를 표시한다"는 목적이 달성되지 않는다.
+        # 이 프롬프트 동안 관여한 단계의 이름은 모두 허용한다 (턴 중 전이 대응).
         seen = [r["stage"] for r in con.execute(
             "SELECT stage FROM prompt_stage WHERE prompt_id=?", (prompt_id,))]
-        ok = {stage_index(cfg, s) + 1 for s in seen + [sid]}
-        m = re.match(r"^\[\s*(\d+)\s*/\s*\d+", msg)
-        if not m or int(m.group(1)) not in ok:
+        allowed = {stage_obj(cfg, s)["label"].lower() for s in seen + [sid]}
+        m = re.match(r"^\[([^\]]{1,60})\]", msg)
+        inside = m.group(1).lower() if m else ""
+        if not m or not any(lbl in inside for lbl in allowed):
             problems.append(("prefix",
-                "말머리에 [%s] 를 표시하지 않았다. 현재 단계를 말머리에 붙여 다시 답하라."
-                % label_of(cfg, sid)))
+                "말머리에 [%s] 를 표시하지 않았다. 현재 단계 이름을 대괄호로 감싸 "
+                "맨 앞에 붙여 다시 답하라." % stage["label"]))
     for key in stage.get("stop_requires", []):
         if not has_evidence(con, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"

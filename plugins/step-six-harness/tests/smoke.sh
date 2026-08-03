@@ -123,6 +123,16 @@ setstage execution
 check_empty "그 턴에 관여한 단계의 말머리는 통과" "$(hook "$(STOP pz '[1/6 Scaffolding] 완료')")"
 check "무관한 단계 말머리는 차단" '"decision": "block"' "$(hook "$(STOP pz2 '[2/6 Context] 완료')")"
 
+echo "== 말머리는 번호가 아니라 단계 이름으로 검증한다"
+check_empty "이름만 써도 통과" "$(hook "$(STOP pn1 '[Execution] 완료')")"
+check_empty "대소문자 무시" "$(hook "$(STOP pn2 '[execution] 완료')")"
+check_empty "번호를 함께 써도 통과" "$(hook "$(STOP pn3 '[4/6 Execution] 완료')")"
+check "이름 없이 번호만 쓰면 차단" '"decision": "block"' "$(hook "$(STOP pn4 '[4/6] 완료')")"
+check "닫는 대괄호가 없으면 차단" '"decision": "block"' "$(hook "$(STOP pn5 '[4/6 Execution 완료')")"
+check "다른 단계 이름은 차단" '"decision": "block"' "$(hook "$(STOP pn6 '[Planning] 완료')")"
+check "차단 메시지가 이름만 제시한다" '\[Execution\] 를 표시하지 않았다' \
+  "$(hook "$(STOP pn7 '말머리 없음')")"
+
 echo "== 턴 종료 게이트와 상한 소진 노출"
 setstage verification
 check "1회차 차단" '검증 증거가 없다' "$(hook "$(STOP pv '[5/6 Verification] 끝')")"

@@ -62,7 +62,10 @@ description: 6단계 작업 하네스의 현재 단계를 확인하고 제어한
 
 ## 규칙
 
-- 모든 답변 말머리에 `[N/6 StageName]` 을 붙인다. 없으면 턴 종료가 차단된다.
+- 모든 답변 말머리에 현재 단계 이름을 붙인다 — `[Scaffolding]` `[Context]` `[Planning]`
+  `[Execution]` `[Verification]` `[Compounding]`. 없으면 턴 종료가 차단된다.
+  대소문자는 무시되고(`[compounding]` 도 통과), 번호를 함께 써도 된다(`[6/6 Compounding]`).
+  이름 없이 번호만 쓰면(`[6/6]`) 차단된다.
 - `.dev/` 산출물 파일명은 현재 루프 해시로 시작해야 한다: `.dev/plan/260804-a3f9c1-이름.md`.
   `scratch/` 만 예외다. 해시는 `status` 나 `loop` 로 확인한다.
 - 상태 DB(`.claude/harness/harness.db`)는 커밋하지 않는 런타임 전용이고 루프가 닫히면 그
