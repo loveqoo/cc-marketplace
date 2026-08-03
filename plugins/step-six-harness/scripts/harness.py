@@ -363,9 +363,8 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
     stage = stage_obj(cfg, sid)
     lines = [
         "[harness] loop %s · 단계 %s — %s" % (lid, label_of(cfg, sid), stage["summary"]),
-        "제어: `.claude/harness/bin/harness` {status | advance | "
-        "skip <stage|+N|until:<stage>> --reason \"...\" | allow <glob> --reason \"...\" | "
-        "approve-plan <file>}",
+        "제어: `.claude/harness/bin/harness` {status | advance | skip <대상> --reason \"...\"} "
+        "· 나머지 명령은 `harness help`",
         "이 단계 쓰기 허용: %s. `.dev/` 산출물 파일명은 `%s-` 로 시작해야 한다. "
         "근거 문서: `.claude/harness/rationale.md`"
         % (", ".join(stage.get("write", [])) or "(없음)", lid),
@@ -982,8 +981,8 @@ def run_cli(argv):
             print("활성 루프가 없어 새로 만들었다: %s" % lid)
         fn = CLI.get(cmd)
         if not fn:
-            print("알 수 없는 명령: %s (%s)" % (cmd, ", ".join(sorted(CLI))),
-                  file=sys.stderr)
+            print("알 수 없는 명령: %s\n사용 가능: %s\n전체 사용법은 `harness help`."
+                  % (cmd, ", ".join(sorted(CLI))), file=sys.stderr)
             return 2
         return fn(con, cfg, root, lid, sid, argv[1:])
     finally:
@@ -1055,10 +1054,45 @@ def cli_init(argv):
     return 0
 
 
+USAGE = """step-six-harness — 6단계 작업 하네스 (Scaffolding → Context → Planning →
+                                Execution → Verification → Compounding)
+
+현재 상태
+  status                       현재 루프·단계·종료 조건·증거·스킵 기록·예외
+  loop                         루프 해시(= .dev/ 파일명 접두사)와 브랜치
+
+단계 진행
+  advance                      다음 단계로. 종료 조건이 남으면 거부하고 무엇이 남았는지 알려준다
+  skip <대상> --reason "..."    단계 건너뛰기 ✋
+                               대상: <stage-id> | +N (N단계 전진) | until:<stage-id>
+  approve-plan <file>          계획에 대한 사람의 승인 기록 ✋
+
+예외
+  allow <glob> --reason "..." [--uses N]
+                               쓰기 금지 경로(docs/ 등)에 예외 등록 ✋
+  auto-skip on --reason "..." [--uses N] [--scope loop|project]
+                               스킵 동의 다이얼로그를 끈다 ✋ (범위를 좁히는 것을 권한다)
+  auto-skip off | status       자동 승인 해제 / 현재 상태
+
+루프
+  loop new [--intent "..."]    루프를 닫고 새 해시로 시작
+  loop adopt <hash> --reason "..."
+                               DB를 잃었을 때 기존 해시로 재연결 ✋
+
+설치
+  init [path]                  이 프로젝트에 하네스 설치
+
+✋ = 사용자 승인 다이얼로그가 뜬다. 모델은 스스로 승인할 수 없다.
+
+명령을 외울 필요는 없다 — 차단당하면 훅이 실행할 명령을 그대로 알려준다.
+단계 정의·폴더 규칙: .claude/harness/stages.json
+왜 이렇게 통제하는가: .claude/harness/rationale.md"""
+
+
 def main():
     argv = sys.argv[1:]
-    if not argv:
-        print(__doc__)
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(USAGE)
         return 0
     if argv[0] == "hook":
         return run_hook()
