@@ -620,18 +620,19 @@ def hook_stop(inp, con, cfg, root, lid, sid):
 
     problems = []
     if msg:
-        # 번호가 아니라 단계 이름으로 검증한다. 번호만 보면 `[3/6` 처럼 라벨을 빼도
-        # 통과해서 "현재 단계를 표시한다"는 목적이 달성되지 않는다.
+        # 단계 이름과 **정확히** 일치해야 한다. 번호 병기(`[4/6 Execution]`)는 이름에서
+        # 도출되는 중복 정보라 허용하지 않는다. 정확 일치라서 한 이름이 다른 이름의
+        # 부분 문자열일 때 생기는 오탐도 없다.
         # 이 프롬프트 동안 관여한 단계의 이름은 모두 허용한다 (턴 중 전이 대응).
         seen = [r["stage"] for r in con.execute(
             "SELECT stage FROM prompt_stage WHERE prompt_id=?", (prompt_id,))]
         allowed = {stage_obj(cfg, s)["label"].lower() for s in seen + [sid]}
         m = re.match(r"^\[([^\]]{1,60})\]", msg)
-        inside = m.group(1).lower() if m else ""
-        if not m or not any(lbl in inside for lbl in allowed):
+        inside = m.group(1).strip().lower() if m else ""
+        if inside not in allowed:
             problems.append(("prefix",
-                "말머리에 [%s] 를 표시하지 않았다. 현재 단계 이름을 대괄호로 감싸 "
-                "맨 앞에 붙여 다시 답하라." % stage["label"]))
+                "말머리는 [%s] 여야 한다. 단계 이름만 대괄호로 감싸 맨 앞에 붙여라 "
+                "(번호 병기 불가)." % stage["label"]))
     for key in stage.get("stop_requires", []):
         if not has_evidence(con, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"

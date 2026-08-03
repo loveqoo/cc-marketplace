@@ -120,26 +120,30 @@ echo "== 결함 B 회귀: 턴 중 단계 전이 시 이전 말머리 허용"
 setstage scaffolding
 hook '{"hook_event_name":"PreToolUse","cwd":"'"$WORK"'","prompt_id":"pz","tool_name":"Read","tool_input":{}}' >/dev/null
 setstage execution
-check_empty "그 턴에 관여한 단계의 말머리는 통과" "$(hook "$(STOP pz '[1/6 Scaffolding] 완료')")"
-check "무관한 단계 말머리는 차단" '"decision": "block"' "$(hook "$(STOP pz2 '[2/6 Context] 완료')")"
+check_empty "그 턴에 관여한 단계의 말머리는 통과" "$(hook "$(STOP pz '[Scaffolding] 완료')")"
+check "무관한 단계 말머리는 차단" '"decision": "block"' "$(hook "$(STOP pz2 '[Context] 완료')")"
 
 echo "== 말머리는 번호가 아니라 단계 이름으로 검증한다"
 check_empty "이름만 써도 통과" "$(hook "$(STOP pn1 '[Execution] 완료')")"
 check_empty "대소문자 무시" "$(hook "$(STOP pn2 '[execution] 완료')")"
-check_empty "번호를 함께 써도 통과" "$(hook "$(STOP pn3 '[4/6 Execution] 완료')")"
-check "이름 없이 번호만 쓰면 차단" '"decision": "block"' "$(hook "$(STOP pn4 '[4/6] 완료')")"
-check "닫는 대괄호가 없으면 차단" '"decision": "block"' "$(hook "$(STOP pn5 '[4/6 Execution 완료')")"
-check "다른 단계 이름은 차단" '"decision": "block"' "$(hook "$(STOP pn6 '[Planning] 완료')")"
-check "차단 메시지가 이름만 제시한다" '\[Execution\] 를 표시하지 않았다' \
-  "$(hook "$(STOP pn7 '말머리 없음')")"
+check_empty "앞뒤 공백 허용" "$(hook "$(STOP pn3 '[ Execution ] 완료')")"
+check "번호를 병기하면 차단 (중복 정보)" '"decision": "block"' \
+  "$(hook "$(STOP pn4 '[4/6 Execution] 완료')")"
+check "이름 없이 번호만 쓰면 차단" '"decision": "block"' "$(hook "$(STOP pn5 '[4/6] 완료')")"
+check "닫는 대괄호가 없으면 차단" '"decision": "block"' "$(hook "$(STOP pn6 '[Execution 완료')")"
+check "다른 단계 이름은 차단" '"decision": "block"' "$(hook "$(STOP pn7 '[Planning] 완료')")"
+check "이름이 다른 이름을 포함해도 정확 일치만" '"decision": "block"' \
+  "$(hook "$(STOP pn8 '[Execution 단계] 완료')")"
+check "차단 메시지가 형식을 제시한다" '\[Execution\] 여야 한다' \
+  "$(hook "$(STOP pn9 '말머리 없음')")"
 
 echo "== 턴 종료 게이트와 상한 소진 노출"
 setstage verification
-check "1회차 차단" '검증 증거가 없다' "$(hook "$(STOP pv '[5/6 Verification] 끝')")"
-check "2회차 차단 (limit 2)" '"decision": "block"' "$(hook "$(STOP pv '[5/6 Verification] 끝')")"
-check "3회차는 우회를 사용자에게 노출" 'systemMessage' "$(hook "$(STOP pv '[5/6 Verification] 끝')")"
+check "1회차 차단" '검증 증거가 없다' "$(hook "$(STOP pv '[Verification] 끝')")"
+check "2회차 차단 (limit 2)" '"decision": "block"' "$(hook "$(STOP pv '[Verification] 끝')")"
+check "3회차는 우회를 사용자에게 노출" 'systemMessage' "$(hook "$(STOP pv '[Verification] 끝')")"
 hook '{"hook_event_name":"PostToolUse","cwd":"'"$WORK"'","tool_name":"Bash","tool_input":{"command":"npm test"}}' >/dev/null
-check_empty "증거 적립 후 통과" "$(hook "$(STOP pv2 '[5/6 Verification] 끝')")"
+check_empty "증거 적립 후 통과" "$(hook "$(STOP pv2 '[Verification] 끝')")"
 
 echo "== docs 예외"
 setstage scaffolding
