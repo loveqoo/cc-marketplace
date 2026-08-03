@@ -23,7 +23,7 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
    | `.claude/harness/POLICY.md` | ✅ | 6단계 원칙 요약 — 매 세션 로드됨 |
    | `.claude/harness/rationale.md` | ✅ | 상세 근거 — 필요할 때만 읽힘 |
    | `.claude/harness/stages.json` | ✅ | 단계 정의·폴더 규칙의 단일 출처 |
-   | `.claude/harness/state.json` | ❌ | 기계 상태 (gitignore 등록됨) |
+   | `.claude/harness/harness.db` | ❌ | SQLite 런타임 상태 — 해시 발급 + 현재 단계. gitignore 등록됨 |
    | `.claude/harness/bin/harness` | ❌ | 래퍼 (세션마다 자동 갱신) |
 
 3. `git diff` 로 CLAUDE.md 변경이 1줄인지 확인시킨다.
@@ -32,6 +32,8 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
    - `folder_rules.dev_subdirs` — `.dev/` 하위 허용 폴더
    - `stages[].write` — 단계별 쓰기 허용 클래스
    - `stages[].stop_requires` — 턴 종료를 막을 조건
+   - `stop_block_limits` — 조건별 턴 종료 차단 상한 (소진 시 사용자에게 노출됨)
+   - `folder_rules.loop_prefixed_dirs` — 파일명에 루프 해시를 강제할 `.dev/` 하위 폴더
    - `path_classes` — 경로 → 클래스 매핑 (예: `src/` 를 별도 클래스로 분리)
 
 5. 훅을 현재 세션에 적용하려면 `/reload-plugins` 가 필요함을 알린다.

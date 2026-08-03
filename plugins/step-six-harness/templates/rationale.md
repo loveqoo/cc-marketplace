@@ -67,6 +67,32 @@
 
 기록만 하고 승격하지 않으면 복리가 아니라 일기다.
 
+## 상태와 시퀀스: 왜 해시이고, 왜 DB를 커밋하지 않는가
+
+6단계 한 바퀴가 **작업 루프** 하나이고, 루프는 `260804-a3f9c1` 같은 해시로 식별된다.
+이 해시가 `.dev/` 산출물 파일명의 접두사가 된다.
+
+`001, 002` 처럼 증가하는 번호를 쓰지 않는 이유는 **다음 번호를 알려면 다른 워크트리의
+상태를 읽어야 하기 때문**이다. 병행 작업 중인 두 워크트리는 서로를 볼 수 없으니 둘 다
+`003` 을 만들고 머지 시점에 충돌한다. 해시는 조정이 필요 없다.
+
+상태는 `.claude/harness/harness.db` (SQLite)가 갖는다. 이 DB의 역할은 딱 두 가지다 —
+**해시 발급과 현재 상태 제어.** 루프가 닫히면 그 루프의 행은 버린다. 영구 기록은 각 폴더에
+남은 파일이고, 파일명이 해시를 갖고 있으니 그게 시퀀스이자 인덱스다.
+
+그래서 DB는 커밋하지 않는다(gitignore). 얻는 것:
+
+- 워크트리마다 자기 단계를 독립적으로 갖는다. 다른 브랜치의 "현재 단계"가 머지로 흘러들어오지 않는다.
+- 바이너리 파일이 git 히스토리를 불리지 않는다. 머지 충돌도 원리적으로 없다.
+- 지워도 된다. `harness status` 가 새 루프를 만들고, 기존 해시로 되돌아가려면
+  `harness loop adopt <해시>` 를 쓴다.
+- 병렬 툴 호출로 훅이 동시에 발화해도 트랜잭션이 쓰기를 직렬화한다. 단일 JSON 파일이었다면
+  read-modify-write 경합으로 증거가 유실됐다.
+
+**한 가지 대가**: 스킵된 단계는 파일을 남기지 않으므로, 루프가 닫히면 "무엇을 왜 건너뛰었나"만
+사라진다. 그래서 Compounding 단계에 진입할 때 하네스가 스킵 기록을 노출한다 — 회고 md 로
+옮겨 적으면 그 사실이 git 에 남는다. 회고는 원래 그걸 적는 자리다.
+
 ## 하네스가 강제하는 것과 하지 않는 것
 
 훅은 확정적인 사실만 판정할 수 있다. 그래서 역할을 나눈다.
@@ -79,11 +105,16 @@
 | 단계별 쓰기 허용 경로 | 차단 |
 | 신규 최상위 폴더 | Scaffolding 외 차단 |
 | `.dev/` 하위 폴더명, `docs/**/NNN-name.md` | 차단 |
+| `.dev/` 산출물 파일명에 루프 해시 접두사 없음 | 차단 |
 | 계획 파일 + 사람의 승인 없이 Planning 종료 | `advance` 거부 |
 | 검증 증거 없이 Verification 종료 | 턴 종료 차단 |
 | 회고 기록 없이 Compounding 종료 | 턴 종료 차단 |
 | 사유 없는 스킵 | 차단 · 사유 있으면 사용자 승인 다이얼로그 |
-| 말머리에 단계 미표시 | 턴 종료 차단(프롬프트당 1회) |
+| 말머리에 단계 미표시 | 턴 종료 차단 |
+
+턴 종료 차단에는 상한이 있다(`stages.json` 의 `stop_block_limits`). 무한 루프를 막기 위한
+것이고, 상한을 소진해 통과할 때는 **`systemMessage` 로 사용자에게 그 사실을 노출한다** —
+조용한 우회가 없는 게 상한을 없애는 것보다 중요하다.
 
 **훅이 판정하지 않는다 (판단 영역)**
 
@@ -99,7 +130,10 @@
 .claude/harness/bin/harness advance                             # 다음 단계 (조건 미충족이면 거부)
 .claude/harness/bin/harness skip <stage|+N|until:<stage>> --reason "..."   # 사용자 승인 필요
 .claude/harness/bin/harness allow "docs/spec/003-x.md" --reason "..."      # 쓰기 예외, 사용자 승인 필요
-.claude/harness/bin/harness approve-plan .dev/plan/003-x.md      # 계획 승인 기록
+.claude/harness/bin/harness approve-plan .dev/plan/<해시>-x.md   # 계획 승인 기록
+.claude/harness/bin/harness loop                                 # 현재 루프 해시·브랜치
+.claude/harness/bin/harness loop new --intent "..."              # 루프를 닫고 새로 시작
+.claude/harness/bin/harness loop adopt <해시> --reason "..."      # 기존 해시로 재연결
 ```
 
 차단은 하네스가 틀렸다는 신호일 수도 있다. 규칙 자체가 작업을 방해한다면 그것을 Compounding에서

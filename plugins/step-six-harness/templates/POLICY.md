@@ -16,14 +16,15 @@
 | --- | --- |
 | `docs/` | **사람이 기록한다.** 아키텍처·컨벤션·스펙. 명시적 승인 없이 수정하지 않는다. `spec/`, `adr/`, `retrospect/` 는 `NNN-name.md` |
 | `tests/` | 검증에 필요한 모든 파일 |
-| `.dev/` | 작업의 흔적: `plan/`, `learning/`, `troubleshooting/`, `retrospect/`, `log/`, `experiment/`, `scratch/` |
+| `.dev/` | 작업의 흔적: `plan/`, `learning/`, `troubleshooting/`, `retrospect/`, `log/`, `experiment/`, `scratch/`. 파일명은 **`<루프해시>-이름.md`** (`scratch/` 제외) |
 | `.claude/` | Claude 설정 |
 
 ## 지켜야 할 점
 
 1. **말머리에 현재 단계를 표시한다** — 예: `[4/6 Execution]`. 표시하지 않으면 턴 종료가 차단된다.
 2. **스킵은 사유와 사람의 승인이 필요하다** — 작업 성격상 불필요한 단계는 건너뛸 수 있으나, 사유를 반드시 노출하고 승인을 받는다: `.claude/harness/bin/harness skip <stage|+N|until:<stage>> --reason "..."`
-3. **당장의 구현 이득보다 구조를 바꾸는 쪽을 택한다** — 올바른 구조가 올바른 구현을 만들고 예측 가능하게 한다. 구조 변경 비용은 미래를 위한 투자다. 매번 수정을 반복하며 헛돌면 신뢰 비용이 급강하한다.
+3. **산출물 파일명에 루프 해시를 붙인다** — 6단계 한 바퀴가 하나의 작업 루프이고 해시가 그 식별자다. `001, 002` 같은 증가 번호는 워크트리로 병행 작업하면 충돌한다. 현재 해시는 `harness status` 로 확인한다.
+4. **당장의 구현 이득보다 구조를 바꾸는 쪽을 택한다** — 올바른 구조가 올바른 구현을 만들고 예측 가능하게 한다. 구조 변경 비용은 미래를 위한 투자다. 매번 수정을 반복하며 헛돌면 신뢰 비용이 급강하한다.
 
 제어: `.claude/harness/bin/harness {status | advance | skip | allow | approve-plan}`
 각 원칙의 상세 근거와 판단 기준: `.claude/harness/rationale.md` (필요할 때 읽어라)

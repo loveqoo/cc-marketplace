@@ -19,7 +19,20 @@
     ],
     "docs_subdirs": ["spec", "adr", "retrospect"],
     "numbered_name_pattern": "^[0-9]{3}-[a-z0-9][a-z0-9-]*\\.md$",
-    "new_toplevel_dir_stages": ["scaffolding"]
+    "new_toplevel_dir_stages": ["scaffolding"],
+    "loop_prefixed_dirs": [
+      "plan",
+      "learning",
+      "troubleshooting",
+      "retrospect",
+      "log",
+      "experiment"
+    ]
+  },
+  "stop_block_limits": {
+    "prefix": 1,
+    "verification_evidence": 2,
+    "retro_file": 2
   },
   "stages": [
     {

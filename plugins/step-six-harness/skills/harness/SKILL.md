@@ -23,7 +23,9 @@ description: 6단계 작업 하네스의 현재 단계를 확인하고 제어한
 
 | `allow <glob> --reason "..." [--uses N]` | 쓰기 금지 경로에 예외 등록 (`docs/` 등) | ✅ 다이얼로그 |
 | `approve-plan <file>` | 계획에 대한 사람의 승인 기록 | ✅ 다이얼로그 |
-| `cycle` | Compounding 완료 후 새 사이클 시작 (`advance` 가 자동 호출) | |
+| `loop` | 현재 루프 해시·브랜치. `.dev/` 파일명 접두사가 이 해시다 | |
+| `loop new --intent "..."` | 루프를 닫고 새 해시로 시작 (`advance` 가 6단계 끝에서 자동 호출) | |
+| `loop adopt <hash> --reason "..."` | DB를 잃었을 때 기존 해시로 재연결 | ✅ 다이얼로그 |
 
 ## 차단당했을 때
 
@@ -38,6 +40,10 @@ description: 6단계 작업 하네스의 현재 단계를 확인하고 제어한
 ## 규칙
 
 - 모든 답변 말머리에 `[N/6 StageName]` 을 붙인다. 없으면 턴 종료가 차단된다.
+- `.dev/` 산출물 파일명은 현재 루프 해시로 시작해야 한다: `.dev/plan/260804-a3f9c1-이름.md`.
+  `scratch/` 만 예외다. 해시는 `status` 나 `loop` 로 확인한다.
+- 상태 DB(`.claude/harness/harness.db`)는 커밋하지 않는 런타임 전용이고 루프가 닫히면 그
+  루프의 행은 버려진다. 영구 기록은 파일명에 해시가 박힌 md 파일들이다.
 - 스킵 사유는 반드시 노출한다. 사유 없는 `skip` 은 거부된다.
 - `bypassPermissions` 모드에서는 동의 다이얼로그가 뜨지 않으므로 `skip`/`allow`/`approve-plan`
   이 모두 거부된다. 권한 모드를 낮추고 다시 시도한다.
