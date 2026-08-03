@@ -55,7 +55,7 @@ EVIDENCE_STAGES = ("execution", "verification")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS loop (
-  id TEXT PRIMARY KEY, intent TEXT, branch TEXT, created_at TEXT);
+  id TEXT PRIMARY KEY, intent TEXT, branch TEXT, created_at TEXT, closed_at TEXT);
 CREATE TABLE IF NOT EXISTS stage (
   loop_id TEXT, stage TEXT, status TEXT,
   entered_at TEXT, left_at TEXT, reason TEXT, authorized_by TEXT,
@@ -69,7 +69,22 @@ CREATE TABLE IF NOT EXISTS wgrant (
 CREATE TABLE IF NOT EXISTS stop_block (prompt_id TEXT, key TEXT, at TEXT);
 CREATE TABLE IF NOT EXISTS prompt_stage (
   prompt_id TEXT, stage TEXT, at TEXT, PRIMARY KEY (prompt_id, stage));
+-- 관측 기록. 루프가 닫혀도 남는다. 복리의 원료이며 모델의 자기신고가 아니다.
+CREATE TABLE IF NOT EXISTS event (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, loop_id TEXT, stage TEXT,
+  kind TEXT, rule TEXT, target TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS event_kind_idx ON event(kind, rule);
+CREATE INDEX IF NOT EXISTS event_target_idx ON event(target);
 """
+
+EVENT_KINDS = {
+    "block": "규칙 차단",
+    "skip": "단계 스킵",
+    "stop_gate": "종료 조건 미충족",
+    "bypass": "게이트 우회",
+    "tool_fail": "도구 실패",
+    "edit": "파일 편집",
+}
 
 
 # --------------------------------------------------------------------------- io
@@ -190,10 +205,15 @@ def create_loop(con, cfg, root, intent=None, loop_id=None):
 
 
 def close_loop(con, lid):
-    """루프의 모든 행을 버린다. 영구 기록은 폴더의 파일명이 갖고 있다."""
+    """루프의 작업 상태를 버린다. 영구 기록은 폴더의 파일명이 갖고 있다.
+
+    남기는 것: loop 인덱스(해시·의도·기간)와 event(관측 기록).
+    event 를 버리면 복리의 원료가 사라지고, loop 인덱스가 없으면 event 가
+    어느 작업의 것인지 알 수 없다. 버리는 것은 진행 중 상태뿐이다.
+    """
     for tbl in ("stage", "evidence", "wgrant"):
         con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
-    con.execute("DELETE FROM loop WHERE id=?", (lid,))
+    con.execute("UPDATE loop SET closed_at=? WHERE id=?", (now(), lid))
 
 
 def active_stage(con, lid):
@@ -213,6 +233,26 @@ def skips_of(con, lid):
 
 
 # --------------------------------------------------------------------- evidence
+
+def record_event(con, lid, sid, kind, rule=None, target=None, detail=None):
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (now(), lid, sid, kind, rule, target,
+                 detail[:400] if detail else None))
+
+
+def norm_cmd(cmd):
+    """도구 실패를 세려면 명령을 안정된 키로 정규화해야 한다."""
+    toks = re.findall(r"[^\s|;&<>]+", cmd or "")
+    if not toks:
+        return ""
+    head = toks[0].split("/")[-1]
+    multi = ("npm", "pnpm", "yarn", "bun", "git", "go", "cargo", "make",
+             "python", "python3", "uv", "docker", "kubectl", "gh")
+    if head in multi and len(toks) > 1 and not toks[1].startswith("-"):
+        return "%s %s" % (head, toks[1])
+    return head
+
 
 def has_evidence(con, lid, kind):
     return con.execute("SELECT 1 FROM evidence WHERE loop_id=? AND kind=? LIMIT 1",
@@ -286,34 +326,41 @@ def new_toplevel_dir(root, rel):
 
 
 def check_write(con, cfg, root, lid, sid, rel):
-    """(decision, reason). decision None 이면 판정하지 않음."""
+    """(decision, reason). decision None 이면 판정하지 않음.
+
+    차단은 event 에 적립한다 — 어떤 규칙에 몇 번 걸리는지가 복리의 원료다.
+    """
     stage = stage_obj(cfg, sid)
     lbl = label_of(cfg, sid)
     cls = classify(rel, cfg)
     rules = cfg.get("folder_rules", {})
     grant = find_grant(con, lid, rel)
 
+    def deny(rule, reason):
+        record_event(con, lid, sid, "block", rule, rel, reason)
+        return "deny", reason
+
     # 1. docs/ 는 인간 소유
     if cls == "docs" and not grant:
-        return "deny", (
+        return deny("docs_readonly", (
             "docs/ 는 사람이 기록하는 영역이라 하네스가 쓰기를 막는다 (%s). "
             "정말 필요하면 사용자에게 승인을 받아라: "
-            "`.claude/harness/bin/harness allow \"%s\" --reason \"...\"`" % (rel, rel))
+            "`.claude/harness/bin/harness allow \"%s\" --reason \"...\"`" % (rel, rel)))
 
     # 2. 단계별 쓰기 허용 클래스
     if cls not in stage.get("write", []) and not grant:
-        return "deny", (
+        return deny("stage_write", (
             "현재 단계 %s 에서는 '%s' 클래스 경로에 쓸 수 없다 (%s). 허용: %s. "
             "단계를 진행하려면 `.claude/harness/bin/harness advance`, "
             "건너뛰려면 `... skip <stage> --reason \"...\"`."
-            % (lbl, cls, rel, ", ".join(stage.get("write", [])) or "(없음)"))
+            % (lbl, cls, rel, ", ".join(stage.get("write", [])) or "(없음)")))
 
     # 3. 신규 최상위 폴더는 Scaffolding 에서만 (승인된 구조 영역은 제외)
     top = new_toplevel_dir(root, rel) if cls == "source" else None
     if top and sid not in rules.get("new_toplevel_dir_stages", ["scaffolding"]):
-        return "deny", (
+        return deny("new_toplevel", (
             "신규 최상위 폴더 '%s/' 는 Scaffolding 단계에서만 만들 수 있다 (현재 %s). "
-            "구조 변경이 필요하면 Scaffolding 으로 되돌아가서 합의하라." % (top, lbl))
+            "구조 변경이 필요하면 Scaffolding 으로 되돌아가서 합의하라." % (top, lbl)))
 
     parts = rel.split("/")
 
@@ -321,21 +368,23 @@ def check_write(con, cfg, root, lid, sid, rel):
     if cls == "dev" and len(parts) >= 2:
         allowed = rules.get("dev_subdirs", [])
         if allowed and parts[1] not in allowed:
-            return "deny", (".dev/ 하위는 %s 만 허용한다. '%s' 는 규칙 위반이다."
-                            % ("/".join(allowed), parts[1]))
+            return deny("dev_subdir",
+                        ".dev/ 하위는 %s 만 허용한다. '%s' 는 규칙 위반이다."
+                        % ("/".join(allowed), parts[1]))
         if len(parts) >= 3 and parts[1] in rules.get("loop_prefixed_dirs", []):
             if not parts[-1].startswith(lid + "-"):
-                return "deny", (
+                return deny("loop_prefix", (
                     "이 루프의 산출물은 파일명이 루프 해시로 시작해야 한다. "
                     "'%s' 대신 '%s-%s' 로 써라. 해시가 시퀀스이자 워크트리 간 "
-                    "충돌 방지 장치다." % (parts[-1], lid, parts[-1]))
+                    "충돌 방지 장치다." % (parts[-1], lid, parts[-1])))
 
     # 5. docs 하위 번호 명명 규칙 (grant 로 쓰기가 허용된 경우에만 도달)
     if cls == "docs" and len(parts) >= 3 and parts[1] in rules.get("docs_subdirs", []):
         pat = rules.get("numbered_name_pattern")
         if pat and not re.match(pat, parts[-1]):
-            return "deny", ("docs/%s/ 파일명은 NNN-name.md 형식이어야 한다. "
-                            "'%s' 는 규칙 위반이다." % (parts[1], parts[-1]))
+            return deny("docs_naming",
+                        "docs/%s/ 파일명은 NNN-name.md 형식이어야 한다. "
+                        "'%s' 는 규칙 위반이다." % (parts[1], parts[-1]))
 
     if grant:
         con.execute("UPDATE wgrant SET uses_left=uses_left-1 WHERE id=?", (grant["id"],))
@@ -370,6 +419,8 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
         % (", ".join(stage.get("write", [])) or "(없음)", lid),
         "모든 답변 말머리에 [%s] 를 붙여라." % label_of(cfg, sid),
     ]
+    if stage.get("hint"):
+        lines.append(stage["hint"])
     if auto_skip_on(con):
         lines.append("⚠ 스킵 자동 승인 ON (%s) — 스킵에 사용자 다이얼로그가 뜨지 않는다. "
                      "사유는 여전히 필수다. 끄려면 `harness auto-skip off`."
@@ -435,7 +486,7 @@ def auto_skip_scope_note(con):
     return ", ".join(bits) or "무제한"
 
 
-def ctrl_decision(con, sub, cmd, mode):
+def ctrl_decision(con, sub, cmd, mode, lid, sid):
     """제어 명령에 대한 판정. 사람의 동의가 필요한 것만 ask 로 올린다."""
     if sub == "auto-skip":
         # off 는 게이트 복원이므로 동의 없이 허용한다. on 은 게이트를 무력화하므로
@@ -447,6 +498,7 @@ def ctrl_decision(con, sub, cmd, mode):
 
     reason = arg_value(cmd, "reason")
     if sub != "approve-plan" and not reason:
+        record_event(con, lid, sid, "block", "no_reason", sub, cmd[:200])
         return emit(pre_decision("deny",
             "사유 없이 %s 할 수 없다. --reason \"...\" 로 사유를 명시하라." % sub))
 
@@ -463,6 +515,7 @@ def ctrl_decision(con, sub, cmd, mode):
         detail += "\n사유: %s" % reason
     detail += "\n승인하면 하네스 상태에 기록된다."
     if mode == "bypassPermissions":
+        record_event(con, lid, sid, "block", "bypass_mode", sub, cmd[:200])
         return emit(pre_decision("deny", detail +
             "\nbypassPermissions 모드에서는 사람의 동의를 받을 수 없어 거부한다. "
             "권한 모드를 낮추고 다시 시도하라."))
@@ -478,13 +531,17 @@ def hook_pre_tool_use(inp, con, cfg, root, lid, sid):
         cmd = ti.get("command") or ""
         m = CTRL_RE.search(cmd)
         if m:
-            return ctrl_decision(con, m.group(1), cmd, mode)
+            with con:
+                return ctrl_decision(con, m.group(1), cmd, mode, lid, sid)
 
         if BASH_MUTATORS.search(cmd):
             for tok in re.findall(r"[\w./~-]+", cmd):
                 rel = rel_to_root(root, tok)
                 if rel and "/" in rel and classify(rel, cfg) == "docs" \
                         and not find_grant(con, lid, rel):
+                    with con:
+                        record_event(con, lid, sid, "block", "docs_readonly_bash",
+                                     rel, cmd[:200])
                     return emit(pre_decision("deny",
                         "docs/ 는 사람이 기록하는 영역이다. 이 명령이 '%s' 를 변경할 수 "
                         "있어 막는다. 필요하면 `harness allow` 로 승인을 받아라." % rel))
@@ -513,6 +570,8 @@ def hook_post_tool_use(inp, con, cfg, root, lid, sid):
         if field:
             rel = rel_to_root(root, ti.get(field))
             if rel:
+                # 편집 이력. 한 루프에서 같은 파일을 몇 번 고쳤는지가 구조 냄새다.
+                record_event(con, lid, sid, "edit", None, rel)
                 for kind, sig in signals.items():
                     for pat in sig.get("write_glob", []):
                         if glob_match(rel, pat):
@@ -531,6 +590,26 @@ def hook_post_tool_use(inp, con, cfg, root, lid, sid):
             tp = sig.get("tool_pattern")
             if tp and re.search(tp, tool):
                 record_evidence(con, lid, sid, "verification_evidence", "tool:" + tool)
+
+
+def hook_post_tool_use_failure(inp, con, cfg, root, lid, sid):
+    """도구 실패를 적립한다. 같은 실패가 반복되는 것이 '동일한 실수'의 직접 증거다.
+
+    오류 필드명이 문서에 명시돼 있지 않아 후보를 순서대로 시도한다.
+    """
+    tool = inp.get("tool_name") or ""
+    ti = inp.get("tool_input") or {}
+    err = ""
+    for key in ("tool_error", "error", "tool_output", "tool_response", "message"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            err = val.strip()
+            break
+    target = norm_cmd(ti.get("command")) if tool == "Bash" else tool
+    if tool in WRITE_TOOLS:
+        target = "%s %s" % (tool, rel_to_root(root, ti.get(WRITE_TOOLS[tool])) or "")
+    with con:
+        record_event(con, lid, sid, "tool_fail", tool, target or tool, err)
 
 
 def hook_stop(inp, con, cfg, root, lid, sid):
@@ -567,7 +646,11 @@ def hook_stop(inp, con, cfg, root, lid, sid):
                 continue
             con.execute("INSERT INTO stop_block(prompt_id,key,at) VALUES(?,?,?)",
                         (prompt_id, key, now()))
+            record_event(con, lid, sid, "stop_gate", key, stage["id"], text)
             blocked.append(text)
+        for key in exhausted:
+            record_event(con, lid, sid, "bypass", key, stage["id"],
+                         "차단 상한 소진으로 미충족 상태 종료")
 
     if blocked:
         emit({"decision": "block", "reason": " / ".join(blocked)})
@@ -581,6 +664,7 @@ HOOKS = {
     "SessionStart": hook_session_start,
     "PreToolUse": hook_pre_tool_use,
     "PostToolUse": hook_post_tool_use,
+    "PostToolUseFailure": hook_post_tool_use_failure,
     "Stop": hook_stop,
 }
 
@@ -722,17 +806,40 @@ def _enter(con, cfg, root, lid, dest_idx):
 
 
 def _hint_on_enter(con, cfg, lid, sid):
-    """Compounding 진입 시 스킵 기록을 노출해 회고 md 로 옮기게 한다.
-    루프가 닫히면 DB 행은 버려지므로, 여기서 옮기지 않으면 그 사실만 소실된다."""
+    """단계 진입 시의 안내.
+
+    Context 는 **당겨가는** 단계다. 과거 기록을 밀어넣지 않는다 — 이번 task 와
+    무관한 실수까지 컨텍스트를 먹기 때문이다. 조회 방법만 알려주고 무엇이
+    관련 있는지는 모델이 판단한다.
+    Compounding 은 반대다. 막 끝낸 루프 자신의 기록은 무조건 관련 있으니 밀어준다.
+    """
+    hint = stage_obj(cfg, sid).get("hint")
+    if hint:
+        print("\n%s" % hint)
+
     if sid != "compounding":
         return
     sk = skips_of(con, lid)
-    if not sk:
-        return
-    print("\n이 루프에서 건너뛴 단계 — 회고에 사유와 함께 기록하라 "
-          "(루프 종료 시 DB 기록은 버려진다):")
-    for r in sk:
-        print("  - %s: %s (승인: %s)" % (r["stage"], r["reason"], r["authorized_by"]))
+    if sk:
+        print("\n이 루프에서 건너뛴 단계 — 회고에 사유와 함께 기록하라:")
+        for r in sk:
+            print("  - %s: %s (승인: %s)" % (r["stage"], r["reason"], r["authorized_by"]))
+    rows = con.execute(
+        "SELECT kind, rule, target, COUNT(*) c FROM event "
+        "WHERE loop_id=? AND kind IN ('block','tool_fail','bypass') "
+        "GROUP BY kind, rule, target HAVING c > 0 ORDER BY c DESC LIMIT 8",
+        (lid,)).fetchall()
+    if rows:
+        print("\n이 루프에서 관측된 것 — 회고 대상:")
+        for r in rows:
+            print("  - %s/%s %s ×%d" % (r["kind"], r["rule"] or "-", r["target"], r["c"]))
+    churn = con.execute(
+        "SELECT target, COUNT(*) c FROM event WHERE loop_id=? AND kind='edit' "
+        "GROUP BY target HAVING c >= 4 ORDER BY c DESC LIMIT 5", (lid,)).fetchall()
+    if churn:
+        print("\n재편집이 많은 파일 — 구조 문제일 수 있다:")
+        for r in churn:
+            print("  - %s ×%d" % (r["target"], r["c"]))
 
 
 def cli_advance(con, cfg, root, lid, sid, argv):
@@ -808,6 +915,8 @@ def cli_skip(con, cfg, root, lid, sid, argv):
                         "authorized_by=? WHERE loop_id=? AND stage=?",
                         (now(), reason, by, lid, ids[i]))
             skipped.append(ids[i])
+        for s in skipped:
+            record_event(con, lid, s, "skip", s, by, reason)
         if by == "auto":
             left = consume_auto_skip(con)
         nlid, nsid, cycled = _enter(con, cfg, root, lid, dest + 1)
@@ -854,6 +963,155 @@ def cli_approve_plan(con, cfg, root, lid, sid, argv):
         record_evidence(con, lid, sid, "plan_file", rel)
         record_evidence(con, lid, sid, "plan_approved", rel)
     print("계획 승인 기록: %s" % rel)
+    return 0
+
+
+RECALL_DIRS = ("retrospect", "learning", "troubleshooting")
+
+
+def _expand_keywords(keywords):
+    """경로 키워드를 조각으로 넓힌다 — src/api.ts → {src/api.ts, src, api, ts}.
+
+    이벤트 조회는 세는 것이라 정확해야 하지만, 파일은 읽을 후보를 고르는 것이라
+    넓어야 한다. 'src/api' 로 조회했을 때 api 를 다룬 회고 산문이 걸려야 한다.
+    """
+    out = set()
+    for kw in keywords:
+        out.add(kw.lower())
+        for part in re.split(r"[/\\.\-_]", kw):
+            if len(part) >= 3:
+                out.add(part.lower())
+    return out
+
+
+def _recall_files(root, keywords, limit=6):
+    """회고·학습·트러블슈팅 파일 중 키워드에 걸리는 것. 내용은 읽지 않고 경로만 준다."""
+    keywords = _expand_keywords(keywords) if keywords else set()
+    hits = []
+    for sub in RECALL_DIRS:
+        d = os.path.join(root, ".dev", sub)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d), reverse=True):
+            path = os.path.join(d, name)
+            if not os.path.isfile(path):
+                continue
+            rel = ".dev/%s/%s" % (sub, name)
+            if not keywords:
+                hits.append(rel)
+                continue
+            hay = name.lower()
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    hay += "\n" + fh.read(20000).lower()
+            except Exception:
+                pass
+            if any(kw.lower() in hay for kw in keywords):
+                hits.append(rel)
+    return hits[:limit]
+
+
+def cli_recall(con, cfg, root, lid, sid, argv):
+    """과거 관측 기록과 회고 파일을 조회한다 (pull). 무엇이 관련 있는지는 호출자가 판단한다."""
+    keywords = argv_positional(argv)
+    kind = argv_value(argv, "kind")
+    rule = argv_value(argv, "rule")
+    try:
+        limit = int(argv_value(argv, "limit") or 12)
+    except ValueError:
+        limit = 12
+
+    # 괄호 필수 — "A OR B AND C" 는 "A OR (B AND C)" 로 파싱되어
+    # 첫 조건만 만족하면 키워드 필터가 통째로 무시된다.
+    where, params = ["(kind != 'edit' OR ? = 1)"], [1 if kind == "edit" else 0]
+    if kind:
+        where.append("kind = ?")
+        params.append(kind)
+    if rule:
+        where.append("rule = ?")
+        params.append(rule)
+    for kw in keywords:
+        like = "%" + kw.lower() + "%"
+        where.append("(LOWER(target) LIKE ? OR LOWER(IFNULL(rule,'')) LIKE ? "
+                     "OR LOWER(IFNULL(detail,'')) LIKE ?)")
+        params += [like, like, like]
+    rows = con.execute(
+        "SELECT kind, rule, target, COUNT(*) c, MAX(at) last, "
+        "COUNT(DISTINCT loop_id) loops FROM event WHERE %s "
+        "GROUP BY kind, rule, target ORDER BY loops DESC, c DESC LIMIT ?"
+        % " AND ".join(where), params + [limit]).fetchall()
+
+    head = "키워드: %s" % " ".join(keywords) if keywords else "전체"
+    print("과거 관측 기록 (%s)" % head)
+    if not rows:
+        print("  (없음)")
+    for r in rows:
+        mark = "  ← 여러 루프에서 반복" if r["loops"] > 1 else ""
+        print("  %-10s %-16s %-34s ×%d (루프 %d)%s"
+              % (r["kind"], r["rule"] or "-", (r["target"] or "")[:34],
+                 r["c"], r["loops"], mark))
+
+    churn = con.execute(
+        "SELECT target, COUNT(*) c, COUNT(DISTINCT loop_id) loops FROM event "
+        "WHERE kind='edit' GROUP BY target HAVING c >= 5 "
+        "ORDER BY c DESC LIMIT 5").fetchall()
+    if churn and not kind:
+        matched = [r for r in churn
+                   if not keywords or any(k.lower() in (r["target"] or "").lower()
+                                          for k in keywords)]
+        if matched:
+            print("\n재편집이 많은 파일")
+            for r in matched:
+                print("  %-40s ×%d (루프 %d)" % (r["target"][:40], r["c"], r["loops"]))
+
+    files = _recall_files(root, keywords)
+    print("\n관련 회고·학습 파일 (필요하면 읽어라)")
+    if not files:
+        print("  (없음)")
+    for f in files:
+        print("  %s" % f)
+    return 0
+
+
+def cli_stats(con, cfg, root, lid, sid, argv):
+    """누적 수치. --loop 를 주면 현재 루프만."""
+    only = "--loop" in argv
+    cond, params = ("WHERE loop_id = ?", [lid]) if only else ("", [])
+    print("범위: %s" % ("현재 루프 %s" % lid if only else "전체 누적"))
+
+    lc = con.execute("SELECT COUNT(*) c, SUM(closed_at IS NOT NULL) closed "
+                     "FROM loop").fetchone()
+    print("루프: %d개 (완료 %d)" % (lc["c"], lc["closed"] or 0))
+
+    rows = con.execute("SELECT kind, COUNT(*) c FROM event %s GROUP BY kind "
+                       "ORDER BY c DESC" % cond, params).fetchall()
+    print("이벤트: " + (", ".join("%s %d" % (EVENT_KINDS.get(r["kind"], r["kind"]), r["c"])
+                                  for r in rows) or "(없음)"))
+
+    # 반복 신호는 규칙 단위로 봐야 드러난다. (규칙, 대상) 으로 묶으면
+    # 같은 규칙에 다른 파일로 계속 걸리는 패턴이 흩어져 보이지 않는다.
+    # tool_fail 만 예외 — 정규화된 명령 자체가 의미 있는 키다.
+    for kind, title, key in (("block", "차단된 규칙", "rule"),
+                             ("tool_fail", "실패한 도구", "target"),
+                             ("skip", "건너뛴 단계", "rule"),
+                             ("stop_gate", "미충족 종료 조건", "rule"),
+                             ("bypass", "우회한 게이트", "rule")):
+        q = ("SELECT IFNULL(%s,'-') k, COUNT(*) c, COUNT(DISTINCT loop_id) loops, "
+             "COUNT(DISTINCT target) targets FROM event WHERE kind=? %s "
+             "GROUP BY k ORDER BY loops DESC, c DESC LIMIT 6"
+             % (key, "AND loop_id=?" if only else ""))
+        rs = con.execute(q, ([kind] + params)).fetchall()
+        if not rs:
+            continue
+        print("\n%s" % title)
+        for r in rs:
+            bits = "×%d" % r["c"]
+            if key == "rule" and r["targets"] > 1:
+                bits += ", 대상 %d종" % r["targets"]
+            if r["loops"] > 1:
+                bits += " ← %d개 루프에서 반복" % r["loops"]
+            print("  %-24s %s" % (r["k"][:24], bits))
+    print("\n상세 조회: `harness recall <키워드|경로>`")
     return 0
 
 
@@ -953,6 +1211,8 @@ CLI = {
     "approve-plan": cli_approve_plan,
     "loop": cli_loop,
     "auto-skip": cli_auto_skip,
+    "recall": cli_recall,
+    "stats": cli_stats,
 }
 
 
@@ -1060,6 +1320,12 @@ USAGE = """step-six-harness — 6단계 작업 하네스 (Scaffolding → Contex
 현재 상태
   status                       현재 루프·단계·종료 조건·증거·스킵 기록·예외
   loop                         루프 해시(= .dev/ 파일명 접두사)와 브랜치
+
+과거 기록 조회 (Context 단계에서 쓴다)
+  recall [키워드|경로 ...] [--kind K] [--rule R]
+                               과거 차단·실패·재편집 기록과 관련 회고 파일을 찾는다.
+                               이번 task 와 관련된 것만 골라 읽어라 — 전부 읽지 마라
+  stats [--loop]               누적 수치. 어떤 규칙에 몇 번 걸렸는지, 무엇이 반복되는지
 
 단계 진행
   advance                      다음 단계로. 종료 조건이 남으면 거부하고 무엇이 남았는지 알려준다

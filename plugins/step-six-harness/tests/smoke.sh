@@ -206,6 +206,77 @@ else
   FAIL=$((FAIL + 1)); echo "  FAIL 새 해시가 발급된다"
 fi
 
+echo "== 관측 기록(event) 적립"
+check "차단이 규칙명과 함께 적립된다" 'docs_readonly' \
+  "$(sql "SELECT rule FROM event WHERE kind='block' AND rule='docs_readonly' LIMIT 1")"
+check "단계 스킵이 적립된다" '^skip$' \
+  "$(sql "SELECT kind FROM event WHERE kind='skip' LIMIT 1")"
+check "파일 편집이 적립된다" '^edit$' \
+  "$(sql "SELECT kind FROM event WHERE kind='edit' LIMIT 1")"
+check "종료 게이트 미충족이 적립된다" '^verification_evidence$' \
+  "$(sql "SELECT rule FROM event WHERE kind='stop_gate' AND rule='verification_evidence' LIMIT 1")"
+check "게이트 우회가 적립된다" '^bypass$' \
+  "$(sql "SELECT kind FROM event WHERE kind='bypass' LIMIT 1")"
+check "이전 루프 event 는 살아남는다" '^0$' \
+  "$(sql "SELECT CASE WHEN COUNT(*)>0 THEN 0 ELSE 1 END FROM event WHERE loop_id='$LID'")"
+check "닫힌 루프 인덱스는 남는다" '^1$' \
+  "$(sql "SELECT COUNT(*) FROM loop WHERE id='$LID' AND closed_at IS NOT NULL")"
+
+echo "== 도구 실패 적립 (PostToolUseFailure)"
+PF() { printf '{"hook_event_name":"PostToolUseFailure","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"},"tool_error":"%s"}' "$WORK" "$1" "$2"; }
+hook "$(PF 'npm test -- --watch=false' 'FAIL src/api.test.ts')" >/dev/null
+hook "$(PF 'npm test' 'FAIL src/api.test.ts again')" >/dev/null
+check "명령이 정규화되어 같은 키로 집계" '^npm test|2$' \
+  "$(sql "SELECT target, COUNT(*) FROM event WHERE kind='tool_fail' GROUP BY target")"
+check "오류 내용이 detail 에 남는다" 'src/api.test.ts' \
+  "$(sql "SELECT detail FROM event WHERE kind='tool_fail' LIMIT 1")"
+
+echo "== 루프를 넘는 반복 감지"
+# 새 루프에서 같은 경로를 같은 규칙으로 다시 차단시킨다
+setstage scaffolding
+hook "$(W docs/spec/001-a.md)" >/dev/null
+check "같은 규칙이 2개 루프에 걸쳐 기록된다" '^2$' \
+  "$(sql "SELECT COUNT(DISTINCT loop_id) FROM event WHERE rule='docs_readonly'")"
+
+echo "== recall (pull 방식 조회)"
+mkdir -p "$WORK/.dev/retrospect" "$WORK/.dev/learning"
+NEW="$(loopid)"
+printf 'api 리팩터링 회고\n비동기 처리에서 실수했다\n' > "$WORK/.dev/retrospect/$NEW-api.md"
+printf '무관한 학습\n' > "$WORK/.dev/learning/$NEW-unrelated.md"
+check "키워드로 회고 파일을 찾는다" 'api\.md' "$(cli recall 비동기)"
+check "경로 키워드가 조각으로 넓혀져 산문에 걸린다" 'api\.md' "$(cli recall src/api.ts)"
+check "무관한 파일은 걸리지 않는다" '^0$' \
+  "$(cli recall 비동기 | grep -c unrelated || true)"
+check "명령 키워드로 실패 기록을 찾는다" 'npm test' "$(cli recall npm)"
+check "무관한 기록은 걸러진다" '^0$' \
+  "$(cli recall npm | sed -n '/과거 관측/,/^$/p' | grep -c docs_readonly || true)"
+check "키워드가 아무것도 안 맞으면 비어 있다" '(없음)' "$(cli recall zzz존재하지않음)"
+check "여러 루프 반복을 표시한다" '여러 루프에서 반복' "$(cli recall docs)"
+check "--kind 로 종류를 좁힌다" 'tool_fail' "$(cli recall --kind tool_fail)"
+check "키워드가 없으면 전체" '전체' "$(cli recall)"
+
+echo "== stats (누적 수치)"
+check "루프 수를 센다" '루프: ' "$(cli stats)"
+check "이벤트 종류별 집계" '규칙 차단' "$(cli stats)"
+check "차단된 규칙 상위 표시" 'docs_readonly' "$(cli stats)"
+check "규칙 단위로 묶어 대상 종수를 센다" '대상 ' "$(cli stats)"
+check "실패한 도구 상위 표시" 'npm test' "$(cli stats)"
+check "반복을 명시한다" '루프에서 반복' "$(cli stats)"
+check "--loop 는 현재 루프만" "현재 루프 $NEW" "$(cli stats --loop)"
+check "recall 로 안내한다" 'harness recall' "$(cli stats)"
+
+echo "== 단계별 안내 (hint)"
+setstage context
+check "Context 는 조회 방법만 알려준다 (push 아님)" 'harness recall' \
+  "$(hook '{"hook_event_name":"SessionStart","cwd":"'"$WORK"'","source":"startup"}')"
+check "Context hint 가 무관한 것을 읽지 말라고 한다" '무관한 과거 실수까지 읽지 마라' \
+  "$(hook '{"hook_event_name":"SessionStart","cwd":"'"$WORK"'","source":"startup"}')"
+setstage verification
+hook '{"hook_event_name":"PostToolUse","cwd":"'"$WORK"'","tool_name":"Bash","tool_input":{"command":"npm test"}}' >/dev/null
+OUT3="$(cli advance)"
+check "Compounding 진입 시 이 루프 관측을 밀어준다" '이 루프에서 관측된 것' "$OUT3"
+check "승격 논의를 유도한다" '복리가 아니라 일기' "$OUT3"
+
 echo "== 손상 내성"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 check_empty "DB 손상 시 차단하지 않음" "$(hook "$(W docs/x.md)" 2>/dev/null)"

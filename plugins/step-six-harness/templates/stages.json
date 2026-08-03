@@ -39,6 +39,7 @@
       "id": "scaffolding",
       "label": "Scaffolding",
       "summary": "작업할 구조인지 확인하고, 필요하면 이때 구조를 바꾼다. 역할별 폴더링.",
+      "hint": "반복되는 실수를 구조나 훅으로 막을지 판단하려면 `harness stats` 를 보라.",
       "write": ["source", "tests", "context", "dev"],
       "exit_criteria": [],
       "stop_requires": []
@@ -47,6 +48,7 @@
       "id": "context",
       "label": "Context",
       "summary": "유저/프로젝트/폴더 스코프로 계층 기록. 전부 싣지 말고 '이럴 때 이걸 봐라'로 유도.",
+      "hint": "과거 실수·회고 조회: `harness recall <키워드|경로>`. Scaffolding 에서 정한 task 와 관련된 것만 골라 읽어라 — 무관한 과거 실수까지 읽지 마라.",
       "write": ["context", "dev"],
       "exit_criteria": [],
       "stop_requires": []
@@ -79,6 +81,7 @@
       "id": "compounding",
       "label": "Compounding",
       "summary": "회고를 기록. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
+      "hint": "여러 루프에서 반복된 항목은 `harness stats` 로 확인하고, 스킬·훅 승격이나 stages.json 수정을 논의하라. 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
       "write": ["dev", "context", "tests"],
       "exit_criteria": ["retro_file"],
       "stop_requires": ["retro_file"]

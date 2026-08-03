@@ -23,11 +23,32 @@ description: 6단계 작업 하네스의 현재 단계를 확인하고 제어한
 
 | `allow <glob> --reason "..." [--uses N]` | 쓰기 금지 경로에 예외 등록 (`docs/` 등) | ✅ 다이얼로그 |
 | `approve-plan <file>` | 계획에 대한 사람의 승인 기록 | ✅ 다이얼로그 |
+| `recall [키워드\|경로] [--kind K] [--rule R]` | 과거 차단·실패·재편집 기록과 관련 회고 파일을 찾는다. **Context 단계의 주 도구** | |
+| `stats [--loop]` | 누적 수치. 어떤 규칙에 몇 번 걸렸는지, 무엇이 여러 루프에 걸쳐 반복되는지 | |
 | `loop` | 현재 루프 해시·브랜치. `.dev/` 파일명 접두사가 이 해시다 | |
 | `loop new --intent "..."` | 루프를 닫고 새 해시로 시작 (`advance` 가 6단계 끝에서 자동 호출) | |
 | `loop adopt <hash> --reason "..."` | DB를 잃었을 때 기존 해시로 재연결 | ✅ 다이얼로그 |
 | `auto-skip on --reason "..." [--uses N] [--scope loop\|project]` | 스킵 동의 다이얼로그를 끄고 자동 승인. 범위를 좁히는 것을 권한다 | ✅ 다이얼로그 (켜는 것 자체는 승인 필요) |
 | `auto-skip off` / `auto-skip status` | 자동 승인 해제 / 현재 상태 | 끄기는 승인 불필요 |
+
+## Context 단계에서 (2/6)
+
+`recall` 은 **당기는 도구다.** 하네스가 과거 실수를 밀어주지 않는 이유는, 이번 작업과 무관한
+실수까지 컨텍스트를 먹기 때문이다. Scaffolding에서 정한 task 를 근거로 무엇이 관련 있는지
+직접 판단해서 조회하라.
+
+```sh
+.claude/harness/bin/harness recall src/api        # 이번에 만질 경로
+.claude/harness/bin/harness recall "npm test"     # 이번에 쓸 명령
+.claude/harness/bin/harness recall 인증 토큰       # 이번 작업의 개념
+```
+
+- 출력의 `← 여러 루프에서 반복` 표시가 붙은 항목은 **같은 실수를 되풀이하고 있다는 뜻이다.**
+  그건 이번 루프에서 다루거나, 규칙·구조로 막을지 논의할 대상이다.
+- `재편집이 많은 파일` 은 구조 문제 신호다. 이번 작업이 그 파일을 건드린다면 Scaffolding으로
+  되돌아가 구조를 고칠지 먼저 판단하라.
+- 회고 파일 목록은 **경로만** 준다. 관련 있어 보이는 것만 골라 읽어라 — 전부 읽지 마라.
+- 전체 그림이 필요하면 `stats`, 이번 루프만 보려면 `stats --loop`.
 
 ## 차단당했을 때
 
