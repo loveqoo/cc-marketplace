@@ -269,7 +269,7 @@ cli loop intent 'npm test 실패 조사' >/dev/null
 check "작업이 정해지면 그것을 기본 키워드로 쓴다" '작업에서 추출' "$(cli recall)"
 check "작업 키워드로 관련 기록을 찾는다" 'npm test' "$(cli recall)"
 cli loop intent 'src/auth.ts 토큰 갱신 로직 수정' >/dev/null
-check "저정보 단어(src·로직·수정)는 키워드에서 제외" '추출: auth.ts 토큰 갱신$' "$(cli recall | head -1)"
+check "저정보 단어(src·로직·수정)는 키워드에서 제외" '추출: auth.ts 토큰 갱신)' "$(cli recall | head -1)"
 
 echo "== stats (누적 수치)"
 check "루프 수를 센다" '루프: ' "$(cli stats)"
