@@ -43,6 +43,13 @@ WRITE_TOOLS = {
 BASH_MUTATORS = re.compile(r"(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|tee|dd|truncate)\b|>\s*\S|sed\s+-i")
 CTRL_RE = re.compile(r"harness(?:\.py)?[\"']?\s+([a-z-]+)")
 CONSENT_CMDS = ("skip", "allow", "approve-plan", "adopt")
+CTRL_HEAD = {
+    "skip": "단계 스킵 요청",
+    "allow": "쓰기 금지 경로에 대한 예외 요청",
+    "approve-plan": "계획 승인 요청",
+    "adopt": "기존 루프 해시 재연결 요청",
+    "auto-skip": "스킵 자동 승인 활성화 요청 — 이후 스킵은 다이얼로그 없이 통과한다",
+}
 EVIDENCE_STAGES = ("execution", "verification")
 
 SCHEMA = """
@@ -364,12 +371,53 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
         % (", ".join(stage.get("write", [])) or "(없음)", lid),
         "모든 답변 말머리에 [%s] 를 붙여라." % label_of(cfg, sid),
     ]
+    if auto_skip_on(con):
+        lines.append("⚠ 스킵 자동 승인이 켜져 있다 — 스킵에 사용자 다이얼로그가 뜨지 않는다. "
+                     "사유는 여전히 필수다. 끄려면 `harness auto-skip off`.")
     sk = skips_of(con, lid)
     if sk:
         lines.append("이 루프의 스킵: "
-                     + "; ".join("%s(%s)" % (r["stage"], r["reason"]) for r in sk))
+                     + "; ".join("%s(%s, %s)" % (r["stage"], r["reason"],
+                                                 r["authorized_by"]) for r in sk))
     emit({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                  "additionalContext": "\n".join(lines)}})
+
+
+def auto_skip_on(con):
+    return get_meta(con, "auto_skip") == "on"
+
+
+def ctrl_decision(con, sub, cmd, mode):
+    """제어 명령에 대한 판정. 사람의 동의가 필요한 것만 ask 로 올린다."""
+    if sub == "auto-skip":
+        # off 는 게이트 복원이므로 동의 없이 허용한다. on 은 게이트를 무력화하므로
+        # 반드시 사람의 동의를 받는다 — 그러지 않으면 모델이 스스로 켤 수 있다.
+        if not re.search(r"auto-skip\s+on\b", cmd):
+            return
+    elif sub not in CONSENT_CMDS:
+        return
+
+    reason = arg_value(cmd, "reason")
+    if sub != "approve-plan" and not reason:
+        return emit(pre_decision("deny",
+            "사유 없이 %s 할 수 없다. --reason \"...\" 로 사유를 명시하라." % sub))
+
+    if sub == "skip" and auto_skip_on(con):
+        # 자동 승인이 켜져 있다. 다이얼로그는 생략하되 사실은 사용자에게 노출한다.
+        out = pre_decision("defer", None)
+        out["systemMessage"] = ("harness: 단계 스킵을 자동 승인했다 (사유: %s). "
+                                "끄려면 `harness auto-skip off`." % reason)
+        return emit(out)
+
+    detail = "%s: `%s`" % (CTRL_HEAD[sub], cmd.strip())
+    if reason:
+        detail += "\n사유: %s" % reason
+    detail += "\n승인하면 하네스 상태에 기록된다."
+    if mode == "bypassPermissions":
+        return emit(pre_decision("deny", detail +
+            "\nbypassPermissions 모드에서는 사람의 동의를 받을 수 없어 거부한다. "
+            "권한 모드를 낮추고 다시 시도하라."))
+    return emit(pre_decision("ask", detail))
 
 
 def hook_pre_tool_use(inp, con, cfg, root, lid, sid):
@@ -381,26 +429,7 @@ def hook_pre_tool_use(inp, con, cfg, root, lid, sid):
         cmd = ti.get("command") or ""
         m = CTRL_RE.search(cmd)
         if m:
-            sub = m.group(1)
-            if sub not in CONSENT_CMDS:
-                return
-            reason = arg_value(cmd, "reason")
-            if sub != "approve-plan" and not reason:
-                return emit(pre_decision("deny",
-                    "사유 없이 %s 할 수 없다. --reason \"...\" 로 사유를 명시하라." % sub))
-            head = {"skip": "단계 스킵 요청",
-                    "allow": "쓰기 금지 경로에 대한 예외 요청",
-                    "approve-plan": "계획 승인 요청",
-                    "adopt": "기존 루프 해시 재연결 요청"}[sub]
-            detail = "%s: `%s`" % (head, cmd.strip())
-            if reason:
-                detail += "\n사유: %s" % reason
-            detail += "\n승인하면 하네스 상태에 기록된다."
-            if mode == "bypassPermissions":
-                return emit(pre_decision("deny", detail +
-                    "\nbypassPermissions 모드에서는 사람의 동의를 받을 수 없어 거부한다. "
-                    "권한 모드를 낮추고 다시 시도하라."))
-            return emit(pre_decision("ask", detail))
+            return ctrl_decision(con, m.group(1), cmd, mode)
 
         if BASH_MUTATORS.search(cmd):
             for tok in re.findall(r"[\w./~-]+", cmd):
@@ -626,6 +655,10 @@ def cli_status(con, cfg, root, lid, sid, argv):
         print("  스킵: %s — %s (승인: %s)" % (r["stage"], r["reason"], r["authorized_by"]))
     for g in con.execute("SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0", (lid,)):
         print("  예외: %s (남은 %d회) — %s" % (g["glob"], g["uses_left"], g["reason"]))
+    if auto_skip_on(con):
+        print("  ⚠ 스킵 자동 승인 ON (since %s) — 사유: %s. 끄려면 `harness auto-skip off`"
+              % (get_meta(con, "auto_skip_at", "-"),
+                 get_meta(con, "auto_skip_reason", "-")))
     return 0
 
 
@@ -708,24 +741,27 @@ def cli_skip(con, cfg, root, lid, sid, argv):
         print("뒤로 갈 수는 없다. 현재 단계 %s 유지." % label_of(cfg, sid))
         return 1
 
+    # 자동 승인으로 통과한 스킵은 사람이 승인한 것과 구분해 기록한다
+    by = "auto" if auto_skip_on(con) else "user"
     skipped = []
     with con:
         # 현재 단계: 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다
         if dest == cur or exit_blockers(con, cfg, lid, sid):
             con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
-                        "authorized_by='user' WHERE loop_id=? AND stage=?",
-                        (now(), reason, lid, sid))
+                        "authorized_by=? WHERE loop_id=? AND stage=?",
+                        (now(), reason, by, lid, sid))
             skipped.append(sid)
         else:
             con.execute("UPDATE stage SET status='done', left_at=? "
                         "WHERE loop_id=? AND stage=?", (now(), lid, sid))
         for i in range(cur + 1, dest + 1):
             con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
-                        "authorized_by='user' WHERE loop_id=? AND stage=?",
-                        (now(), reason, lid, ids[i]))
+                        "authorized_by=? WHERE loop_id=? AND stage=?",
+                        (now(), reason, by, lid, ids[i]))
             skipped.append(ids[i])
         nlid, nsid, cycled = _enter(con, cfg, root, lid, dest + 1)
-    print("스킵(사용자 승인): %s" % (", ".join(skipped) or "(없음)"))
+    print("스킵(%s): %s" % ("자동 승인" if by == "auto" else "사용자 승인",
+                            ", ".join(skipped) or "(없음)"))
     print("사유: %s" % reason)
     if cycled:
         print("루프 %s 종료 → 새 루프 %s, 단계 %s" % (lid, nlid, label_of(cfg, nsid)))
@@ -768,6 +804,41 @@ def cli_approve_plan(con, cfg, root, lid, sid, argv):
     return 0
 
 
+def cli_auto_skip(con, cfg, root, lid, sid, argv):
+    """스킵 자동 승인 토글. on 은 PreToolUse 가 사람의 동의를 받은 뒤에만 도달한다."""
+    pos = argv_positional(argv)
+    mode = pos[0] if pos else "status"
+    if mode == "off":
+        with con:
+            set_meta(con, "auto_skip", "off")
+            set_meta(con, "auto_skip_off_at", now())
+        print("스킵 자동 승인 OFF — 이제 모든 스킵이 사용자 동의를 요구한다.")
+        return 0
+    if mode == "on":
+        reason = argv_value(argv, "reason")
+        if not reason:
+            print("사용법: harness auto-skip on --reason \"...\"")
+            return 2
+        with con:
+            set_meta(con, "auto_skip", "on")
+            set_meta(con, "auto_skip_reason", reason)
+            set_meta(con, "auto_skip_at", now())
+        print("스킵 자동 승인 ON (사용자 승인) — 사유: %s" % reason)
+        print("이후 스킵은 다이얼로그 없이 통과하지만, 사유는 계속 필수이고")
+        print("기록에는 authorized_by=auto 로 남는다. 끄려면 `harness auto-skip off`.")
+        return 0
+    if mode == "status":
+        if auto_skip_on(con):
+            print("스킵 자동 승인: ON (since %s) — 사유: %s"
+                  % (get_meta(con, "auto_skip_at", "-"),
+                     get_meta(con, "auto_skip_reason", "-")))
+        else:
+            print("스킵 자동 승인: OFF — 모든 스킵이 사용자 동의를 요구한다.")
+        return 0
+    print("사용법: harness auto-skip {on --reason \"...\" | off | status}")
+    return 2
+
+
 def cli_loop(con, cfg, root, lid, sid, argv):
     pos = argv_positional(argv)
     sub = pos[0] if pos else "show"
@@ -803,6 +874,7 @@ CLI = {
     "allow": cli_allow,
     "approve-plan": cli_approve_plan,
     "loop": cli_loop,
+    "auto-skip": cli_auto_skip,
 }
 
 

@@ -118,6 +118,43 @@ cli allow 'docs/spec/**' --reason '사용자가 스펙 작성을 지시' >/dev/n
 check_empty "예외 등록 후 docs 쓰기 허용" "$(hook "$(W docs/spec/001-a.md)")"
 check "예외에도 명명 규칙은 강제" 'NNN-name.md' "$(hook "$(W docs/spec/bad_name.md)")"
 
+echo "== 스킵 자동 승인 토글"
+setstage context
+SKON='.claude/harness/bin/harness auto-skip on'
+check "기본값은 OFF" 'OFF' "$(cli auto-skip status)"
+check "auto-skip on 은 사유 없이 거부" '"permissionDecision": "deny"' \
+  "$(hook "$(B "$SKON" default)")"
+check "auto-skip on 은 사용자 승인 필요" '"permissionDecision": "ask"' \
+  "$(hook "$(B "$SKON --reason \\\"급한 핫픽스 기간\\\"" default)")"
+check "켜는 행위의 위험을 다이얼로그에 노출" '다이얼로그 없이 통과' \
+  "$(hook "$(B "$SKON --reason \\\"급한 핫픽스 기간\\\"" default)")"
+check "bypassPermissions 에서는 켤 수 없다" '"permissionDecision": "deny"' \
+  "$(hook "$(B "$SKON --reason \\\"x\\\"" bypassPermissions)")"
+check_empty "auto-skip off 는 승인 없이 통과" \
+  "$(hook "$(B '.claude/harness/bin/harness auto-skip off' default)")"
+
+cli auto-skip on --reason "급한 핫픽스 기간" >/dev/null
+check "ON 상태 표시" 'ON' "$(cli auto-skip status)"
+SKIPCMD='.claude/harness/bin/harness skip context --reason \"자동 승인 테스트\"'
+check "ON 이면 스킵이 ask 가 아니라 defer" '"permissionDecision": "defer"' \
+  "$(hook "$(B "$SKIPCMD" default)")"
+check "자동 승인 사실을 사용자에게 노출" 'systemMessage' "$(hook "$(B "$SKIPCMD" default)")"
+check "ON 이어도 사유는 여전히 필수" '"permissionDecision": "deny"' \
+  "$(hook "$(B '.claude/harness/bin/harness skip context' default)")"
+check "ON 이어도 allow 는 동의를 요구" '"permissionDecision": "ask"' \
+  "$(hook "$(B '.claude/harness/bin/harness allow \"docs/x.md\" --reason \"y\"' default)")"
+check "SessionStart 가 ON 을 경고" '자동 승인이 켜져 있다' \
+  "$(hook '{"hook_event_name":"SessionStart","cwd":"'"$WORK"'","source":"startup"}')"
+cli skip context --reason "자동 승인으로 건너뜀" >/dev/null
+check "기록은 authorized_by=auto 로 구분" '^auto$' \
+  "$(sql "SELECT authorized_by FROM stage WHERE stage='context'")"
+check "status 가 ON 을 경고" '자동 승인 ON' "$(cli status)"
+cli auto-skip off >/dev/null
+check "OFF 로 복원" 'OFF' "$(cli auto-skip status)"
+setstage context
+check "복원 후 다시 동의를 요구" '"permissionDecision": "ask"' \
+  "$(hook "$(B "$SKIPCMD" default)")"
+
 echo "== 루프 종료 시 행을 버린다"
 setstage compounding
 mkdir -p "$WORK/.dev/retrospect"
