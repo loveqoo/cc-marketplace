@@ -21,6 +21,30 @@ description: 6단계 작업 하네스의 현재 단계를 확인하고 제어한
 `skip` 은 **현재 단계부터 대상 단계까지**를 건너뛴 것으로 기록한다. 현재 단계를 정상적으로
 끝낸 뒤 다음 단계만 건너뛰려면 `advance` 로 넘어간 다음 `skip` 하라.
 
+**Compounding은 건너뛸 수 없다.** `skip compounding` 은 거부된다.
+
+## 루프 중간에 선행 작업이 드러났을 때
+
+되돌아가지 않는다. 단계는 항상 앞으로만 간다. 예를 들어 Planning에서 "구조를 먼저 바꿔야
+한다"가 드러나면:
+
+```sh
+# 1. 사람과 합의해 루프를 중단 지점까지 이동 (승인 다이얼로그가 뜬다)
+.claude/harness/bin/harness skip until:compounding --reason "Planning에서 구조 선행 필요 발견"
+
+# 2. 중단 사유를 회고로 남긴다 — 이게 루프를 닫는 조건이다
+#    .dev/retrospect/<해시>-abort-structure-first.md
+
+# 3. 루프를 닫고 새 루프를 Scaffolding부터 시작
+.claude/harness/bin/harness advance
+.claude/harness/bin/harness loop intent "결제 모듈 폴더를 역할별로 분리"
+```
+
+중첩 루프를 만들지 않는 이유: Planning이 구조 결함을 드러낸 것은 **새 작업이 아니라
+Scaffolding이 불완전했다는 증거**다. 자식 루프로 감싸면 그 신호가 별개 작업처럼 보여 사라진다.
+버려진 루프가 회고 파일을 남기면 그 사실이 git에 기록되고, `harness stats` 의 스킵 집계에
+반복 패턴으로 드러난다.
+
 | `allow <glob> --reason "..." [--uses N]` | 쓰기 금지 경로에 예외 등록 (`docs/` 등) | ✅ 다이얼로그 |
 | `approve-plan <file>` | 계획에 대한 사람의 승인 기록 | ✅ 다이얼로그 |
 | `recall [키워드\|경로] [--kind K] [--rule R]` | 과거 차단·실패·재편집 기록과 관련 회고 파일을 찾는다. **Context 단계의 주 도구** | |

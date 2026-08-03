@@ -80,6 +80,7 @@
     {
       "id": "compounding",
       "label": "Compounding",
+      "skippable": false,
       "summary": "회고를 기록. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
       "hint": "여러 루프에서 반복된 항목은 `harness stats` 로 확인하고, 스킬·훅 승격이나 stages.json 수정을 논의하라. 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
       "write": ["dev", "context", "tests"],

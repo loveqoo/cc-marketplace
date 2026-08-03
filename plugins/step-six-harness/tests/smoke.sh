@@ -116,6 +116,31 @@ check "Verification 은 skipped" '^skipped$' "$(sql "SELECT status FROM stage WH
 check "스킵 사유가 잘리지 않는다" '문서 작업이라 검증 불필요' "$(cli status)"
 check "Compounding 진입 시 스킵을 회고용으로 노출" '회고에 사유와 함께 기록' "$SKIPOUT"
 
+echo "== Compounding 은 건너뛸 수 없다"
+setstage planning
+check "skip compounding 거부" '건너뛸 수 없다' \
+  "$(cli skip compounding --reason '회고 생략' || true)"
+check "거부 시 대안을 제시한다" 'skip until:compounding' \
+  "$(cli skip compounding --reason '회고 생략' || true)"
+check "compounding 을 지나치는 +N 도 거부" '건너뛸 수 없다' \
+  "$(cli skip +6 --reason '전부 생략' || true)"
+check "단계가 유지된다" 'Planning' "$(cli status | head -1)"
+
+echo "== 루프 중단 패턴: skip until:compounding → 회고 → 새 루프"
+ABORT="$(cli skip until:compounding --reason 'Planning에서 구조 선행 필요를 발견')"
+check "Compounding 까지 이동" '6/6 Compounding' "$ABORT"
+check "Compounding 자신은 스킵되지 않는다" '^pending$\|^active$' \
+  "$(sql "SELECT status FROM stage WHERE stage='compounding'")"
+check "회고 없이는 루프를 닫을 수 없다" 'retro_file' "$(cli advance || true)"
+ALID="$(loopid)"
+mkdir -p "$WORK/.dev/retrospect"
+hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-abort.md"}}' "$WORK" "$ALID")" >/dev/null
+NEWOUT="$(cli advance)"
+check "회고 후 루프가 닫히고 새 루프가 시작된다" '새 루프' "$NEWOUT"
+check "새 루프는 Scaffolding 부터" '1/6 Scaffolding' "$NEWOUT"
+check "중단한 루프의 스킵 사유가 event 에 남는다" '구조 선행 필요' \
+  "$(sql "SELECT detail FROM event WHERE kind='skip' AND loop_id='$ALID' LIMIT 1")"
+
 echo "== 결함 B 회귀: 턴 중 단계 전이 시 이전 말머리 허용"
 setstage scaffolding
 hook '{"hook_event_name":"PreToolUse","cwd":"'"$WORK"'","prompt_id":"pz","tool_name":"Read","tool_input":{}}' >/dev/null
