@@ -67,6 +67,17 @@ check "외울 필요 없다고 안내" '외울 필요는 없다' "$(python3 "$EN
 check "오타는 help 로 안내" 'harness help' "$(cli statuss 2>&1 || true)"
 check "하네스 밖에서도 help 동작" 'step-six-harness' "$(cd / && python3 "$ENGINE" help)"
 
+echo "== 작업 선정 (Scaffolding)"
+check "작업 미정을 알린다" '작업: (미정)' "$(cli status)"
+check "작업을 기록한다" 'src/auth.ts 토큰 갱신' \
+  "$(cli loop intent 'src/auth.ts 토큰 갱신 수정')"
+check "status 에 작업이 보인다" '작업: src/auth.ts' "$(cli status)"
+check "사유 없는 intent 는 사용법 안내" '사용법' "$(cli loop intent || true)"
+check "조회 명령이 미리 허용된다" 'harness recall' \
+  "$(python3 -c "import json;print(json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'])")"
+check "동의 필요 명령은 허용하지 않는다" '^0$' \
+  "$(python3 -c "import json;a=json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'];print(sum(1 for x in a if 'harness skip' in x or 'auto-skip on' in x))")"
+
 echo "== 폴더 가드"
 check "docs/ 쓰기 차단" '"permissionDecision": "deny"' "$(hook "$(W docs/spec/001-a.md)")"
 check_empty "Scaffolding 에서 신규 최상위 폴더 허용" "$(hook "$(W src/a.py)")"
@@ -253,7 +264,12 @@ check "무관한 기록은 걸러진다" '^0$' \
 check "키워드가 아무것도 안 맞으면 비어 있다" '(없음)' "$(cli recall zzz존재하지않음)"
 check "여러 루프 반복을 표시한다" '여러 루프에서 반복' "$(cli recall docs)"
 check "--kind 로 종류를 좁힌다" 'tool_fail' "$(cli recall --kind tool_fail)"
-check "키워드가 없으면 전체" '전체' "$(cli recall)"
+check "작업 미정이면 전체 + 기록 안내" '작업이 정해졌으면' "$(cli recall)"
+cli loop intent 'npm test 실패 조사' >/dev/null
+check "작업이 정해지면 그것을 기본 키워드로 쓴다" '작업에서 추출' "$(cli recall)"
+check "작업 키워드로 관련 기록을 찾는다" 'npm test' "$(cli recall)"
+cli loop intent 'src/auth.ts 토큰 갱신 로직 수정' >/dev/null
+check "저정보 단어(src·로직·수정)는 키워드에서 제외" '추출: auth.ts 토큰 갱신$' "$(cli recall | head -1)"
 
 echo "== stats (누적 수치)"
 check "루프 수를 센다" '루프: ' "$(cli stats)"

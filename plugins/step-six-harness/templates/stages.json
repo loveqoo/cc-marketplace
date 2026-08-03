@@ -38,8 +38,8 @@
     {
       "id": "scaffolding",
       "label": "Scaffolding",
-      "summary": "작업할 구조인지 확인하고, 필요하면 이때 구조를 바꾼다. 역할별 폴더링.",
-      "hint": "반복되는 실수를 구조나 훅으로 막을지 판단하려면 `harness stats` 를 보라.",
+      "summary": "이번에 할 작업을 정하고, 그 작업에 맞는 구조인지 확인한다. 필요하면 이때 구조를 바꾼다. 역할별 폴더링.",
+      "hint": "이전 작업이 끝났다면 여기서 새 작업을 선정한다. 필요하면 후보를 나열해 사용자와 합의하고(선택), 정해지면 `harness loop intent \"<작업>\"` 으로 기록하라 — Context 의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다. 반복되는 실수를 구조나 훅으로 막을지 판단하려면 `harness stats`.",
       "write": ["source", "tests", "context", "dev"],
       "exit_criteria": [],
       "stop_requires": []

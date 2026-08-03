@@ -25,6 +25,7 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
    | `.claude/harness/stages.json` | ✅ | 단계 정의·폴더 규칙의 단일 출처 |
    | `.claude/harness/harness.db` | ❌ | SQLite 런타임 상태 — 해시 발급 + 현재 단계. gitignore 등록됨 |
    | `.claude/harness/bin/harness` | ❌ | 래퍼 (세션마다 자동 갱신) |
+   | `.claude/settings.json` | ✅ | 조회 명령(`status`·`recall`·`stats`·`advance`·`loop intent`)을 권한 허용 목록에 추가. 동의가 필요한 명령(`skip`·`allow`·`approve-plan`·`auto-skip on`)은 **의도적으로 제외** |
 
 3. `git diff` 로 CLAUDE.md 변경이 1줄인지 확인시킨다.
 

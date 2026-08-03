@@ -767,6 +767,12 @@ def refresh_wrapper(root):
 
 def cli_status(con, cfg, root, lid, sid, argv):
     print("loop %s · 단계 %s" % (lid, label_of(cfg, sid)))
+    row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+    if row and row["intent"]:
+        print("  작업: %s" % row["intent"])
+    else:
+        print("  작업: (미정) — Scaffolding 에서 정하고 "
+              "`harness loop intent \"...\"` 로 기록하라")
     print("  요약: %s" % stage_obj(cfg, sid)["summary"])
     print("  쓰기 허용: %s" % (", ".join(stage_obj(cfg, sid).get("write", [])) or "(없음)"))
     print("  .dev/ 산출물 파일명 접두사: %s-" % lid)
@@ -968,6 +974,17 @@ def cli_approve_plan(con, cfg, root, lid, sid, argv):
 
 RECALL_DIRS = ("retrospect", "learning", "troubleshooting")
 
+# 작업 설명에서 키워드를 뽑을 때 걸러낼 저정보 단어. 이것들이 남으면 OR 조회가
+# 거의 모든 기록에 걸려서 조회가 무의미해진다.
+STOPWORDS = {
+    "수정", "추가", "구현", "작업", "개선", "변경", "정리", "삭제", "제거", "적용",
+    "처리", "로직", "기능", "부분", "관련", "리팩터링", "리팩토링", "버그", "이슈",
+    "fix", "add", "update", "refactor", "change", "remove", "delete", "impl",
+    "implement", "cleanup", "the", "and", "for", "with", "into",
+    # 경로 상용 디렉터리명 — 이것만으로는 무관한 기록까지 걸린다
+    "src", "lib", "app", "apps", "dist", "build", "packages", "pkg", "internal",
+}
+
 
 def _expand_keywords(keywords):
     """경로 키워드를 조각으로 넓힌다 — src/api.ts → {src/api.ts, src, api, ts}.
@@ -1016,6 +1033,16 @@ def cli_recall(con, cfg, root, lid, sid, argv):
     keywords = argv_positional(argv)
     kind = argv_value(argv, "kind")
     rule = argv_value(argv, "rule")
+    from_intent = False
+    if not keywords:
+        # Scaffolding 에서 정한 작업을 기본 키워드로 쓴다. 6→2 링크의 연결점.
+        row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+        intent = (row["intent"] if row else None) or ""
+        picked = [t for t in re.split(r"[\s,·/]+", intent)
+                  if len(t) >= 2 and t.lower() not in STOPWORDS][:6]
+        if picked:
+            keywords = picked
+            from_intent = True
     try:
         limit = int(argv_value(argv, "limit") or 12)
     except ValueError:
@@ -1030,18 +1057,28 @@ def cli_recall(con, cfg, root, lid, sid, argv):
     if rule:
         where.append("rule = ?")
         params.append(rule)
+    # 키워드는 OR 로 묶는다. AND 로 묶으면 "src/auth.ts 토큰 갱신 수정" 같은 작업
+    # 설명에서 뽑은 키워드를 전부 만족하는 이벤트가 없어 항상 빈 결과가 나온다.
+    kw_or = []
     for kw in keywords:
         like = "%" + kw.lower() + "%"
-        where.append("(LOWER(target) LIKE ? OR LOWER(IFNULL(rule,'')) LIKE ? "
+        kw_or.append("(LOWER(target) LIKE ? OR LOWER(IFNULL(rule,'')) LIKE ? "
                      "OR LOWER(IFNULL(detail,'')) LIKE ?)")
         params += [like, like, like]
+    if kw_or:
+        where.append("(" + " OR ".join(kw_or) + ")")
     rows = con.execute(
         "SELECT kind, rule, target, COUNT(*) c, MAX(at) last, "
         "COUNT(DISTINCT loop_id) loops FROM event WHERE %s "
         "GROUP BY kind, rule, target ORDER BY loops DESC, c DESC LIMIT ?"
         % " AND ".join(where), params + [limit]).fetchall()
 
-    head = "키워드: %s" % " ".join(keywords) if keywords else "전체"
+    if from_intent:
+        head = "이 루프의 작업에서 추출: %s" % " ".join(keywords)
+    elif keywords:
+        head = "키워드: %s" % " ".join(keywords)
+    else:
+        head = "전체 — 작업이 정해졌으면 `harness loop intent \"...\"` 로 기록하라"
     print("과거 관측 기록 (%s)" % head)
     if not rows:
         print("  (없음)")
@@ -1185,6 +1222,16 @@ def cli_loop(con, cfg, root, lid, sid, argv):
         print("루프 %s 종료 → 새 루프 %s, 단계 %s"
               % (lid, nlid, label_of(cfg, cfg["stages"][0]["id"])))
         return 0
+    if sub == "intent":
+        text = " ".join(pos[1:]).strip() or (argv_value(argv, "intent") or "").strip()
+        if not text:
+            print("사용법: harness loop intent \"<이번 루프에서 할 작업>\"")
+            return 2
+        with con:
+            con.execute("UPDATE loop SET intent=? WHERE id=?", (text, lid))
+        print("루프 %s 의 작업: %s" % (lid, text))
+        print("Context 단계의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다.")
+        return 0
     if sub == "adopt":
         want = pos[1] if len(pos) > 1 else None
         if not want:
@@ -1249,6 +1296,40 @@ def run_cli(argv):
         con.close()
 
 
+WRAPPER_CMD = ".claude/harness/bin/harness"
+# 읽기 전용·정상 진행 명령만 미리 허용한다. 동의가 필요한 명령
+# (skip / allow / approve-plan / auto-skip on / loop new|adopt) 은 의도적으로 제외한다.
+SAFE_PERMS = ["Bash(%s %s)" % (WRAPPER_CMD, c) for c in ("status", "advance", "loop", "help")] \
+    + ["Bash(%s %s:*)" % (WRAPPER_CMD, c) for c in ("recall", "stats", "loop intent")] \
+    + ["Bash(%s auto-skip status)" % WRAPPER_CMD]
+
+
+def ensure_permissions(root):
+    """하네스 조회 명령을 프로젝트 설정에 미리 허용한다.
+
+    매번 권한 프롬프트를 요구하면 모델이 조회를 포기하고 파일을 직접 읽는
+    우회로 간다 — 실제 세션에서 관측된 문제다. 반환값은 추가한 규칙 수.
+    """
+    path = os.path.join(root, ".claude", "settings.json")
+    data = {}
+    if os.path.isfile(path):
+        data = jload(path)
+        if not isinstance(data, dict):
+            return -1  # 손상된 설정은 건드리지 않는다
+    allow = data.setdefault("permissions", {}).setdefault("allow", [])
+    if not isinstance(allow, list):
+        return -1
+    added = [p for p in SAFE_PERMS if p not in allow]
+    if not added:
+        return 0
+    allow.extend(added)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return len(added)
+
+
 def cli_init(argv):
     root = os.path.abspath(argv[0] if argv else os.getcwd())
     pr = plugin_root()
@@ -1280,6 +1361,13 @@ def cli_init(argv):
         created.append(DB_REL)
     con.close()
     refresh_wrapper(root)
+
+    nperm = ensure_permissions(root)
+    if nperm > 0:
+        created.append(".claude/settings.json (조회 명령 %d개 허용)" % nperm)
+    elif nperm < 0:
+        print("주의: .claude/settings.json 을 읽을 수 없어 권한 허용을 건너뛰었다.",
+              file=sys.stderr)
 
     gi = os.path.join(root, ".gitignore")
     want = [".claude/harness/harness.db", ".claude/harness/harness.db-wal",
@@ -1341,6 +1429,8 @@ USAGE = """step-six-harness — 6단계 작업 하네스 (Scaffolding → Contex
   auto-skip off | status       자동 승인 해제 / 현재 상태
 
 루프
+  loop intent "<작업>"          이번 루프에서 할 작업을 기록 (Scaffolding 에서)
+                               recall 이 이 작업을 기본 키워드로 쓴다
   loop new [--intent "..."]    루프를 닫고 새 해시로 시작
   loop adopt <hash> --reason "..."
                                DB를 잃었을 때 기존 해시로 재연결 ✋
