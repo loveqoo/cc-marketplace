@@ -372,8 +372,9 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
         "모든 답변 말머리에 [%s] 를 붙여라." % label_of(cfg, sid),
     ]
     if auto_skip_on(con):
-        lines.append("⚠ 스킵 자동 승인이 켜져 있다 — 스킵에 사용자 다이얼로그가 뜨지 않는다. "
-                     "사유는 여전히 필수다. 끄려면 `harness auto-skip off`.")
+        lines.append("⚠ 스킵 자동 승인 ON (%s) — 스킵에 사용자 다이얼로그가 뜨지 않는다. "
+                     "사유는 여전히 필수다. 끄려면 `harness auto-skip off`."
+                     % auto_skip_scope_note(con))
     sk = skips_of(con, lid)
     if sk:
         lines.append("이 루프의 스킵: "
@@ -383,8 +384,56 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
                                  "additionalContext": "\n".join(lines)}})
 
 
+def auto_skip_state(con):
+    """(활성, 만료사유) — 범위·횟수 만료까지 반영한 실제 상태."""
+    if get_meta(con, "auto_skip") != "on":
+        return False, None
+    scope = get_meta(con, "auto_skip_loop")
+    if scope and scope != head_loop(con):
+        return False, "루프 %s 범위였고 루프가 바뀌어 만료됐다" % scope
+    uses = get_meta(con, "auto_skip_uses")
+    if uses:
+        try:
+            if int(uses) <= 0:
+                return False, "사용 횟수를 모두 소진해 만료됐다"
+        except ValueError:
+            pass
+    return True, None
+
+
 def auto_skip_on(con):
-    return get_meta(con, "auto_skip") == "on"
+    return auto_skip_state(con)[0]
+
+
+def auto_skip_uses_left(con):
+    uses = get_meta(con, "auto_skip_uses")
+    try:
+        return int(uses) if uses else None
+    except ValueError:
+        return None
+
+
+def consume_auto_skip(con):
+    """자동 승인 1회 소진. 남은 횟수(무제한이면 None)를 돌려준다."""
+    left = auto_skip_uses_left(con)
+    if left is None:
+        return None
+    left = max(0, left - 1)
+    set_meta(con, "auto_skip_uses", str(left))
+    # 플래그는 사용자의 의도를 담고, 실효 상태는 auto_skip_state 가 계산한다.
+    # 여기서 'off' 로 뒤집으면 "왜 꺼졌는지"를 잃는다.
+    return left
+
+
+def auto_skip_scope_note(con):
+    bits = []
+    scope = get_meta(con, "auto_skip_loop")
+    if scope:
+        bits.append("루프 %s 범위" % scope)
+    left = auto_skip_uses_left(con)
+    if left is not None:
+        bits.append("남은 %d회" % left)
+    return ", ".join(bits) or "무제한"
 
 
 def ctrl_decision(con, sub, cmd, mode):
@@ -405,8 +454,9 @@ def ctrl_decision(con, sub, cmd, mode):
     if sub == "skip" and auto_skip_on(con):
         # 자동 승인이 켜져 있다. 다이얼로그는 생략하되 사실은 사용자에게 노출한다.
         out = pre_decision("defer", None)
-        out["systemMessage"] = ("harness: 단계 스킵을 자동 승인했다 (사유: %s). "
-                                "끄려면 `harness auto-skip off`." % reason)
+        out["systemMessage"] = ("harness: 단계 스킵을 자동 승인했다 (사유: %s · %s). "
+                                "끄려면 `harness auto-skip off`."
+                                % (reason, auto_skip_scope_note(con)))
         return emit(out)
 
     detail = "%s: `%s`" % (CTRL_HEAD[sub], cmd.strip())
@@ -656,9 +706,8 @@ def cli_status(con, cfg, root, lid, sid, argv):
     for g in con.execute("SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0", (lid,)):
         print("  예외: %s (남은 %d회) — %s" % (g["glob"], g["uses_left"], g["reason"]))
     if auto_skip_on(con):
-        print("  ⚠ 스킵 자동 승인 ON (since %s) — 사유: %s. 끄려면 `harness auto-skip off`"
-              % (get_meta(con, "auto_skip_at", "-"),
-                 get_meta(con, "auto_skip_reason", "-")))
+        print("  ⚠ 스킵 자동 승인 ON (%s) — 사유: %s. 끄려면 `harness auto-skip off`"
+              % (auto_skip_scope_note(con), get_meta(con, "auto_skip_reason", "-")))
     return 0
 
 
@@ -743,6 +792,7 @@ def cli_skip(con, cfg, root, lid, sid, argv):
 
     # 자동 승인으로 통과한 스킵은 사람이 승인한 것과 구분해 기록한다
     by = "auto" if auto_skip_on(con) else "user"
+    left = None
     skipped = []
     with con:
         # 현재 단계: 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다
@@ -759,10 +809,14 @@ def cli_skip(con, cfg, root, lid, sid, argv):
                         "authorized_by=? WHERE loop_id=? AND stage=?",
                         (now(), reason, by, lid, ids[i]))
             skipped.append(ids[i])
+        if by == "auto":
+            left = consume_auto_skip(con)
         nlid, nsid, cycled = _enter(con, cfg, root, lid, dest + 1)
     print("스킵(%s): %s" % ("자동 승인" if by == "auto" else "사용자 승인",
                             ", ".join(skipped) or "(없음)"))
     print("사유: %s" % reason)
+    if by == "auto" and left is not None:
+        print("자동 승인 남은 횟수: %d%s" % (left, " — 소진되어 OFF 로 돌아갔다" if left == 0 else ""))
     if cycled:
         print("루프 %s 종료 → 새 루프 %s, 단계 %s" % (lid, nlid, label_of(cfg, nsid)))
     else:
@@ -811,31 +865,56 @@ def cli_auto_skip(con, cfg, root, lid, sid, argv):
     if mode == "off":
         with con:
             set_meta(con, "auto_skip", "off")
+            set_meta(con, "auto_skip_uses", "")
+            set_meta(con, "auto_skip_loop", "")
             set_meta(con, "auto_skip_off_at", now())
         print("스킵 자동 승인 OFF — 이제 모든 스킵이 사용자 동의를 요구한다.")
         return 0
+
     if mode == "on":
         reason = argv_value(argv, "reason")
+        uses = argv_value(argv, "uses")
+        scope = argv_value(argv, "scope") or "project"
         if not reason:
-            print("사용법: harness auto-skip on --reason \"...\"")
+            print("사용법: harness auto-skip on --reason \"...\" "
+                  "[--uses N] [--scope loop|project]")
             return 2
+        if scope not in ("loop", "project"):
+            print("--scope 는 loop 또는 project 여야 한다.")
+            return 2
+        if uses is not None:
+            try:
+                if int(uses) < 1:
+                    raise ValueError
+            except ValueError:
+                print("--uses 는 1 이상의 정수여야 한다.")
+                return 2
         with con:
             set_meta(con, "auto_skip", "on")
             set_meta(con, "auto_skip_reason", reason)
             set_meta(con, "auto_skip_at", now())
+            set_meta(con, "auto_skip_uses", str(int(uses)) if uses else "")
+            set_meta(con, "auto_skip_loop", lid if scope == "loop" else "")
         print("스킵 자동 승인 ON (사용자 승인) — 사유: %s" % reason)
-        print("이후 스킵은 다이얼로그 없이 통과하지만, 사유는 계속 필수이고")
-        print("기록에는 authorized_by=auto 로 남는다. 끄려면 `harness auto-skip off`.")
+        print("범위: %s" % auto_skip_scope_note(con))
+        print("사유는 계속 필수이고 기록에는 authorized_by=auto 로 남는다. "
+              "끄려면 `harness auto-skip off`.")
         return 0
+
     if mode == "status":
-        if auto_skip_on(con):
+        active, expired = auto_skip_state(con)
+        if active:
             print("스킵 자동 승인: ON (since %s) — 사유: %s"
                   % (get_meta(con, "auto_skip_at", "-"),
                      get_meta(con, "auto_skip_reason", "-")))
+            print("  범위: %s" % auto_skip_scope_note(con))
         else:
-            print("스킵 자동 승인: OFF — 모든 스킵이 사용자 동의를 요구한다.")
+            print("스킵 자동 승인: OFF — 모든 스킵이 사용자 동의를 요구한다."
+                  + (" (%s)" % expired if expired else ""))
         return 0
-    print("사용법: harness auto-skip {on --reason \"...\" | off | status}")
+
+    print("사용법: harness auto-skip {on --reason \"...\" [--uses N] "
+          "[--scope loop|project] | off | status}")
     return 2
 
 

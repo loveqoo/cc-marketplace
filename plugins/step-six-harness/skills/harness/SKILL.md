@@ -26,7 +26,7 @@ description: 6단계 작업 하네스의 현재 단계를 확인하고 제어한
 | `loop` | 현재 루프 해시·브랜치. `.dev/` 파일명 접두사가 이 해시다 | |
 | `loop new --intent "..."` | 루프를 닫고 새 해시로 시작 (`advance` 가 6단계 끝에서 자동 호출) | |
 | `loop adopt <hash> --reason "..."` | DB를 잃었을 때 기존 해시로 재연결 | ✅ 다이얼로그 |
-| `auto-skip on --reason "..."` | 스킵 동의 다이얼로그를 끄고 자동 승인 | ✅ 다이얼로그 (켜는 것 자체는 승인 필요) |
+| `auto-skip on --reason "..." [--uses N] [--scope loop\|project]` | 스킵 동의 다이얼로그를 끄고 자동 승인. 범위를 좁히는 것을 권한다 | ✅ 다이얼로그 (켜는 것 자체는 승인 필요) |
 | `auto-skip off` / `auto-skip status` | 자동 승인 해제 / 현재 상태 | 끄기는 승인 불필요 |
 
 ## 차단당했을 때

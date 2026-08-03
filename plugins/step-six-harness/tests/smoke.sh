@@ -143,7 +143,7 @@ check "ON 이어도 사유는 여전히 필수" '"permissionDecision": "deny"' \
   "$(hook "$(B '.claude/harness/bin/harness skip context' default)")"
 check "ON 이어도 allow 는 동의를 요구" '"permissionDecision": "ask"' \
   "$(hook "$(B '.claude/harness/bin/harness allow \"docs/x.md\" --reason \"y\"' default)")"
-check "SessionStart 가 ON 을 경고" '자동 승인이 켜져 있다' \
+check "SessionStart 가 ON 을 경고" '⚠ 스킵 자동 승인 ON' \
   "$(hook '{"hook_event_name":"SessionStart","cwd":"'"$WORK"'","source":"startup"}')"
 cli skip context --reason "자동 승인으로 건너뜀" >/dev/null
 check "기록은 authorized_by=auto 로 구분" '^auto$' \
@@ -155,7 +155,36 @@ setstage context
 check "복원 후 다시 동의를 요구" '"permissionDecision": "ask"' \
   "$(hook "$(B "$SKIPCMD" default)")"
 
+echo "== 자동 승인 횟수 만료 (--uses N)"
+cli auto-skip on --reason "핫픽스 2회만" --uses 2 >/dev/null
+check "횟수 범위 표시" '남은 2회' "$(cli auto-skip status)"
+setstage context; cli skip context --reason "1회차" >/dev/null
+check "1회 소진" '남은 1회' "$(cli auto-skip status)"
+setstage context; LASTOUT="$(cli skip context --reason '2회차')"
+check "소진 시 안내" '소진되어 OFF' "$LASTOUT"
+check "소진 후 OFF + 사유" '소진해 만료' "$(cli auto-skip status)"
+setstage context
+check "만료 후 다시 동의를 요구" '"permissionDecision": "ask"' \
+  "$(hook "$(B "$SKIPCMD" default)")"
+
+echo "== 자동 승인 루프 범위 만료 (--scope loop)"
+cli auto-skip on --reason "이번 루프만" --scope loop >/dev/null
+check "루프 범위 표시" '루프 .* 범위' "$(cli auto-skip status)"
+check "같은 루프에서는 활성" '"permissionDecision": "defer"' \
+  "$(hook "$(B "$SKIPCMD" default)")"
+cli loop new >/dev/null
+check "루프가 바뀌면 만료" '루프가 바뀌어' "$(cli auto-skip status)"
+setstage context
+check "만료 후 다시 동의를 요구" '"permissionDecision": "ask"' \
+  "$(hook "$(B "$SKIPCMD" default)")"
+cli auto-skip off >/dev/null
+check "--uses 0 거부" '1 이상' "$(cli auto-skip on --reason x --uses 0 || true)"
+check "--scope 오타 거부" 'loop 또는 project' \
+  "$(cli auto-skip on --reason x --scope bogus || true)"
+check "거부되면 켜지지 않는다" 'OFF' "$(cli auto-skip status)"
+
 echo "== 루프 종료 시 행을 버린다"
+LID="$(loopid)"
 setstage compounding
 mkdir -p "$WORK/.dev/retrospect"
 hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-r.md"}}' "$WORK" "$LID")" >/dev/null
