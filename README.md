@@ -32,7 +32,7 @@ AI와 오래 일하면 같은 문제를 반복하게 됩니다. 지난주에 겪
 - 한 번 쓰고 버릴 스크립트를 만드는 중인 분 — 쌓일 것이 없으면 복리도 없습니다
 - 절차적 제약을 답답해하는 분 — 마찰이 커지면 결국 게이트를 끄게 됩니다
 
-> **현재 상태를 솔직히 적어둡니다.** 테스트 359개와 두 차례의 적대적 코드 리뷰를
+> **현재 상태를 솔직히 적어둡니다.** 테스트 375개와 두 차례의 적대적 코드 리뷰를
 > 통과했지만, **실제 프로젝트에서 길게 돌려본 적은 아직 없습니다.** 낮은 위험
 > 프로젝트에서 먼저 써보시는 것을 권합니다.
 
@@ -289,7 +289,7 @@ claude
 ### 하네스 자체를 고칠 때의 검사 셋
 
 ```bash
-sh plugins/step-seven-harness/tests/smoke.sh        # 359개, 매번 돌립니다
+sh plugins/step-seven-harness/tests/smoke.sh        # 375개, 매번 돌립니다
 python3 plugins/step-seven-harness/tests/math_check.py   # 측정 산술을 손계산과 대조
 sh plugins/step-seven-harness/tests/init_diff.sh    # 설치 동작이 리팩터 전과 같은지 차등 실행
 ```
