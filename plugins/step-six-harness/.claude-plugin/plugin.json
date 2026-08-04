@@ -1,8 +1,8 @@
 {
   "name": "step-six-harness",
   "displayName": "Step Six Harness",
-  "description": "6단계 선형 작업 원칙(Scaffolding → Context → Planning → Execution → Verification → Compounding)을 훅으로 강제하는 하네스. 폴더 규칙을 가드하고, 스킵은 사유와 유저 승인을 요구한다.",
-  "version": "0.15.0",
+  "description": "작업 하네스 — Selection(작업·완료 조건) → Scaffolding → Context → Planning → Execution → Verification → Compounding 을 훅으로 강제한다. 마지막 단계에서 작업 종료와 다음 회차로 갈라지므로 한 작업이 여러 회차를 돈다. 폴더 규칙을 가드하고, 스킵은 사유와 사용자 승인을 요구하며, 승인을 면제해도 기록은 면제하지 않는다.",
+  "version": "0.15.1",
   "author": {
     "name": "loveqoo",
     "email": "gunam.jung@gmail.com",

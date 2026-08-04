@@ -14,7 +14,7 @@ Claude Code 플러그인 마켓플레이스.
 
 | 플러그인 | 설명 |
 | --- | --- |
-| [`step-six-harness`](plugins/step-six-harness) | 6단계 선형 작업 원칙(Scaffolding → Context → Planning → Execution → Verification → Compounding)을 훅으로 강제한다. 폴더 규칙 가드, 스킵 사유·사용자 승인 요구, 검증 증거 없이 단계 종료 차단. |
+| [`step-six-harness`](plugins/step-six-harness) | 작업 하네스 — `Selection`(작업·완료 조건) → `Scaffolding` → `Context` → `Planning` → `Execution` → `Verification` → `Compounding` 을 훅으로 강제한다. 마지막 단계에서 **작업 종료**와 **다음 회차**로 갈라져 한 작업이 여러 회차를 돈다. 완료 조건·폴더 규칙 가드, 스킵은 사유와 사용자 승인 요구, 승인을 면제해도 기록은 면제하지 않음, 검증 증거 없이 단계 종료 차단. |
 
 ## 구조
 

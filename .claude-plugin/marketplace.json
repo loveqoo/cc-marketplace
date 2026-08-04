@@ -10,7 +10,7 @@
     {
       "name": "step-six-harness",
       "source": "./plugins/step-six-harness",
-      "description": "6단계 선형 작업 원칙을 훅으로 강제하는 하네스. 폴더 규칙 가드, 스킵 사유·승인 요구, 검증 증거 없이 단계 종료 차단.",
+      "description": "작업 하네스 — Selection부터 Compounding까지 7단계를 훅으로 강제하고, 마지막에서 작업 종료와 다음 회차로 갈라진다. 완료 조건·폴더 규칙 가드, 스킵은 사유와 승인 필요, 검증 증거 없이 단계 종료 차단.",
       "category": "workflow",
       "keywords": ["harness", "workflow", "guardrails", "hooks"]
     }
