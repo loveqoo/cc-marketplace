@@ -1061,6 +1061,45 @@ print(sqlite3.connect(sys.argv[1]).execute(
 " "$GW/.claude/harness/harness.db")"
 rm -rf "$GW"
 
+echo "== 측정 산술 (손계산 대조)"
+# 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
+# cycle_counters 11개 항목과 _survival 8개 항목.
+MC="$(cd "$(dirname "$0")/../../.." && pwd)"
+MOUT="$(python3 "$(dirname "$0")/math_check.py" "$MC" 2>&1)"; MRC=$?
+check "손계산과 전부 일치" '^0$' "$MRC"
+check "실패 항목 없음" '실패 0개' "$MOUT"
+if [ "$MRC" != 0 ]; then printf '%s\n' "$MOUT" | grep FAIL | sed 's/^/     /'; fi
+
+echo "== 순수 함수 경계 (_bucket / _pct / trend_verdict)"
+POUT="$(python3 - "$(dirname "$0")/../scripts" <<'PYP'
+import sys
+sys.path.insert(0, sys.argv[1])
+import harness as h
+bad = []
+for n in range(0, 41):
+    bs = h._bucket([{"i": i} for i in range(n)])
+    if n == 0:
+        if bs != []:
+            bad.append("n=0")
+        continue
+    cov = [(lo, hi, len(r)) for lo, hi, r in bs]
+    if sum(c for _, _, c in cov) != n: bad.append("총합 n=%d" % n)
+    if any(hi - lo + 1 != c for lo, hi, c in cov): bad.append("라벨폭 n=%d" % n)
+    if cov[0][0] != 1 or cov[-1][1] != n: bad.append("양끝 n=%d" % n)
+    if any(cov[i][1] + 1 != cov[i+1][0] for i in range(len(cov)-1)):
+        bad.append("연속성 n=%d" % n)
+if h._pct(1, 0).strip() != "-": bad.append("0 분모")
+if h._pct(2, 3).strip() != "67%": bad.append("반올림")
+mk = lambda b, r, by: {"blocks": b, "refails": r, "bypass": by, "skips": 0, "declines": 0}
+if h.trend_verdict([mk(5,3,0), mk(2,1,0)]) != "improving": bad.append("improving")
+if h.trend_verdict([mk(5,3,0), mk(2,1,3)]) != "evasion": bad.append("evasion")
+if h.trend_verdict([mk(5,3,0), mk(5,3,2)]) != "mismatch": bad.append("mismatch")
+if h.trend_verdict([mk(5,3,0)]) is not None: bad.append("구간1")
+print("실패: %s" % (bad or "없음"))
+PYP
+)"
+check "_bucket n=0..40 라벨·분할·연속성" '실패: 없음' "$POUT"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

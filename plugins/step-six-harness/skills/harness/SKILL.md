@@ -220,4 +220,7 @@ Scaffolding 이 불완전했다는 증거**다. 자식 루프로 감싸면 그 �
   돌아온다(최대 6회). 그때는 `harness advance` 로 다음 단계로 가거나, Compounding 이면
   `advance --done`/`--cycle` 로 닫는다. **진전이 없으면 2회에서 멈추고** 사람에게 물으라고
   한다 — 같은 명령을 반복하지 말고 무엇이 막고 있는지 보고하라.
+- 하네스 자신을 고칠 때의 검사 셋: `tests/smoke.sh`(359개, 매번),
+  `tests/math_check.py`(측정 산술을 손계산과 대조), `tests/init_diff.sh`(설치 동작이
+  리팩터 전과 같은지 차등 실행 — git 히스토리가 필요하고 느려서 손으로 돌린다).
 - 상세 근거는 `.claude/harness/rationale.md` 에 있다. 필요할 때 읽는다.
