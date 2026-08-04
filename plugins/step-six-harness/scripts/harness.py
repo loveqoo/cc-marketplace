@@ -1019,7 +1019,8 @@ def cli_skip(con, cfg, root, lid, sid, argv):
         print("뒤로 갈 수는 없다. 현재 단계 %s 유지." % label_of(cfg, sid))
         return 1
 
-    # 건너뛸 수 없는 단계 — 루프를 중단하더라도 회고는 남겨야 복리가 끊기지 않는다.
+    # 건너뛸 수 없는 단계 — 회차를 중단하더라도 회고는 남겨야 복리가 끊기지 않는다.
+    # 이 검사가 먼저다. 아래 기록 검사보다 뒤에 두면 엉뚱한 이유를 내놓는다.
     locked = [ids[i] for i in range(cur, dest + 1)
               if cfg["stages"][i].get("skippable") is False]
     if locked:
@@ -1028,6 +1029,18 @@ def cli_skip(con, cfg, root, lid, sid, argv):
               "이동한 뒤, 중단 사유를 회고로 남기고 `harness advance` 로 루프를 닫아라."
               % locked[0])
         return 1
+
+    # 스킵은 **승인**을 면제하지만 **기록**을 면제하지 않는다.
+    # 무인 실행으로 Planning 을 건너뛰어도 계획 파일은 남아야 한다 — 회차 10번을 돌았을 때
+    # 계획 10개가 남는 것과 스킵 기록 10개가 남는 것은 복리의 재료로서 다르다.
+    for i in range(cur, dest + 1):
+        st = cfg["stages"][i]
+        for key in st.get("skip_requires", []):
+            if not has_evidence(con, lid, key):
+                print("%s 를 건너뛰더라도 기록은 남겨야 한다: %s"
+                      % (st["label"], CRITERIA_HELP.get(key, key)))
+                print("먼저 그 기록을 남긴 뒤 다시 시도하라. 승인만 면제된다.")
+                return 1
 
     # 자동 승인으로 통과한 스킵은 사람이 승인한 것과 구분해 기록한다
     by = "auto" if auto_skip_on(con) else "user"

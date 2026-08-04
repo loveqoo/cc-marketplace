@@ -70,6 +70,7 @@
       "hint": "계획을 다른 모델이나 서브에이전트에게 적대적으로 검토받는 것을 고려하라(권고 — 강제하지 않는다). 이 환경에 codex·antigravity 플러그인과 서브에이전트가 있다. 사용자가 원하면 여러 모델에 돌린다.",
       "write": ["dev", "context"],
       "exit_criteria": ["plan_file", "plan_approved"],
+      "skip_requires": ["plan_file"],
       "stop_requires": []
     },
     {

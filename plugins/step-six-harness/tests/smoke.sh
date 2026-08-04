@@ -147,6 +147,17 @@ check "compounding 을 지나치는 +N 도 거부" '건너뛸 수 없다' \
   "$(cli skip +6 --reason '전부 생략' || true)"
 check "단계가 유지된다" 'Planning' "$(cli status | head -1)"
 
+echo "== 스킵은 승인을 면제하지만 기록을 면제하지 않는다"
+check "계획 없이 Planning 스킵 거부" '기록은 남겨야 한다' \
+  "$(cli skip planning --reason '무인 실행 중' || true)"
+check "무엇을 남겨야 하는지 알려준다" '\.dev/plan/' \
+  "$(cli skip planning --reason '무인 실행 중' || true)"
+PLID="$(loopid)"
+mkdir -p "$WORK/.dev/plan"
+hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/plan/%s-1-p.md"}}' "$WORK" "$PLID")" >/dev/null
+check "기록을 남기면 스킵 통과" 'planning' "$(cli skip planning --reason '승인만 면제')"
+setstage planning
+
 echo "== 루프 중단 패턴: skip until:compounding → 회고 → 새 루프"
 ABORT="$(cli skip until:compounding --reason 'Planning에서 구조 선행 필요를 발견')"
 check "Compounding 까지 이동" '7/7 Compounding' "$ABORT"
