@@ -1061,6 +1061,123 @@ print(sqlite3.connect(sys.argv[1]).execute(
 " "$GW/.claude/harness/harness.db")"
 rm -rf "$GW"
 
+echo "== 회고의 질문과 형식"
+RW2="$(mktemp -d)"
+(cd "$RW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+r2() { (cd "$RW2" && python3 "$ENGINE" "$@"); }
+rpy() { python3 - "$RW2" "$(dirname "$ENGINE")" "$@"; }
+r2 loop intent "회고 확인" >/dev/null
+r2 loop done-when "키가 확인된다" >/dev/null
+# 엔진의 now() 로 이벤트를 심는다. SQL strftime 은 UTC 라 창 밖으로 밀린다.
+rpy <<'PYR' >/dev/null
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1]); lid = h.head_loop(con)
+with con:
+    h.record_event(con, lid, "execution", "tool_fail", "Bash", "npm test")
+    h.record_event(con, lid, "execution", "block", "docs_readonly", "docs/a.md")
+    con.execute("UPDATE stage SET status='pending' WHERE status='active'")
+    con.execute("UPDATE stage SET status='active' WHERE stage='verification'")
+    h.record_evidence(con, lid, "verification", "verification_evidence", "t")
+PYR
+ROUT="$(r2 advance)"
+check "회고 질문을 제시한다" '회고에 답할 것' "$ROUT"
+check "성공 쪽을 묻는다 (ExpeL 의 짝)" '무엇이 통했나' "$ROUT"
+check "잘못된 가정을 묻는다" '무엇을 잘못 가정했나' "$ROUT"
+check "회차를 싸게 만들 것을 묻는다" '싸게 만들었을 것' "$ROUT"
+check "검색 키를 그대로 알려준다" '검색 키' "$ROUT"
+check "관측된 명령이 키에 들어간다" 'npm test' "$ROUT"
+check "관측된 규칙도 키에 들어간다" 'docs_readonly' "$ROUT"
+check "키가 없으면 안 찾아진다고 경고한다" '찾아지지 않는다' "$ROUT"
+check "질문이 관측 목록보다 앞에 온다" '^1$' \
+  "$(printf '%s' "$ROUT" | awk '/회고에 답할 것/{q=NR} /관측된 것/{o=NR} END{print (q && o && q<o) ? 1 : 0}')"
+
+# 키가 빠진 회고 -> 알리되 막지 않는다
+mkdir -p "$RW2/.dev/retrospect"
+RPRE="$(rpy <<'PYP'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1]); lid = h.head_loop(con)
+with con: h.record_evidence(con, lid, "compounding", "retro_file", "r")
+print(h.file_prefix(con, lid))
+PYP
+)"
+printf '# 회고\n- 테스트가 위치 때문에 실패했다.\n' > "$RW2/.dev/retrospect/${RPRE}retro.md"
+COUT="$(r2 advance --cycle)"
+check "키가 빠지면 알려준다" '검색 키 2개 중 2개가 빠졌다' "$COUT"
+check "막지 않고 회차는 닫힌다" '회차 1 기록' "$COUT"
+check "확인 결과가 event 로 남는다" 'found=0/2' \
+  "$(rpy <<'PYQ'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+r = con.execute("SELECT detail FROM event WHERE kind='retro_keys' ORDER BY id").fetchone()
+print(r["detail"] if r else "")
+PYQ
+)"
+
+# 키를 넣은 회고 -> 전부 들어 있다고 확인
+# 회차 경계는 **배타적**이다(종료 시각 +1초). 테스트는 한 초 안에 다 끝나므로
+# 새 회차의 이벤트는 시각을 명시해 심는다. 실사용에서는 회차 간격이 분 단위다.
+rpy <<'PYS' >/dev/null
+import sys, time; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1]); lid = h.head_loop(con)
+later = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(time.time() + 5))
+with con:
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                "VALUES(?,?,?,?,?,?)",
+                (later, lid, "execution", "tool_fail", "Bash", "npm test"))
+    con.execute("UPDATE stage SET status='pending' WHERE status='active'")
+    con.execute("UPDATE stage SET status='active' WHERE stage='compounding'")
+    h.record_evidence(con, lid, "compounding", "retro_file", "r")
+PYS
+RPRE2="$(rpy <<'PYT'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+print(h.file_prefix(con, h.head_loop(con)))
+PYT
+)"
+printf '# 회고 — `npm test`\n- `npm test` 는 루트에서 돌려야 한다.\n' \
+  > "$RW2/.dev/retrospect/${RPRE2}retro.md"
+check "키가 다 들어가면 그렇다고 알린다" '전부 들어 있다' "$(r2 advance --done)"
+
+# 형식이 실제로 찾아짐을 결정한다 (이 기능의 존재 이유)
+printf '# 회고\n테스트 실행이 파일을 못 찾아 실패했다.\n' \
+  > "$RW2/.dev/retrospect/${RPRE}paraphrase.md"
+check "키가 없는 회고는 recall 에 안 걸린다" '^0$' \
+  "$(r2 recall 'npm test' | grep -c 'paraphrase')"
+check "키가 있는 회고는 recall 에 걸린다" '^1$' \
+  "$(r2 recall 'npm test' | grep -c "${RPRE2}retro.md")"
+
+# 회차 경계: 종료와 **같은 초**의 이벤트는 앞 회차에 속해야 한다.
+# 포함 경계였을 때 앞 회차의 마지막 이벤트가 다음 회차 창에 겹쳐 두 번 세어졌다.
+check "회차 경계의 같은 초 이벤트는 다음 회차로 새지 않는다" 'ok' \
+  "$(rpy <<'PYB'
+import sys, time; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+lid = "260101-bbbbbb"
+close_at = "2026-01-01T12:00:00+0900"
+with con:
+    con.execute("INSERT OR IGNORE INTO loop(id,created_at) VALUES(?,?)",
+                (lid, "2026-01-01T10:00:00+0900"))
+    # 종료와 같은 초에 남은 이벤트 + 1초 뒤 이벤트
+    for at, tgt in ((close_at, "old cmd"), ("2026-01-01T12:00:01+0900", "new cmd")):
+        con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (at, lid, "execution", "tool_fail", "Bash", tgt))
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (close_at, lid, "compounding", "cycle_close", "1", lid + "-1", "{}"))
+keys = h.cycle_search_keys(con, lid, h.cycle_window_start(con, lid))
+assert keys == ["new cmd"], ("앞 회차 이벤트가 새어들었다", keys)
+print("ok")
+PYB
+)"
+rm -rf "$RW2"
+
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
 # cycle_counters 11개 항목과 _survival 8개 항목.

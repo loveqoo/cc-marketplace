@@ -109,6 +109,7 @@ EVENT_KINDS = {
     "promote_declined": "승격 보류",
     "promote_verify": "승격 시 변경 관측",
     "cycle_close": "회차 종료",
+    "retro_keys": "회고 검색 키 확인",
     "stop_continue": "턴 이어붙임",
     "stop_stalled": "진전 없어 이어붙임 중단",
 }
@@ -576,19 +577,27 @@ def pending_promotions(con, cfg, limit=None):
 # "no such column" 으로 하네스가 죽는 일이 없다.
 
 def cycle_window_start(con, lid):
-    """이번 회차가 시작된 시각. 마지막 회차 종료 기록이 없으면 작업 생성 시각."""
+    """이번 회차 창의 시작 **epoch**. `>=` 로 비교한다.
+
+    시각 정밀도가 초 단위라 경계 처리가 필요하다. 회차 종료 기록이 있으면 그
+    시각을 **배타적**으로 둔다(+1초) — 같은 초에 남은 이벤트는 앞 회차의 사실이고,
+    포함시키면 한 회차의 마지막 이벤트가 다음 회차 창에 겹쳐 두 번 세어진다.
+    회차 종료 기록이 없으면(1회차) 작업 생성 시각을 포함한다.
+    """
     row = con.execute(
         "SELECT MAX(at) a FROM event WHERE loop_id=? AND kind='cycle_close'",
         (lid,)).fetchone()
     if row and row["a"]:
-        return row["a"]
+        return ts_epoch(row["a"]) + 1
     row = con.execute("SELECT created_at FROM loop WHERE id=?", (lid,)).fetchone()
-    return (row["created_at"] if row else None) or ""
+    return ts_epoch(row["created_at"] if row else None)
 
 
-def cycle_counters(con, lid, start):
-    """이 회차의 마찰 수치. 회피 지표를 반드시 함께 담는다 — 차단만 보면 속는다."""
-    lo = ts_epoch(start)
+def cycle_counters(con, lid, lo):
+    """이 회차의 마찰 수치. 회피 지표를 반드시 함께 담는다 — 차단만 보면 속는다.
+
+    `lo` 는 cycle_window_start 가 준 epoch 다 (경계 처리가 거기 들어 있다).
+    """
     rows = events_where(con, loop_id=lid, from_epoch=lo)
     tally = {}
     for r in rows:
@@ -613,7 +622,7 @@ def cycle_counters(con, lid, start):
         seen_now.add(r["target"])
 
     return {
-        "dur": max(0, int(time.time() - lo)) if start else 0,
+        "dur": max(0, int(time.time() - lo)) if lo else 0,
         "blocks": tally.get("block", 0),
         "fails": tally.get("tool_fail", 0),
         "refails": refails,
@@ -633,8 +642,7 @@ def record_cycle_close(con, cfg, lid, sid):
     stage 행은 작업이 닫힐 때 삭제되므로 나중에 회차별 비용을 되살릴 수 없다.
     경계에서 스냅샷을 남기면 event 는 작업이 닫혀도 살아남아 측정이 가능해진다.
     """
-    start = cycle_window_start(con, lid)
-    c = cycle_counters(con, lid, start)
+    c = cycle_counters(con, lid, cycle_window_start(con, lid))
     c["cycle"] = cycle_of(con, lid)
     record_event(con, lid, sid, "cycle_close", str(c["cycle"]),
                  "%s-%d" % (lid, c["cycle"]), json.dumps(c, ensure_ascii=False))
@@ -657,15 +665,85 @@ def promote_change_seen(con, cfg, lid, as_kind):
     if not pats:
         return None
     excl = cfg.seq("promotion.verify_exclude")
-    start = cycle_window_start(con, lid)
     for r in events_where(con, kinds=("edit",), loop_id=lid,
-                          from_epoch=ts_epoch(start)):
+                          from_epoch=cycle_window_start(con, lid)):
         rel = r["target"] or ""
         if any(glob_match(rel, p) for p in excl):
             continue
         if any(glob_match(rel, p) for p in pats):
             return True
     return False
+
+
+# ----------------------------------------------------------------- retrospect
+#
+# 회고는 파일이 있는지만 봤고 **무엇을 묻는지는 설계된 적이 없었다.** 밀어주던 것이
+# 전부 하네스 내부 사정(어떤 규칙에 걸렸나, 어떤 파일을 다시 고쳤나)이라, "왜 내
+# 규칙을 어겼나"를 묻고 "무엇을 배웠나"는 묻지 않았다.
+#
+# 그리고 형식이 기계적으로 중요하다. 회고는 나중에 **정규화된 명령·규칙 이름으로
+# 텍스트 검색**되어 찾아진다. 같은 사실을 담아도 그 토큰이 글자 그대로 없으면
+# 영원히 안 찾아진다 — 실험으로 확인했다. 그래서 키를 알려주고 들어갔는지 본다.
+#
+# 통찰의 질은 채점하지 않는다(판단이다). 찾아지는지만 확인한다(기계적 사실이다).
+
+RETRO_QUESTIONS = (
+    ("무엇이 통했나", "막혔던 것을 결국 어떻게 풀었는가. 실패만 적으면 절반이다 — "
+                      "다음에 필요한 건 해결 쪽이다"),
+    ("무엇을 잘못 가정했나", "시작할 때 참이라고 믿었는데 틀린 것. 같은 오해가 "
+                             "다음 작업에서 되풀이된다"),
+    ("이 회차를 싸게 만들었을 것은", "미리 알았다면 무엇이 줄었을까. 이게 복리의 "
+                                     "정의 그 자체다"),
+)
+
+
+def cycle_search_keys(con, lid, lo, limit=6):
+    """이 회차에 관측된 것들의 **검색 키**.
+
+    나중에 실패 지점 주입과 `recall` 이 바로 이 문자열로 회고를 찾는다. 그러니
+    회고에 이 문자열이 글자 그대로 들어 있어야 한다.
+    """
+    keys = []
+    for r in events_where(con, kinds=("tool_fail", "block"), loop_id=lid,
+                          from_epoch=lo):
+        k = r["target"] if r["kind"] == "tool_fail" else r["rule"]
+        if k and k not in keys:
+            keys.append(k)
+    return keys[:limit]
+
+
+def retro_files_of_cycle(con, root, lid):
+    """이 회차가 쓴 회고·학습 파일. 파일명 접두사로 가른다."""
+    pre = file_prefix(con, lid)
+    out = []
+    for sub in RECALL_DIRS:
+        d = os.path.join(root, ".dev", sub)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if n.startswith(pre) and os.path.isfile(os.path.join(d, n)):
+                out.append(os.path.join(d, n))
+    return out
+
+
+def retro_key_report(con, root, lid, lo):
+    """(키, 찾은 키, 못 찾은 키). 검색과 **같은 범위**를 읽어 확인한다."""
+    keys = cycle_search_keys(con, lid, lo)
+    if not keys:
+        return [], [], []
+    hay = ""
+    for path in retro_files_of_cycle(con, root, lid):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                hay += "\n" + fh.read(RECALL_READ_BYTES).lower()
+        except OSError:
+            continue
+    found = [k for k in keys if k.lower() in hay]
+    return keys, found, [k for k in keys if k not in found]
 
 
 def promotion_summary(con, cfg):
@@ -1805,6 +1883,20 @@ def _hint_on_enter(ctx, lid, sid):
 
     if sid != "compounding":
         return
+
+    # 무엇을 물을지가 회고의 값을 정한다. 관측을 나열하기 **전에** 질문을 둔다 —
+    # 순서를 뒤집으면 "규칙에 걸린 목록"이 회고의 전부가 된다.
+    print("\n회고에 답할 것:")
+    for i, (q, why) in enumerate(RETRO_QUESTIONS, 1):
+        print("  %d. **%s** — %s" % (i, q, why))
+
+    keys = cycle_search_keys(con, lid, cycle_window_start(con, lid))
+    if keys:
+        print("\n이 회차의 검색 키 — 회고 **앞부분**에 이 문자열을 그대로 넣어라:")
+        print("  " + "  ".join("`%s`" % k for k in keys))
+        print("  나중에 이 키로 찾는다. 없으면 그 회고는 다시 찾아지지 않는다 "
+              "(내용이 같아도 그렇다).")
+
     sk = skips_of(con, lid)
     if sk:
         print("\n이 루프에서 건너뛴 단계 — 회고에 사유와 함께 기록하라:")
@@ -1900,6 +1992,23 @@ def cli_advance(ctx, argv):
                   "사람의 승인을 받아라." % sid)
         return 1
 
+    # 회고가 나중에 찾아지는지 확인한다. 통찰의 질은 채점하지 않지만 찾아지는지는
+    # 기계적 사실이라 확인할 수 있다. 막지는 않는다 — 무엇을 쓸지는 판단이다.
+    retro_note = None
+    if sid == last:
+        try:
+            keys, found, missing = retro_key_report(
+                con, root, lid, cycle_window_start(con, lid))
+            if keys:
+                retro_note = (keys, found, missing)
+                with con:
+                    record_event(con, lid, sid, "retro_keys", str(len(found)),
+                                 "%s-%d" % (lid, cycle_of(con, lid)),
+                                 "found=%d/%d missing=%s"
+                                 % (len(found), len(keys), ",".join(missing) or "-"))
+        except Exception:
+            pass
+
     snap = None
     with con:
         con.execute("UPDATE stage SET status='done', left_at=? "
@@ -1918,6 +2027,15 @@ def cli_advance(ctx, argv):
             nlid, nsid, _ = _enter(ctx, stage_index(cfg, sid) + 1)
             done_task = False
 
+    if retro_note:
+        keys, found, missing = retro_note
+        if missing:
+            print("회고 확인: 검색 키 %d개 중 %d개가 빠졌다 — %s"
+                  % (len(keys), len(missing), ", ".join("`%s`" % k for k in missing)))
+            print("   그 문자열이 회고에 없으면 다음에 같은 일이 생겨도 찾아지지 않는다. "
+                  "다음 회차 회고에는 넣어라.")
+        else:
+            print("회고 확인: 검색 키 %d개 전부 들어 있다 — 다시 찾아진다." % len(keys))
     if snap:
         print("회차 %d 기록: 차단 %d · 실패 %d(반복 %d) · 재편집 최대 %d · "
               "우회 %d · 스킵 %d"
@@ -2065,6 +2183,9 @@ def cli_approve_plan(ctx, argv):
 
 
 RECALL_DIRS = ("retrospect", "learning", "troubleshooting")
+# 회고 파일에서 읽는 범위. 이 밖의 내용은 `recall` 이 못 본다 — 즉 존재하지 않는
+# 것과 같다. 회고 키 확인도 **같은 상수**를 써야 확인이 거짓말을 하지 않는다.
+RECALL_READ_BYTES = 50000
 
 # 작업 설명에서 키워드를 뽑을 때 걸러낼 저정보 단어. 이것들이 남으면 OR 조회가
 # 거의 모든 기록에 걸려서 조회가 무의미해진다.
@@ -2124,7 +2245,7 @@ def _recall_files(root, keywords, limit=6):
             hay = name.lower()
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:
-                    hay += "\n" + fh.read(20000).lower()
+                    hay += "\n" + fh.read(RECALL_READ_BYTES).lower()
             except Exception:
                 pass
             if any(kw.lower() in hay for kw in keywords):

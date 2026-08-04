@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
-                       else os.path.join(os.path.dirname(__file__), "..", ".."))
+                       else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "plugins/step-seven-harness/scripts"))
 import harness as h  # noqa: E402
 
@@ -77,7 +77,8 @@ EXPECT = {                # 손계산
     "declines": 2,
     "promotes": 1,
 }
-got = h.cycle_counters(con, LID, T0)
+# cycle_counters 는 이제 epoch 를 받는다 (경계 처리가 cycle_window_start 안에 있다)
+got = h.cycle_counters(con, LID, h.ts_epoch(T0))
 print("cycle_counters")
 bad = []
 for k, want in sorted(EXPECT.items()):
