@@ -42,12 +42,19 @@ WRITE_TOOLS = {
 }
 
 # Bash 가 파일을 건드릴 가능성이 있는 명령. 이 경우에만 경로 토큰을 훑는다.
-BASH_MUTATORS = re.compile(r"(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|tee|dd|truncate)\b|>\s*\S|sed\s+-i")
+BASH_MUTATORS = re.compile(
+    r"(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|tee|dd|truncate|install|ln|shred)\b"
+    r"|>\s*\S|sed\s+-i"
+    # find 는 -delete/-exec 로 쓴다. 읽기 명령으로 분류했다가 통째로 통과했다.
+    r"|\s-delete\b|\s-exec(dir)?\b")
 # 두 번째 토큰까지 잡는다. `loop new` 는 루프를 닫고 새로 만들므로 모든 단계
 # 게이트를 우회하는데, 첫 토큰만 보면 subcommand 가 'loop' 로 잡혀 동의 판정이
 # 아예 일어나지 않았다 — 승격 게이트가 그 구멍으로 그대로 새어나갔다.
-CTRL_RE = re.compile(r"harness(?:\.py)?[\"']?\s+([a-z-]+)(?:\s+([a-z-]+))?")
 CTRL_SUB2 = {"loop": ("new", "adopt")}
+CTRL_NAMES = ("harness", "harness.py")
+# 따옴표 안은 값이다. 먼저 한 토큰으로 뭉개야 `--reason "a b"` 의 'b' 가 위치
+# 인자로 오인되지 않는다 — 그 오인이 subcommand 판정을 틀리게 만들었다.
+QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
 CONSENT_CMDS = ("skip", "allow", "approve-plan", "loop new", "loop adopt")
 CTRL_HEAD = {
     "skip": "단계 스킵 요청",
@@ -919,8 +926,21 @@ def check_write(ctx, rel):
             record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
             return "deny", reason
     if w.grant:
-        ctx.con.execute("UPDATE wgrant SET uses_left=uses_left-1 WHERE id=?",
-                        (w.grant["id"],))
+        # 조건부 UPDATE 로 소비한다. `with con:` 은 첫 DML 에서야 트랜잭션을
+        # 시작하므로 find_grant 의 SELECT 는 트랜잭션 밖이다 — 병렬 훅 넷이
+        # `--uses 1` 예외를 넷 다 쓰고 uses_left 가 -3 이 되는 것을 재현했다.
+        # rowcount 로 '먼저 소진한 쪽'을 판정한다.
+        used = ctx.con.execute(
+            "UPDATE wgrant SET uses_left=uses_left-1 WHERE id=? AND uses_left>0",
+            (w.grant["id"],)).rowcount
+        if not used:
+            # 다른 훅이 먼저 썼다. 예외 없이도 통과하는지 다시 판정한다.
+            w.grant = None
+            for name, rule in WRITE_RULES:
+                reason = rule(w)
+                if reason:
+                    record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
+                    return "deny", reason
     return None, None
 
 
@@ -929,8 +949,9 @@ BASH_SPLIT = re.compile(r"\|\||&&|[;&|\n]")
 # 정상 동작이므로 변경 시도로 오인해서는 안 된다.
 BASH_INTERPRETERS = ("python", "python3", "sh", "bash", "zsh", "env", "exec", "node")
 # 읽기만 하는 명령은 막지 않는다. 과잉 차단은 마찰이 되고, 마찰은 게이트를 끄게 만든다.
+# find 는 없다 — `-delete`/`-exec` 로 파일을 지운다.
 BASH_READERS = ("cat", "less", "more", "head", "tail", "grep", "rg", "wc", "file",
-                "stat", "ls", "find", "diff", "shasum", "md5", "md5sum", "awk", "cut")
+                "stat", "ls", "diff", "shasum", "md5", "md5sum", "cut")
 
 
 def bash_protected_hit(cfg, root, cmd):
@@ -943,11 +964,34 @@ def bash_protected_hit(cfg, root, cmd):
     if not pats:
         return None
 
+    mutating = bool(BASH_MUTATORS.search(cmd))
+    # `>|경로` 의 `|` 를 BASH_SPLIT 이 파이프로 보고 쪼개면 경로가 다음 세그먼트의
+    # **명령어 자리**로 밀려 '실행 대상' 으로 건너뛰어진다. 먼저 떼어놓는다.
+    cmd = cmd.replace(">|", "> ")
+
+    def candidates(tok):
+        """`of=경로`, `>|경로` 처럼 붙어 오는 형태까지 경로로 본다.
+
+        둘 다 실제로 통과했다: `dd if=/dev/null of=<db>`, `printf x >|<LEARNED>`.
+        """
+        raw = tok.strip("\"'")
+        out = [raw.lstrip("<>|&")]
+        if "=" in raw:
+            out.append(raw.split("=", 1)[1].lstrip("<>|&"))
+        return [t for t in out if t]
+
     def protected(tok):
-        rel = rel_to_root(root, tok.strip("\"'"))
-        if not rel or rel == ".":
-            return None
-        return rel if any(glob_match(rel, p) for p in pats) else None
+        for cand in candidates(tok):
+            rel = rel_to_root(root, cand)
+            if not rel or rel == ".":
+                continue
+            if any(glob_match(rel, p) for p in pats):
+                return rel
+            # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
+            # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
+            if mutating and any(p.startswith(rel + "/") for p in pats):
+                return rel
+        return None
 
     for seg in BASH_SPLIT.split(cmd):
         toks = re.findall(r"\S+", seg)
@@ -1078,8 +1122,47 @@ def auto_skip_scope_note(con):
     return ", ".join(bits) or "무제한"
 
 
+def ctrl_requests(cmd):
+    """명령 문자열의 하네스 제어 호출을 **전부** 찾아 (subcommand, 세그먼트) 로 준다.
+
+    두 결함을 함께 고친다.
+    1. 이전에는 `CTRL_RE.search` 로 **첫 매치만** 봤다. `harness status;
+       harness loop new` 는 status 로 판정되고 뒤의 loop new 는 검사되지 않았다.
+    2. 훅은 정규식의 두 번째 토큰을 subcommand 로 봤고 CLI 는 플래그를 걷어낸
+       위치 인자를 봤다. 두 파서가 다른 답을 내서 `loop --reason=x new` 가
+       게이트를 지나쳤다. 이제 훅도 `argv_positional` 과 같은 규칙을 쓴다.
+    """
+    out = []
+    for seg in BASH_SPLIT.split(cmd):
+        toks = QUOTED_RE.sub("_", seg).split()
+        for i, tok in enumerate(toks):
+            if os.path.basename(tok.strip("\"'")) not in CTRL_NAMES:
+                continue
+            pos, skip = [], False
+            for a in toks[i + 1:]:
+                if skip:
+                    skip = False
+                    continue
+                if a.startswith("--"):
+                    skip = "=" not in a  # `--flag value` 는 값도 건너뛴다
+                    continue
+                pos.append(a)
+            if pos:
+                sub = pos[0]
+                if len(pos) > 1 and pos[1] in CTRL_SUB2.get(sub, ()):
+                    sub = "%s %s" % (sub, pos[1])
+                out.append((sub, seg))
+            break
+    return out
+
+
 def ctrl_decision(con, sub, cmd, mode, lid, sid):
-    """제어 명령에 대한 판정. 사람의 동의가 필요한 것만 ask 로 올린다."""
+    """제어 명령에 대한 판정을 **돌려준다**(emit 하지 않는다).
+
+    한 Bash 명령에 제어 호출이 여러 개 있을 수 있어서, 호출자가 전부 순회하며
+    동의가 필요한 것을 찾아야 한다. 이전에는 첫 매치만 보고 즉시 emit 해서
+    `harness status; harness loop new` 가 통째로 통과했다.
+    """
     if sub == "auto-skip":
         # off 는 게이트 복원이므로 동의 없이 허용한다. on 은 게이트를 무력화하므로
         # 반드시 사람의 동의를 받는다 — 그러지 않으면 모델이 스스로 켤 수 있다.
@@ -1091,8 +1174,8 @@ def ctrl_decision(con, sub, cmd, mode, lid, sid):
     reason = raw_flag(cmd, "reason")
     if sub != "approve-plan" and not reason:
         record_event(con, lid, sid, "block", "no_reason", sub, cmd[:200])
-        return emit(pre_decision("deny",
-            "사유 없이 %s 할 수 없다. --reason \"...\" 로 사유를 명시하라." % sub))
+        return pre_decision("deny",
+            "사유 없이 %s 할 수 없다. --reason \"...\" 로 사유를 명시하라." % sub)
 
     if sub == "skip" and auto_skip_on(con):
         # 자동 승인이 켜져 있다. 다이얼로그는 생략하되 사실은 사용자에게 노출한다.
@@ -1100,7 +1183,7 @@ def ctrl_decision(con, sub, cmd, mode, lid, sid):
         out["systemMessage"] = ("harness: 단계 스킵을 자동 승인했다 (사유: %s · %s). "
                                 "끄려면 `harness auto-skip off`."
                                 % (reason, auto_skip_scope_note(con)))
-        return emit(out)
+        return out
 
     detail = "%s: `%s`" % (CTRL_HEAD[sub], cmd.strip())
     if reason:
@@ -1108,10 +1191,10 @@ def ctrl_decision(con, sub, cmd, mode, lid, sid):
     detail += "\n승인하면 하네스 상태에 기록된다."
     if mode == "bypassPermissions":
         record_event(con, lid, sid, "block", "bypass_mode", sub, cmd[:200])
-        return emit(pre_decision("deny", detail +
+        return pre_decision("deny", detail +
             "\nbypassPermissions 모드에서는 사람의 동의를 받을 수 없어 거부한다. "
-            "권한 모드를 낮추고 다시 시도하라."))
-    return emit(pre_decision("ask", detail))
+            "권한 모드를 낮추고 다시 시도하라.")
+    return pre_decision("ask", detail)
 
 
 def hook_pre_tool_use(inp, ctx):
@@ -1136,13 +1219,14 @@ def hook_pre_tool_use(inp, ctx):
                 "수정하라. 내용을 보려면 Read 도구를 쓰라. "
                 "이 차단은 `allow` 로도 열리지 않는다." % hit)))
 
-        m = CTRL_RE.search(cmd)
-        if m:
-            sub = m.group(1)
-            if m.group(2) and m.group(2) in CTRL_SUB2.get(sub, ()):
-                sub = "%s %s" % (sub, m.group(2))
+        reqs = ctrl_requests(cmd)
+        for req_sub, seg in reqs:
             with con:
-                return ctrl_decision(con, sub, cmd, mode, lid, sid)
+                out = ctrl_decision(con, req_sub, seg, mode, lid, sid)
+            if out:
+                return emit(out)
+        if reqs:
+            return  # 제어 명령이지만 동의가 필요 없다
 
         if BASH_MUTATORS.search(cmd):
             for tok in re.findall(r"[\w./~-]+", cmd):
@@ -1300,7 +1384,10 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
 def hook_stop(inp, ctx):
     con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
     stage = stage_obj(cfg, sid)
-    prompt_id = inp.get("prompt_id") or "-"
+    # prompt_id 가 없는 환경에서 "-" 로 뭉치면 서로 다른 프롬프트가 이어붙임
+    # 예산을 공유한다. 세션으로 대체하고, 그것도 없으면 작업 해시로 가둔다.
+    prompt_id = (inp.get("prompt_id") or inp.get("session_id")
+                 or "loop:%s" % lid)
     msg = (inp.get("last_assistant_message") or "").strip()
     limits = cfg.get("stop_block_limits", {})
 
@@ -1372,11 +1459,15 @@ def progress_fingerprint(con, lid, sid):
     return "%s:%d:%d" % (sid, ev, n)
 
 
-def stalled_rounds(con, prompt_id, fp):
-    """이 프롬프트에서 지문이 연속 몇 번 그대로였나."""
+def stalled_rounds(con, lid, prompt_id, fp):
+    """이 프롬프트에서 지문이 연속 몇 번 그대로였나.
+
+    작업(loop_id)으로도 가둔다. prompt_id 가 없는 환경에서 과거 기록이 새 작업의
+    예산을 깎는 것을 막는다.
+    """
     seen = [r["detail"] for r in con.execute(
-        "SELECT detail FROM event WHERE kind='stop_continue' AND target=? ORDER BY id",
-        (prompt_id,))]
+        "SELECT detail FROM event WHERE kind='stop_continue' AND target=? "
+        "AND loop_id=? ORDER BY id", (prompt_id, lid))]
     stalled = 0
     for d in reversed(seen):
         if d != fp:
@@ -1404,7 +1495,7 @@ def continue_or_stop(con, cfg, lid, sid, stage, prompt_id):
     limit = cfg.num("stop_continue.max_per_prompt", 6, low=1)
     no_prog = cfg.num("stop_continue.no_progress_limit", 2, low=1)
     fp = progress_fingerprint(con, lid, sid)
-    stalled, used = stalled_rounds(con, prompt_id, fp)
+    stalled, used = stalled_rounds(con, lid, prompt_id, fp)
 
     if stalled >= no_prog:
         # 조용히 놓아주지 않는다. 헛돈 사실이 기록되고 사용자에게 보인다.
@@ -1447,13 +1538,17 @@ def run_hook():
         inp = json.load(sys.stdin)
     except Exception:
         return 0
-    root = find_root(inp.get("cwd"))
-    if not root:
-        return 0  # 하네스 미설치 프로젝트 — 조용히 종료
-    con = connect(root)
-    if con is None:
-        return 0
+    con = None
     try:
+        root = find_root(inp.get("cwd"))
+        if not root:
+            return 0  # 하네스 미설치 프로젝트 — 조용히 종료
+        # connect 가 try 밖에 있었다. 손상된 SQLite 파일은 connect 나
+        # `PRAGMA journal_mode=WAL` 에서 DatabaseError 를 던지고, 그게
+        # fail-open 처리 밖이라 traceback + exit 1 이 됐다 — 재현했다.
+        con = connect(root)
+        if con is None:
+            return 0
         cfg = load_config(root, plugin_root())
         if not isinstance(cfg, dict) or not cfg.get("stages"):
             return 0  # 설정이 깨졌으면 차단하지 않는다
@@ -1480,7 +1575,11 @@ def run_hook():
                   "`.claude/harness/bin/harness init` 을 다시 실행하라." % exc})
         return 0
     finally:
-        con.close()
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
     return 0
 
 
@@ -1836,7 +1935,7 @@ def cli_advance(ctx, argv):
 
 def cli_skip(ctx, argv):
     """PreToolUse 가 사람의 승인을 받은 뒤에만 여기까지 온다."""
-    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
+    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
     pos = argv_positional(argv)
     target = pos[0] if pos else None
     reason = argv_value(argv, "reason")

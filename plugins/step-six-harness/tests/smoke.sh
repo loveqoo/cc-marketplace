@@ -972,9 +972,105 @@ PYFP
 )"
 rm -rf "$CW"
 
-echo "== 손상 내성"
+echo "== 동의 게이트: 훅과 CLI 가 같은 방식으로 subcommand 를 읽는다"
+GW="$(mktemp -d)"
+(cd "$GW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+gb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","permission_mode":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$GW" "${2:-default}" "$1" \
+  | CLAUDE_PROJECT_DIR="$GW" python3 "$ENGINE" hook; }
+W_="$GW/.claude/harness/bin/harness"
+check "옵션을 앞에 둬도 게이트가 걸린다" '"permissionDecision": "ask"' \
+  "$(gb "$W_ loop --reason=x new")"
+check "앞선 무해한 명령으로 우회할 수 없다" '"permissionDecision": "ask"' \
+  "$(gb "$W_ status; $W_ loop new --reason x")"
+# JSON 안에서 이스케이프가 필요 없는 홑따옴표를 쓴다. 겹따옴표를 쓰면 셸이 먼저
+# 벗겨서 JSON 이 깨지고, 훅이 조용히 0 을 반환해 검사가 무의미해진다.
+check "따옴표 안 공백이 위치 인자를 흐리지 않는다" '"permissionDecision": "ask"' \
+  "$(gb "$W_ loop new --reason 'a b'")"
+check "홑따옴표 값도 사유로 인식된다" '사유: a b' \
+  "$(gb "$W_ loop new --reason 'a b'")"
+check "&& 로 이어도 걸린다" '"permissionDecision": "ask"' \
+  "$(gb "$W_ recall x && $W_ skip context --reason y")"
+check "bypassPermissions 에서는 거부" '"permissionDecision": "deny"' \
+  "$(gb "$W_ loop --reason=x new" bypassPermissions)"
+check_empty "동의 불필요 명령은 조용하다 (status)" "$(gb "$W_ status")"
+check_empty "동의 불필요 명령은 조용하다 (loop)" "$(gb "$W_ loop")"
+check_empty "동의 불필요 명령은 조용하다 (metrics)" "$(gb "$W_ metrics")"
+check_empty "동의 불필요 명령은 조용하다 (recall)" "$(gb "$W_ recall npm test")"
+
+echo "== Bash 보호 경로: 리다이렉트·옵션값·find 액션"
+for BAD in "find .claude/harness -name harness.db -delete" \
+           "dd if=/dev/null of=.claude/harness/harness.db" \
+           "printf x >|.claude/harness/LEARNED.md" \
+           "find .claude/harness -name '*.py' -exec rm {} +" \
+           "rm -rf .claude" \
+           "ln -sf /dev/null .claude/harness/harness.db"; do
+  check "차단: $BAD" 'Bash 로도 변경할 수 없다' "$(gb "$BAD")"
+done
+for OK in "mkdir -p .claude/hooks" "cat .claude/harness/LEARNED.md" \
+          "find . -name '*.py'" "rm src/tmp.txt" "grep -r foo src/"; do
+  check_empty "허용: $OK" "$(gb "$OK")"
+done
+
+echo "== 일회성 쓰기 예외는 병렬 훅에서도 한 번만 쓰인다"
+python3 - "$GW/.claude/harness/harness.db" <<'PYG'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+lid = con.execute("SELECT v FROM meta WHERE k='head'").fetchone()[0]
+con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
+            "VALUES(?,?,?,?,datetime('now'))", (lid, "docs/**", "t", 1))
+con.commit()
+PYG
+for i in 1 2 3 4; do
+  printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/spec/00%d-a.md"}}' \
+    "$GW" "$GW" "$i" | CLAUDE_PROJECT_DIR="$GW" python3 "$ENGINE" hook > "$GW/g$i" 2>&1 &
+done
+wait
+check "통과한 쓰기는 하나뿐" '^1$' \
+  "$(n=0; for i in 1 2 3 4; do [ -s "$GW/g$i" ] || n=$((n+1)); done; echo $n)"
+check "나머지는 차단된다" '^3$' \
+  "$(n=0; for i in 1 2 3 4; do grep -q deny "$GW/g$i" && n=$((n+1)); done; echo $n)"
+check "uses_left 가 음수로 내려가지 않는다" '^0$' \
+  "$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute('SELECT uses_left FROM wgrant').fetchone()[0])
+" "$GW/.claude/harness/harness.db")"
+
+echo "== prompt_id 가 없으면 세션별로 예산을 가둔다"
+GL="$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute(\"SELECT v FROM meta WHERE k='head'\").fetchone()[0])
+" "$GW/.claude/harness/harness.db")"
+python3 - "$GW/.claude/harness/harness.db" "$GL" <<'PYS'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("UPDATE stage SET status='pending' WHERE status='active'")
+con.execute("UPDATE stage SET status='active' WHERE stage='scaffolding' AND loop_id=?",
+            (sys.argv[2],))
+con.commit()
+PYS
+gs() { printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"%s","last_assistant_message":"[Scaffolding] x"}' "$GW" "$1" \
+  | CLAUDE_PROJECT_DIR="$GW" python3 "$ENGINE" hook; }
+gs sA >/dev/null; gs sA >/dev/null
+check "같은 세션은 3회째에 멈춘다" '진전이 없어 멈춘다' "$(gs sA)"
+check "다른 세션은 예산이 새로 시작된다" '"decision": "block"' "$(gs sB)"
+check "세션별로 따로 집계된다" '^2$' \
+  "$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT COUNT(DISTINCT target) FROM event WHERE kind='stop_continue'\").fetchone()[0])
+" "$GW/.claude/harness/harness.db")"
+rm -rf "$GW"
+
+echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
+rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"
 check_empty "DB 손상 시 차단하지 않음" "$(hook "$(W docs/x.md)" 2>/dev/null)"
+hook "$(W docs/x.md)" >/dev/null 2>&1; CRC=$?
+check "DB 손상 시 종료 코드 0" '^0$' "$CRC"
+check "traceback 을 내지 않는다" '^0$' \
+  "$(hook "$(W docs/x.md)" 2>&1 >/dev/null | grep -c Traceback)"
+check "무슨 일인지 stderr 로 알린다" 'step-six-harness' \
+  "$(hook "$(W docs/x.md)" 2>&1 >/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
