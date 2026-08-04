@@ -279,6 +279,14 @@ def record_evidence(con, lid, sid, kind, item):
                 "VALUES(?,?,?,?,?)", (lid, sid, kind, item, now()))
 
 
+def acceptance_of(con, lid):
+    """이 작업의 완료 조건. 회차를 넘어 유지된다."""
+    # rowid 순 = 입력 순. at 으로 정렬하면 같은 초에 넣은 조건들의 순서가 뒤섞인다.
+    return [r["item"] for r in con.execute(
+        "SELECT item FROM evidence WHERE loop_id=? AND kind='acceptance' ORDER BY rowid",
+        (lid,))]
+
+
 def exit_blockers(con, cfg, lid, sid):
     return [k for k in stage_obj(cfg, sid).get("exit_criteria", [])
             if not has_evidence(con, lid, k)]
@@ -287,6 +295,8 @@ def exit_blockers(con, cfg, lid, sid):
 CRITERIA_HELP = {
     "intent_set": "이번에 할 작업을 `harness loop intent \"<작업>\"` 으로 기록해야 한다 "
                   "(Context 의 recall 이 이것을 기준으로 조회한다)",
+    "acceptance": "무엇이 '끝'인지를 `harness loop done-when \"<조건>\" ...` 으로 "
+                  "기록해야 한다 (Verification 이 대조할 기준이다)",
     "plan_file": "계획 파일을 .dev/plan/ 아래에 남겨야 한다",
     "plan_approved": "계획에 대한 사람의 승인이 필요하다 (harness approve-plan <file>)",
     "verification_evidence": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, "
@@ -804,6 +814,13 @@ def cli_status(con, cfg, root, lid, sid, argv):
         print("  작업 내용: (미정) — %s 단계에서 정하고 "
               "`harness loop intent \"...\"` 로 기록하라"
               % stage_obj(cfg, cfg["stages"][0]["id"])["label"])
+    acc = acceptance_of(con, lid)
+    if acc:
+        print("  완료 조건 (%d개):" % len(acc))
+        for i, t in enumerate(acc, 1):
+            print("    %d. %s" % (i, t))
+    else:
+        print("  완료 조건: (미정) — `harness loop done-when \"<조건>\" ...` 으로 기록하라")
     print("  요약: %s" % stage_obj(cfg, sid)["summary"])
     print("  쓰기 허용: %s" % (", ".join(stage_obj(cfg, sid).get("write", [])) or "(없음)"))
     print("  .dev/ 산출물 파일명 접두사: %s" % file_prefix(con, lid))
@@ -854,6 +871,14 @@ def _hint_on_enter(con, cfg, lid, sid):
     if hint:
         print("\n%s" % hint)
 
+    # 완료 조건은 Verification·Compounding 에서 무조건 관련 있으므로 밀어준다.
+    if sid in ("verification", "compounding"):
+        acc = acceptance_of(con, lid)
+        if acc:
+            print("\n이 작업의 완료 조건 (%d개):" % len(acc))
+            for i, t in enumerate(acc, 1):
+                print("  %d. %s" % (i, t))
+
     if sid != "compounding":
         return
     sk = skips_of(con, lid)
@@ -887,7 +912,10 @@ def next_cycle(con, cfg, root, lid):
     이전 회차의 계획·회고 파일은 파일로 남고, 파일명의 회차로 구분된다.
     """
     ids = stage_ids(cfg)
-    con.execute("DELETE FROM evidence WHERE loop_id=? AND kind != 'intent_set'", (lid,))
+    # 작업 정의(무엇을·무엇이 끝인지)는 회차를 넘어 유지한다. 회차마다 다시 선언하게
+    # 하면 긴 작업에서 기준이 표류한다 — 그게 완료 조건을 두는 이유와 정면으로 어긋난다.
+    con.execute("DELETE FROM evidence WHERE loop_id=? "
+                "AND kind NOT IN ('intent_set','acceptance')", (lid,))
     con.execute("DELETE FROM wgrant WHERE loop_id=?", (lid,))
     con.execute("UPDATE stage SET status='pending', entered_at=NULL, left_at=NULL, "
                 "reason=NULL, authorized_by=NULL WHERE loop_id=? AND stage != ?",
@@ -1350,6 +1378,28 @@ def cli_loop(con, cfg, root, lid, sid, argv):
         print("작업 %s 의 내용: %s" % (lid, text))
         print("Context 단계의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다.")
         return 0
+    if sub == "done-when":
+        items = [t for t in pos[1:] if t.strip()]
+        if "--clear" in argv:
+            with con:
+                con.execute("DELETE FROM evidence WHERE loop_id=? AND kind='acceptance'",
+                            (lid,))
+            print("완료 조건을 비웠다. 다시 기록하라.")
+            return 0
+        if items:
+            with con:
+                for it in items:
+                    record_evidence(con, lid, sid, "acceptance", it.strip())
+        rows = acceptance_of(con, lid)
+        if not rows:
+            print("사용법: harness loop done-when \"<완료 조건>\" [\"<조건2>\" ...] [--clear]")
+            print("무엇이 '끝'인지 기록한다. Verification 이 이것을 대조하고,")
+            print("Compounding 이 작업 종료 판단의 근거로 쓴다. 회차가 바뀌어도 유지된다.")
+            return 2
+        print("작업 %s 의 완료 조건 (%d개):" % (lid, len(rows)))
+        for i, t in enumerate(rows, 1):
+            print("  %d. %s" % (i, t))
+        return 0
     if sub == "adopt":
         want = pos[1] if len(pos) > 1 else None
         if not want:
@@ -1553,8 +1603,10 @@ USAGE = """step-six-harness — 작업 하네스
   auto-skip off | status       자동 승인 해제 / 현재 상태
 
 루프
-  loop intent "<작업>"          이번 루프에서 할 작업을 기록 (Scaffolding 에서)
+  loop intent "<작업>"          이번에 할 작업을 기록 (Selection 에서)
                                recall 이 이 작업을 기본 키워드로 쓴다
+  loop done-when "<조건>" ...   무엇이 '끝'인지 기록 (Selection 에서). 인자 없으면 목록,
+                               --clear 로 비운다. 회차가 바뀌어도 유지된다
   loop new [--intent "..."]    루프를 닫고 새 해시로 시작
   loop adopt <hash> --reason "..."
                                DB를 잃었을 때 기존 해시로 재연결 ✋

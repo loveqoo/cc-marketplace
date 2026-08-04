@@ -39,10 +39,10 @@
       "id": "selection",
       "label": "Selection",
       "skippable": false,
-      "summary": "이번에 할 작업을 정한다. 필요하면 작업 후보를 나열해 사용자와 합의한다(선택).",
-      "hint": "작업이 불분명하면 후보를 나열해 사용자와 합의하라(선택 — 이미 명확하면 건너뛴다). 정해지면 `harness loop intent \"<작업>\"` 으로 기록하라. 기록하지 않으면 이 단계를 끝낼 수 없고, Context 의 `harness recall` 도 무엇을 당겨올지 알 수 없다. 후보 목록을 남기려면 `.dev/plan/` 에 쓴다.",
+      "summary": "이번에 할 작업과 '무엇이 끝인지'를 정한다. 필요하면 작업 후보를 나열해 사용자와 합의한다(선택).",
+      "hint": "작업이 불분명하면 후보를 나열해 사용자와 합의하라(선택 — 이미 명확하면 건너뛴다). 정해지면 두 가지를 기록한다. ① `harness loop intent \"<작업>\"` — Context 의 recall 기준이 된다. ② `harness loop done-when \"<조건>\" ...` — 무엇이 '끝'인지. Verification 이 이것을 대조하고 Compounding 이 종료 판단의 근거로 쓴다. 둘 다 없으면 이 단계를 끝낼 수 없다. 조건은 검증 가능한 문장으로 쓰고, 회차가 바뀌어도 유지된다(바뀌면 `--clear` 후 다시 기록). 후보 목록을 남기려면 `.dev/plan/` 에 쓴다.",
       "write": ["dev"],
-      "exit_criteria": ["intent_set"],
+      "exit_criteria": ["intent_set", "acceptance"],
       "stop_requires": []
     },
     {
@@ -84,7 +84,7 @@
       "id": "verification",
       "label": "Verification",
       "summary": "완료 조건 대조. 자기검증 회피 — 서브에이전트/타 모델/브라우저/dry-run.",
-      "hint": "검증 결과도 적대적으로 재검토받는 것을 고려하라(권고). 사용자가 원하면 여러 모델에 돌린다.",
+      "hint": "Selection 에서 기록한 완료 조건을 하나씩 대조하라 — 아래에 그대로 제시된다. 검증 결과도 적대적으로 재검토받는 것을 고려하라(권고). 사용자가 원하면 여러 모델에 돌린다.",
       "write": ["tests", "dev"],
       "exit_criteria": ["verification_evidence"],
       "stop_requires": ["verification_evidence"]
@@ -94,7 +94,7 @@
       "label": "Compounding",
       "skippable": false,
       "summary": "회고를 기록하고, 작업이 끝났는지 스스로 판단한다. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
-      "hint": "회고를 쓴 뒤 두 갈래 중 하나를 고른다. 작업이 끝났으면 `harness advance --done` (Selection 으로 돌아가 새 작업을 정한다). 후속 회차가 남았으면 `harness advance --cycle` (Scaffolding 부터 다시, 같은 작업 유지). 판단은 자율이다. 반복 항목은 `harness stats` 로 확인하라 — 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
+      "hint": "회고를 쓴 뒤 두 갈래 중 하나를 고른다. 판단 근거는 Selection 에서 기록한 완료 조건이다 — 아래에 그대로 제시된다. 작업이 끝났으면 `harness advance --done` (Selection 으로 돌아가 새 작업을 정한다). 후속 회차가 남았으면 `harness advance --cycle` (Scaffolding 부터 다시, 같은 작업 유지). 판단은 자율이다. 반복 항목은 `harness stats` 로 확인하라 — 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
       "write": ["dev", "context", "tests"],
       "exit_criteria": ["retro_file"],
       "stop_requires": ["retro_file"]

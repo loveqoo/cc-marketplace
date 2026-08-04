@@ -80,7 +80,13 @@ check "조회 명령이 미리 허용된다" 'harness recall' \
   "$(python3 -c "import json;print(json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'])")"
 check "동의 필요 명령은 허용하지 않는다" '^0$' \
   "$(python3 -c "import json;a=json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'];print(sum(1 for x in a if 'harness skip' in x or 'auto-skip on' in x))")"
-check "작업을 기록하면 종료 조건이 충족된다" '충족 intent_set' "$(cli status)"
+check "작업만 기록해서는 Selection 을 끝낼 수 없다" 'acceptance' "$(cli advance || true)"
+check "완료 조건 미정을 알린다" '완료 조건: (미정)' "$(cli status)"
+check "완료 조건을 기록한다" '테스트 전부 통과' \
+  "$(cli loop done-when '테스트 전부 통과' '응답 200ms 이하')"
+check "입력 순서를 보존한다" '1\. 테스트 전부 통과' "$(cli loop done-when)"
+check "status 에 완료 조건이 보인다" '완료 조건 (2개)' "$(cli status)"
+check "둘 다 기록하면 종료 조건이 충족된다" '충족 intent_set, acceptance' "$(cli status)"
 
 echo "== Selection 은 .dev 만 쓸 수 있다"
 check "Selection 에서 소스 쓰기 차단" 'Selection' "$(hook "$(W src/a.py)")"
@@ -158,9 +164,15 @@ check "새 작업은 Selection 부터" '1/7 Selection' "$NEWOUT"
 check "중단한 작업의 스킵 사유가 event 에 남는다" '구조 선행 필요' \
   "$(sql "SELECT detail FROM event WHERE kind='skip' AND loop_id='$ALID' LIMIT 1")"
 
+echo "== 완료 조건 제시"
+cli loop done-when '유지되는지 확인할 조건' >/dev/null
+setstage execution
+check "Verification 진입 시 완료 조건을 밀어준다" '이 작업의 완료 조건' "$(cli advance)"
+
 echo "== 회차 반복: advance --cycle"
 cli loop intent '회차 테스트' >/dev/null
-cli advance >/dev/null; setstage compounding
+setstage selection; cli advance >/dev/null   # selection 을 done 으로 만든다
+setstage compounding
 CLID="$(loopid)"
 hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-1-r.md"}}' "$WORK" "$CLID")" >/dev/null
 CYC="$(cli advance --cycle)"
@@ -172,6 +184,7 @@ check "회차가 바뀌면 계획 증거가 초기화된다" '^0$' \
   "$(sql "SELECT COUNT(*) FROM evidence WHERE loop_id='$CLID' AND kind='plan_file'")"
 check "작업 선정 기록은 유지된다" '^1$' \
   "$(sql "SELECT COUNT(*) FROM evidence WHERE loop_id='$CLID' AND kind='intent_set'")"
+check "완료 조건도 회차를 넘어 유지된다" '유지되는지 확인할 조건' "$(cli loop done-when)"
 check "Selection 은 done 으로 남는다" '^done$' \
   "$(sql "SELECT status FROM stage WHERE loop_id='$CLID' AND stage='selection'")"
 check "--done/--cycle 은 마지막 단계에서만" '마지막 단계' "$(cli advance --done || true)"
