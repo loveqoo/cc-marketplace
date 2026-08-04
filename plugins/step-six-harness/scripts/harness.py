@@ -17,6 +17,7 @@
   - 모든 쓰기는 트랜잭션 안에서 한다. 병렬 툴 호출로 훅이 동시 발화해도 안전하다.
 """
 
+import calendar
 import fnmatch
 import hashlib
 import json
@@ -42,13 +43,19 @@ WRITE_TOOLS = {
 
 # Bash 가 파일을 건드릴 가능성이 있는 명령. 이 경우에만 경로 토큰을 훑는다.
 BASH_MUTATORS = re.compile(r"(^|[;&|]\s*)(rm|mv|cp|mkdir|touch|tee|dd|truncate)\b|>\s*\S|sed\s+-i")
-CTRL_RE = re.compile(r"harness(?:\.py)?[\"']?\s+([a-z-]+)")
-CONSENT_CMDS = ("skip", "allow", "approve-plan", "adopt")
+# 두 번째 토큰까지 잡는다. `loop new` 는 루프를 닫고 새로 만들므로 모든 단계
+# 게이트를 우회하는데, 첫 토큰만 보면 subcommand 가 'loop' 로 잡혀 동의 판정이
+# 아예 일어나지 않았다 — 승격 게이트가 그 구멍으로 그대로 새어나갔다.
+CTRL_RE = re.compile(r"harness(?:\.py)?[\"']?\s+([a-z-]+)(?:\s+([a-z-]+))?")
+CTRL_SUB2 = {"loop": ("new", "adopt")}
+CONSENT_CMDS = ("skip", "allow", "approve-plan", "loop new", "loop adopt")
 CTRL_HEAD = {
     "skip": "단계 스킵 요청",
     "allow": "쓰기 금지 경로에 대한 예외 요청",
     "approve-plan": "계획 승인 요청",
-    "adopt": "기존 루프 해시 재연결 요청",
+    "loop new": "현재 작업을 닫고 새 작업을 시작하는 요청 — "
+                "남은 단계와 승격 결정을 건너뛰게 된다",
+    "loop adopt": "기존 루프 해시 재연결 요청",
     "auto-skip": "스킵 자동 승인 활성화 요청 — 이후 스킵은 다이얼로그 없이 통과한다",
 }
 EVIDENCE_STAGES = ("execution", "verification")
@@ -110,6 +117,32 @@ PROMOTE_AS = {
 
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def ts_epoch(s):
+    """저장된 시각을 절대 시각(epoch 초)으로 바꾼다.
+
+    시각 비교를 SQL 문자열 비교로 하면 안 된다. 오프셋이 섞이거나(`+0900` 과
+    오프셋 없는 값) DST 전환이 있으면 사전순과 실제 순서가 어긋난다. 예:
+    `2026-11-01T01:45:00-0400` 보다 `2026-11-01T01:30:00-0500` 이 실제로는
+    나중인데 문자열로는 작다 — 재발 판정이 조용히 뒤집힌다.
+    """
+    if not s:
+        return 0.0
+    txt = str(s).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            tm = time.strptime(txt, fmt)
+        except ValueError:
+            continue
+        off = getattr(tm, "tm_gmtoff", None)
+        if off is not None:
+            return calendar.timegm(tm) - off
+        try:
+            return time.mktime(tm)  # 오프셋이 없으면 로컬 시각으로 읽는다
+        except (OverflowError, ValueError):
+            return 0.0
+    return 0.0
 
 
 def jload(path, default=None):
@@ -335,6 +368,12 @@ def repeated_items(con, cfg):
         min_loops = max(2, int(pc.get("min_loops", 3)))
     except (TypeError, ValueError):
         min_loops = 3
+    # 승격할 수 없는 규칙은 후보에서 뺀다. `no_reason`·`bypass_mode`·`protected` 는
+    # 모델이 게이트를 우회하려 한 기록이다 — 하네스가 제대로 동작한 증거이지
+    # 기계화할 습관이 아니다. 이걸 승격 대상으로 올리면 "우회 시도를 승격하라"는
+    # 뜻이 되고, 사용자가 봐야 할 규율 신호가 결정 절차로 세탁된다. stats 에는 남는다.
+    skip = set(pc.get("exclude_rules") or
+               ["no_reason", "bypass_mode", "protected", "protected_bash"])
     out = []
     for kind in kinds:
         key_col = "rule" if kind == "block" else "target"
@@ -343,6 +382,8 @@ def repeated_items(con, cfg):
                 "MAX(at) last FROM event WHERE kind=? GROUP BY k "
                 "HAVING loops >= ? ORDER BY loops DESC, c DESC" % key_col,
                 (kind, min_loops)):
+            if kind == "block" and r["k"] in skip:
+                continue
             out.append({"key": "%s:%s" % (kind, r["k"]), "kind": kind,
                         "name": r["k"], "count": r["c"], "loops": r["loops"],
                         "last": r["last"]})
@@ -351,13 +392,41 @@ def repeated_items(con, cfg):
 
 
 def _events_since(con, item, since):
-    """승격 이후 같은 항목이 다시 걸렸는지. 승격이 통했는지의 유일한 객관 증거다."""
+    """승격 이후 같은 항목이 다시 걸렸는지. 승격이 통했는지의 유일한 객관 증거다.
+
+    비교는 Python 에서 절대 시각으로 한다 — SQL 문자열 비교는 오프셋·DST 에서
+    순서가 뒤집힌다. 한 항목의 이벤트 수는 작으므로 행을 가져와도 싸다.
+    또한 경계를 1초 뒤로 둔다: 승격을 기록한 그 초에 남은 이벤트는 승격 이전의
+    사실이므로 재발로 세면 방금 내린 결정이 즉시 무효화된다.
+    """
     key_col = "rule" if item["kind"] == "block" else "target"
-    row = con.execute(
-        "SELECT COUNT(*) c, COUNT(DISTINCT loop_id) loops FROM event "
-        "WHERE kind=? AND IFNULL(%s,'-')=? AND at > ?" % key_col,
-        (item["kind"], item["name"], since or "")).fetchone()
-    return row["c"], row["loops"]
+    cutoff = ts_epoch(since) + 1 if since else 0.0
+    rows = con.execute(
+        "SELECT at, loop_id FROM event WHERE kind=? AND IFNULL(%s,'-')=?" % key_col,
+        (item["kind"], item["name"])).fetchall()
+    hits = [r for r in rows if ts_epoch(r["at"]) >= cutoff]
+    return len(hits), len({r["loop_id"] for r in hits})
+
+
+def _reopen_after(cfg):
+    try:
+        return max(1, int(promo_cfg(cfg).get("reopen_after_loops", 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def is_regressed(con, cfg, p):
+    """저장된 maturity 를 믿지 않고 지금 계산한다.
+
+    sync_promotions 를 아무도 실행하지 않은 세션에서도 게이트가 맞아야 한다.
+    저장값만 보면 `stats`/`tidy`/`promote` 를 부르지 않은 채 Compounding 을
+    통과할 수 있다 — 실제로 그렇게 새어나갔다.
+    """
+    if p["maturity"] == "regressed":
+        return True
+    item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
+    _, loops = _events_since(con, item, p["recheck_at"] or p["at"])
+    return loops >= _reopen_after(cfg)
 
 
 def sync_promotions(con, cfg):
@@ -367,28 +436,27 @@ def sync_promotions(con, cfg):
     established → regressed: 승격 후에도 M개 작업에서 다시 걸렸다. 승격이
     통하지 않았다는 뜻이므로 다시 결정 대상으로 돌린다.
     """
-    pc = promo_cfg(cfg)
     try:
-        proven_after = max(1, int(pc.get("proven_after_loops", 3)))
-        reopen_after = max(1, int(pc.get("reopen_after_loops", 2)))
+        proven_after = max(1, int(promo_cfg(cfg).get("proven_after_loops", 3)))
     except (TypeError, ValueError):
-        proven_after, reopen_after = 3, 2
+        proven_after = 3
     changed = []
-    rows = con.execute("SELECT * FROM promotion").fetchall()
-    for p in rows:
+    for p in con.execute("SELECT * FROM promotion").fetchall():
         if p["maturity"] == "regressed":
             continue
         item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
         _, loops = _events_since(con, item, p["recheck_at"] or p["at"])
-        if loops >= reopen_after:
+        if loops >= _reopen_after(cfg):
             con.execute("UPDATE promotion SET maturity='regressed' WHERE key=?",
                         (p["key"],))
             changed.append((p["key"], "regressed"))
             continue
         if p["maturity"] == "proven" or p["decision"] == "declined":
             continue
-        since = con.execute("SELECT COUNT(*) c FROM loop WHERE created_at > ?",
-                            (p["at"] or "",)).fetchone()["c"]
+        # 작업 수도 절대 시각으로 센다 — created_at 문자열 비교는 위와 같은 이유로 틀린다.
+        base = ts_epoch(p["at"])
+        since = sum(1 for r in con.execute("SELECT created_at FROM loop")
+                    if ts_epoch(r["created_at"]) > base)
         if loops == 0 and since >= proven_after:
             con.execute("UPDATE promotion SET maturity='proven' WHERE key=?",
                         (p["key"],))
@@ -404,9 +472,8 @@ def pending_promotions(con, cfg, limit=None):
         p = decided.get(item["key"])
         if p is None:
             out.append(item)
-        elif p["maturity"] == "regressed":
-            item = dict(item, regressed=p["decision"])
-            out.append(item)
+        elif is_regressed(con, cfg, p):
+            out.append(dict(item, regressed=p["decision"]))
     if limit is None:
         pc = promo_cfg(cfg)
         try:
@@ -422,11 +489,15 @@ def promotion_summary(con, cfg):
     return {r["maturity"]: r["c"] for r in rows}
 
 
-def learned_lines(con):
-    """LEARNED.md 에 실릴 규칙 줄. rule 로 승격되고 살아 있는 것만."""
-    return con.execute(
-        "SELECT key, maturity, note FROM promotion WHERE decision='rule' "
-        "AND maturity != 'regressed' ORDER BY at", ()).fetchall()
+def learned_lines(con, cfg):
+    """LEARNED.md 에 실릴 규칙 줄. rule 로 승격되고 살아 있는 것만.
+
+    저장된 maturity 가 아니라 실시간 판정을 쓴다 — 그러지 않으면 재발한 규칙이
+    항상 로드되는 문서에 계속 남는다(실제로 남았다).
+    """
+    rows = con.execute(
+        "SELECT * FROM promotion WHERE decision='rule' ORDER BY at").fetchall()
+    return [r for r in rows if not is_regressed(con, cfg, r)]
 
 
 def learned_budget(cfg):
@@ -449,7 +520,7 @@ def refresh_learned(con, cfg, root):
 
     손으로 고친 내용이 성숙도와 어긋나지 않게 하려면 생성이 유일한 경로여야 한다.
     """
-    rows = learned_lines(con)
+    rows = learned_lines(con, cfg)
     body = [LEARNED_HEAD % learned_budget(cfg)]
     if rows:
         for r in rows:
@@ -623,6 +694,47 @@ def check_write(con, cfg, root, lid, sid, rel):
     return None, None
 
 
+BASH_SPLIT = re.compile(r"\|\||&&|[;&|\n]")
+# 이 프로그램들에 넘긴 경로는 '실행 대상'이다. 하네스 래퍼를 python3 로 돌리는 것은
+# 정상 동작이므로 변경 시도로 오인해서는 안 된다.
+BASH_INTERPRETERS = ("python", "python3", "sh", "bash", "zsh", "env", "exec", "node")
+# 읽기만 하는 명령은 막지 않는다. 과잉 차단은 마찰이 되고, 마찰은 게이트를 끄게 만든다.
+BASH_READERS = ("cat", "less", "more", "head", "tail", "grep", "rg", "wc", "file",
+                "stat", "ls", "find", "diff", "shasum", "md5", "md5sum", "awk", "cut")
+
+
+def bash_protected_hit(cfg, root, cmd):
+    """Bash 명령이 보호 경로를 **대상으로** 삼는지. 실행하는 것은 대상이 아니다.
+
+    check_write 는 Write/Edit 만 본다. Bash 는 `rm`, `sed -i`, 리다이렉트,
+    `sqlite3 ... UPDATE` 로 같은 파일을 바꿀 수 있었고 그 경로는 검사되지 않았다.
+    """
+    pats = (cfg.get("folder_rules") or {}).get("protected_paths") or []
+    if not pats:
+        return None
+
+    def protected(tok):
+        rel = rel_to_root(root, tok.strip("\"'"))
+        if not rel or rel == ".":
+            return None
+        return rel if any(glob_match(rel, p) for p in pats) else None
+
+    for seg in BASH_SPLIT.split(cmd):
+        toks = re.findall(r"\S+", seg)
+        if not toks:
+            continue
+        head = os.path.basename(toks[0].strip("\"'"))
+        # 리다이렉트가 있으면 읽기 명령도 쓰기가 된다 (`cat x > 엔진`).
+        if head in BASH_READERS and ">" not in seg:
+            continue
+        skip = 2 if head in BASH_INTERPRETERS and len(toks) > 1 else 1
+        for tok in toks[skip:]:
+            hit = protected(tok)
+            if hit:
+                return hit
+    return None
+
+
 # ------------------------------------------------------------------ hook output
 
 def emit(obj):
@@ -641,6 +753,14 @@ def pre_decision(decision, reason):
 
 def hook_session_start(inp, con, cfg, root, lid, sid):
     refresh_wrapper(root)
+    # LEARNED.md 는 CLAUDE.md 앵커로 **이 순간** 로드된다. 그러니 여기서 맞춰야 한다.
+    # promote 에서만 재생성하면 그 사이 재발한 규칙이 계속 실린다.
+    try:
+        with con:
+            sync_promotions(con, cfg)
+        refresh_learned(con, cfg, root)
+    except Exception:
+        pass  # 복리 장치가 세션 시작을 막지는 않는다
     stage = stage_obj(cfg, sid)
     lines = [
         "[harness] 작업 %s · 회차 %d · 단계 %s — %s"
@@ -770,10 +890,27 @@ def hook_pre_tool_use(inp, con, cfg, root, lid, sid):
 
     if tool == "Bash":
         cmd = ti.get("command") or ""
+
+        # 하네스 자신을 Bash 로 건드리는 것을 먼저 막는다. 제어 명령 판정보다
+        # 앞이어야 한다 — `rm <엔진> && harness status` 처럼 뒤에 제어 명령을
+        # 붙이면 그 앞의 파괴가 검사 없이 통과했다.
+        hit = bash_protected_hit(cfg, root, cmd)
+        if hit:
+            with con:
+                record_event(con, lid, sid, "block", "protected_bash", hit, cmd[:200])
+            return emit(pre_decision("deny", (
+                "하네스 자신(%s)은 Bash 로도 변경할 수 없다. 규칙을 바꾸려면 "
+                "`.claude/harness/stages.json` 을, 엔진을 바꾸려면 플러그인을 "
+                "수정하라. 내용을 보려면 Read 도구를 쓰라. "
+                "이 차단은 `allow` 로도 열리지 않는다." % hit)))
+
         m = CTRL_RE.search(cmd)
         if m:
+            sub = m.group(1)
+            if m.group(2) and m.group(2) in CTRL_SUB2.get(sub, ()):
+                sub = "%s %s" % (sub, m.group(2))
             with con:
-                return ctrl_decision(con, m.group(1), cmd, mode, lid, sid)
+                return ctrl_decision(con, sub, cmd, mode, lid, sid)
 
         if BASH_MUTATORS.search(cmd):
             for tok in re.findall(r"[\w./~-]+", cmd):
@@ -860,6 +997,11 @@ def hook_post_tool_use_failure(inp, con, cfg, root, lid, sid):
         "SELECT detail FROM event WHERE kind='tool_fail' AND target=? "
         "AND detail IS NOT NULL AND detail != '' ORDER BY id DESC LIMIT 1",
         (target,)).fetchone()
+    # 현재 작업이 과거 집합에 이미 있는지 봐야 한다. 무조건 +1 하면 한 작업에서
+    # 세 번 실패한 것을 "작업 2개에서 반복"으로 세어 승격 요구가 거짓이 된다.
+    seen_here = con.execute(
+        "SELECT 1 FROM event WHERE kind='tool_fail' AND target=? AND loop_id=? LIMIT 1",
+        (target, lid)).fetchone()
     with con:
         record_event(con, lid, sid, "tool_fail", tool, target, err)
     if not prior["c"]:
@@ -867,11 +1009,11 @@ def hook_post_tool_use_failure(inp, con, cfg, root, lid, sid):
 
     # 실패한 순간이 회수의 최적 시점이다 — 무엇을 물어볼지 이미 알기 때문이다.
     # 여기서 알려주지 않으면 모델은 같은 벽을 다시 받는다.
-    emit_failure_recall(con, cfg, root, target, prior, prev)
+    emit_failure_recall(con, cfg, root, target, prior["c"] + 1,
+                        prior["loops"] + (0 if seen_here else 1), prev)
 
 
-def emit_failure_recall(con, cfg, root, target, prior, prev):
-    n, loops = prior["c"] + 1, prior["loops"]
+def emit_failure_recall(con, cfg, root, target, n, loops, prev):
     lines = ["[harness] '%s' 실패가 %d번째다%s."
              % (target, n, " (작업 %d개에 걸쳐)" % loops if loops > 1 else "")]
 
@@ -911,11 +1053,11 @@ def emit_failure_recall(con, cfg, root, target, prior, prev):
         thr = int(promo_cfg(cfg).get("min_loops", 3))
     except (TypeError, ValueError):
         thr = 3
-    undecided = p is None or p["maturity"] == "regressed"
-    if loops + 1 >= thr and undecided:
+    undecided = p is None or is_regressed(con, cfg, p)
+    if loops >= thr and undecided:
         out["systemMessage"] = ("harness: '%s' 실패가 작업 %d개에서 반복된다 — "
                                "Compounding 에서 승격 결정을 요구한다." % (target, loops))
-    elif loops + 1 >= thr:
+    elif loops >= thr:
         out["systemMessage"] = ("harness: '%s' 실패가 작업 %d개에서 반복된다 "
                                "(이미 %s 로 결정됨 — 재발이 이어지면 결정이 무효화된다)."
                                % (target, loops, p["decision"]))
@@ -1030,8 +1172,15 @@ def run_hook():
         if fn:
             fn(inp, con, cfg, root, lid, sid)
     except Exception as exc:
+        # 차단하지 않는다. exit 1 은 Claude Code 가 훅 오류로 표면화하므로,
+        # 무력해지더라도 조용히 빠진다 — 세션을 벽돌로 만드는 것보다 낫다.
+        # 단 세션 시작 때는 한 번 알린다. 조용히 죽으면 고장을 모른다.
         sys.stderr.write("step-six-harness: %s\n" % exc)
-        return 1
+        if inp.get("hook_event_name") == "SessionStart":
+            emit({"systemMessage":
+                  "harness: 하네스가 오류로 비활성 상태다 (%s). 스키마가 오래됐으면 "
+                  "`.claude/harness/bin/harness init` 을 다시 실행하라." % exc})
+        return 0
     finally:
         con.close()
     return 0
@@ -1571,11 +1720,19 @@ def tidy_report(con, cfg, root):
             continue
         idx = os.path.join(d, "INDEX.md")
         has_idx = os.path.isfile(idx)
-        newest = max((os.path.getmtime(os.path.join(d, n)) for n in files), default=0)
+
+        def mtime(path):
+            """목록을 읽은 뒤 파일이 사라질 수 있다 (병렬 작업, 끊어진 symlink)."""
+            try:
+                return os.path.getmtime(path)
+            except OSError:
+                return 0.0
+
+        newest = max([mtime(os.path.join(d, n)) for n in files] or [0.0])
         note = None
         if len(files) >= thr and not has_idx:
             note = "파일 %d개인데 INDEX.md 가 없다" % len(files)
-        elif has_idx and os.path.getmtime(idx) < newest:
+        elif has_idx and mtime(idx) < newest:
             note = "INDEX.md 가 최신 파일보다 낡았다 (파일 %d개)" % len(files)
         if note:
             out["dirs"].append((".dev/%s/" % sub, note))
@@ -1600,7 +1757,7 @@ def tidy_report(con, cfg, root):
                 out["groups"].append((k, sorted(v)))
 
     budget = learned_budget(cfg)
-    used = len(learned_lines(con))
+    used = len(learned_lines(con, cfg))
     if used:
         out["learned"] = (used, budget)
     out["regressed"] = con.execute(
@@ -1635,6 +1792,7 @@ def cli_tidy(con, cfg, root, lid, sid, argv):
     """줄이는 것도 일이다. 쌓이면 복잡해지는 시스템은 복리가 아니다."""
     with con:
         sync_promotions(con, cfg)
+    refresh_learned(con, cfg, root)
     rep = tidy_report(con, cfg, root)
     limit = 12
 
@@ -1683,6 +1841,9 @@ def cli_promote(con, cfg, root, lid, sid, argv):
     """
     with con:
         changed = sync_promotions(con, cfg)
+    # 목록만 보는 경로에서도 갱신한다. 성숙도를 바꿨는데 파일을 그대로 두면
+    # 재발한 규칙이 항상 로드되는 문서에 남는다.
+    refresh_learned(con, cfg, root)
     if changed:
         # 20줄을 쏟으면 정작 결정해야 할 목록이 스크롤 밖으로 밀린다.
         if len(changed) <= 3:
@@ -1750,7 +1911,7 @@ def cli_promote(con, cfg, root, lid, sid, argv):
         return 2
 
     if as_kind == "rule":
-        used = len(learned_lines(con))
+        used = len(learned_lines(con, cfg))
         existing = con.execute("SELECT decision FROM promotion WHERE key=?",
                                (key,)).fetchone()
         grows = not (existing and existing["decision"] == "rule")
@@ -1782,7 +1943,7 @@ def cli_promote(con, cfg, root, lid, sid, argv):
     print("  %s" % note)
     if wrote:
         print("  %s 갱신 (%d/%d줄)"
-              % (LEARNED_REL.replace(os.sep, "/"), len(learned_lines(con)),
+              % (LEARNED_REL.replace(os.sep, "/"), len(learned_lines(con, cfg)),
                  learned_budget(cfg)))
     if as_kind == "declined":
         print("  보류도 결정이다. 이 항목이 앞으로 %s개 작업에서 다시 걸리면 "
@@ -1922,6 +2083,7 @@ def cli_stats(con, cfg, root, lid, sid, argv):
             print("  %-24s %s" % (r["k"][:24], bits))
     with con:
         sync_promotions(con, cfg)
+    refresh_learned(con, cfg, root)
     rows = con.execute("SELECT key, decision, maturity, note FROM promotion "
                        "ORDER BY maturity, at").fetchall()
     if rows:
@@ -2105,7 +2267,18 @@ def run_cli(argv):
             print("알 수 없는 명령: %s\n사용 가능: %s\n전체 사용법은 `harness help`."
                   % (cmd, ", ".join(sorted(CLI))), file=sys.stderr)
             return 2
-        return fn(con, cfg, root, lid, sid, argv[1:])
+        try:
+            return fn(con, cfg, root, lid, sid, argv[1:])
+        except sqlite3.OperationalError as exc:
+            # 스키마가 플러그인보다 오래됐을 때 traceback 대신 할 일을 알려준다.
+            # 마이그레이션은 하지 않는다 — DB 는 커밋하지 않는 런타임 상태이고,
+            # init 이 스키마를 다시 적용하는 것이 정해진 업그레이드 경로다.
+            print("DB 스키마가 플러그인 버전과 맞지 않는다 (%s).\n"
+                  "`.claude/harness/bin/harness init` 을 다시 실행하라 — 파일은 "
+                  "덮어쓰지 않고 스키마만 갱신한다. 그래도 안 되면 %s 를 지우고 "
+                  "init 을 실행하라 (진행 중 상태만 사라지고 기록 파일은 남는다)."
+                  % (exc, DB_REL.replace(os.sep, "/")), file=sys.stderr)
+            return 1
     finally:
         con.close()
 
@@ -2132,7 +2305,17 @@ def ensure_permissions(root):
         data = jload(path)
         if not isinstance(data, dict):
             return -1  # 손상된 설정은 건드리지 않는다
-    allow = data.setdefault("permissions", {}).setdefault("allow", [])
+    # 최상위가 dict 인 것만 확인하고 setdefault 를 연달아 호출하면, permissions 가
+    # list/문자열인 정상 JSON 에서 AttributeError 로 init 이 중간에 죽어
+    # 부분 설치 상태를 남긴다. 모양을 단계마다 확인한다.
+    perms = data.get("permissions")
+    if perms is None:
+        perms = data["permissions"] = {}
+    if not isinstance(perms, dict):
+        return -1
+    allow = perms.get("allow")
+    if allow is None:
+        allow = perms["allow"] = []
     if not isinstance(allow, list):
         return -1
     added = [p for p in SAFE_PERMS if p not in allow]
@@ -2192,7 +2375,10 @@ def cli_init(argv):
     want = [".claude/harness/harness.db", ".claude/harness/harness.db-wal",
             ".claude/harness/harness.db-shm", ".claude/harness/bin/"]
     have = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
-    add = [w for w in want if w not in have]
+    # 행 단위로 본다. substring 으로 보면 주석에 경로가 언급된 것만으로
+    # "이미 있다"고 판단해 실제 ignore 규칙을 넣지 않는다.
+    have_lines = {ln.strip() for ln in have.splitlines()}
+    add = [w for w in want if w not in have_lines]
     if add:
         with open(gi, "a", encoding="utf-8") as fh:
             if have and not have.endswith("\n"):
@@ -2205,9 +2391,12 @@ def cli_init(argv):
     # 둘을 한 파일에 섞으면 생성 대상과 손으로 쓴 것이 구분되지 않는다.
     cm = os.path.join(root, "CLAUDE.md")
     body = open(cm, encoding="utf-8").read() if os.path.isfile(cm) else ""
+    # 행 단위로 본다. 코드 예시나 설명문에 앵커 문자열이 있으면 substring 판정은
+    # 실제 import 행이 없는데도 있다고 착각한다.
+    body_lines = {ln.strip() for ln in body.splitlines()}
     add_anchors = [a for a in ("@%s" % POLICY_REL.replace(os.sep, "/"),
                                "@%s" % LEARNED_REL.replace(os.sep, "/"))
-                   if a not in body]
+                   if a not in body_lines]
     if add_anchors:
         with open(cm, "a", encoding="utf-8") as fh:
             if body and not body.endswith("\n"):
@@ -2274,7 +2463,9 @@ USAGE = """step-six-harness — 작업 하네스
                                recall 이 이 작업을 기본 키워드로 쓴다
   loop done-when "<조건>" ...   무엇이 '끝'인지 기록 (Selection 에서). 인자 없으면 목록,
                                --clear 로 비운다. 회차가 바뀌어도 유지된다
-  loop new [--intent "..."]    루프를 닫고 새 해시로 시작
+  loop new --reason "..." [--intent "..."]
+                               루프를 닫고 새 해시로 시작 ✋ — 남은 단계와 승격 결정을
+                               건너뛰게 되므로 스킵과 같은 승인을 받는다
   loop adopt <hash> --reason "..."
                                DB를 잃었을 때 기존 해시로 재연결 ✋
 

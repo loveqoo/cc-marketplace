@@ -40,7 +40,7 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 | `tidy` | 정리 후보 — 낡은 인덱스, 오래된 파일, 병합 후보, 재발한 승격, `LEARNED.md` 예산. **Scaffolding 의 주 도구** | |
 | `loop` | 현재 작업 해시·브랜치 | |
 | `loop intent "<작업>"` | 이번 작업을 기록 (Selection 의 종료 조건) | |
-| `loop new [--intent "..."]` | 작업을 닫고 새 해시로 시작 | |
+| `loop new --reason "..." [--intent "..."]` | 작업을 닫고 새 해시로 시작. **남은 단계와 승격 결정을 건너뛰게 되므로** 승인이 필요하다 | ✅ 다이얼로그 |
 | `loop adopt <hash> --reason "..."` | DB를 잃었을 때 기존 해시로 재연결 | ✅ 다이얼로그 |
 | `auto-skip on --reason "..." [--uses N] [--scope loop\|project]` | 스킵 동의 다이얼로그를 끄고 자동 승인. 범위를 좁히는 것을 권한다 | ✅ 다이얼로그 (켜는 것 자체는 승인 필요) |
 | `auto-skip off` / `auto-skip status` | 자동 승인 해제 / 현재 상태 | 끄기는 승인 불필요 |
@@ -185,4 +185,9 @@ Scaffolding 이 불완전했다는 증거**다. 자식 루프로 감싸면 그 �
   이 모두 거부된다. 권한 모드를 낮추고 다시 시도한다.
 - 계획과 검증 결과를 **다른 모델이나 서브에이전트에게 적대적으로 검토받는 것을 고려한다**
   (권고 — 강제하지 않는다). 사용자가 원하면 여러 모델에 돌린다.
+- 하네스 자신(`.claude/harness/bin/`, `harness.db`, `LEARNED.md`)은 Write/Edit 뿐 아니라
+  **Bash 로도 변경할 수 없다** — `rm`, `sed -i`, 리다이렉트, `sqlite3` 전부 막힌다. 읽는 것은
+  된다. 이 차단은 `allow` 로도 열리지 않는다.
+- 우회를 시도한 기록(`no_reason`, `bypass_mode`, `protected_bash`)은 `stats` 에 남고 사용자가
+  본다. 이 기록들은 승격 후보가 아니다 — 기계화할 습관이 아니라 규율 신호다.
 - 상세 근거는 `.claude/harness/rationale.md` 에 있다. 필요할 때 읽는다.

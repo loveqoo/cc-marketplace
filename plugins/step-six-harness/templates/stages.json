@@ -48,6 +48,7 @@
   },
   "promotion": {
     "kinds": ["block", "tool_fail"],
+    "exclude_rules": ["no_reason", "bypass_mode", "protected", "protected_bash"],
     "min_loops": 3,
     "max_per_cycle": 3,
     "proven_after_loops": 3,

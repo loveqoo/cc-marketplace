@@ -1,8 +1,8 @@
 {
   "name": "step-six-harness",
   "displayName": "Step Six Harness",
-  "description": "작업 하네스 — Selection(작업·완료 조건) → Scaffolding → Context → Planning → Execution → Verification → Compounding 을 훅으로 강제한다. 마지막 단계에서 작업 종료와 다음 회차로 갈라지므로 한 작업이 여러 회차를 돈다. 복리를 실제로 만드는 장치가 셋 있다 — 같은 도구 실패가 반복되면 그 자리에서 과거 기록을 알려주고, 여러 작업에서 반복된 항목은 승격을 결정해야 회차를 닫을 수 있고, 승격된 규칙 문서는 줄 수 상한이 있어 무한히 자라지 않는다. 폴더 규칙을 가드하고, 스킵은 사유와 사용자 승인을 요구하며, 승인을 면제해도 기록은 면제하지 않는다.",
-  "version": "0.16.0",
+  "description": "작업 하네스 — Selection(작업·완료 조건) → Scaffolding → Context → Planning → Execution → Verification → Compounding 을 훅으로 강제한다. 마지막 단계에서 작업 종료와 다음 회차로 갈라지므로 한 작업이 여러 회차를 돈다. 복리 장치 셋: 같은 도구 실패가 반복되면 그 자리에서 과거 기록을 주고, 여러 작업에서 반복된 항목은 승격을 결정해야 회차가 닫히며, 승격된 규칙 문서는 줄 수 상한이 있어 무한히 자라지 않는다. 하네스 자신은 Write/Edit 과 Bash 양쪽에서 잠기고, 작업을 닫는 것도 승인을 받는다. 적대적인 모델을 막는 장치가 아니라 규칙을 지키려는 모델의 실수를 잡고 기록을 남기는 장치다.",
+  "version": "0.17.0",
   "author": {
     "name": "loveqoo",
     "email": "gunam.jung@gmail.com",
@@ -10,5 +10,11 @@
   },
   "repository": "https://github.com/loveqoo/cc-marketplace",
   "license": "MIT",
-  "keywords": ["harness", "workflow", "guardrails", "hooks", "compounding"]
+  "keywords": [
+    "harness",
+    "workflow",
+    "guardrails",
+    "hooks",
+    "compounding"
+  ]
 }

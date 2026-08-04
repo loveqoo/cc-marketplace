@@ -422,7 +422,7 @@ OUTF="$(hook "$(PTF 'flakycmd run' 'boom two')")"
 check "두 번째 실패는 횟수를 알려준다" '2번째' "$OUTF"
 check "이전 오류를 함께 준다" 'boom one' "$OUTF"
 check "직접 다룬 기록이 없으면 인덱스로 유도한다" '인덱스에서 찾아보라' "$OUTF"
-check "임계 미달이면 사용자에게 알리지 않는다" '^[^s]*$' "$(printf '%s' "$OUTF" | grep -c systemMessage)"
+check "임계 미달이면 사용자에게 알리지 않는다" '^0$' "$(printf '%s' "$OUTF" | grep -c systemMessage)"
 mkdir -p "$WORK/.dev/troubleshooting"
 echo 'flakycmd 는 먼저 setup 이 필요하다' > "$WORK/.dev/troubleshooting/flakycmd-fix.md"
 OUTF2="$(hook "$(PTF 'flakycmd run' 'boom three')")"
@@ -453,7 +453,7 @@ setstage compounding
 sql "INSERT OR IGNORE INTO evidence VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
 OUTP="$(cli advance --done || true)"
 check "승격 결정 없이는 작업을 닫을 수 없다" 'promotion_decided' "$OUTP"
-check "회고는 있으므로 회고를 요구하지 않는다" '^[^r]*$' "$(printf '%s' "$OUTP" | grep -c 'retro_file:')"
+check "회고는 있으므로 회고를 요구하지 않는다" '^0$' "$(printf '%s' "$OUTP" | grep -c 'retro_file:')"
 check "Stop 훅도 막는다" '승격 결정이 남았다' \
   "$(hook "$(STOP prm '[Compounding] 끝')")"
 
@@ -496,7 +496,7 @@ OUTG="$(cli promote)"
 check "재발하면 다시 목록에 오른다" 'block:fakerule' "$OUTG"
 check "무엇으로 승격했었는지 알려준다" '다시 걸렸다' "$OUTG"
 check "성숙도가 regressed 다" 'regressed' "$(sql "SELECT maturity FROM promotion WHERE key='block:fakerule'")"
-check "재발은 LEARNED.md 에서 내려간다" '^[^g]*$' \
+check "재발은 LEARNED.md 에서 내려간다" '^0$' \
   "$(grep -c '가짜 규칙' "$WORK/.claude/harness/LEARNED.md" || true)"
 check "tidy 가 재발을 짚는다" '다시 걸린 항목' "$(cli tidy)"
 OUTG2="$(cli promote block:fakerule --as structure --note '구조를 바꿔 원인을 없앴다')"
@@ -562,6 +562,118 @@ check "tidy 를 권한 허용에 넣는다" 'tidy' "$(cat "$WORK/.claude/setting
 echo "== help"
 check "promote 를 사용법에 적는다" 'promote <key>' "$(cli help)"
 check "tidy 를 사용법에 적는다" 'tidy  ' "$(cli help)"
+
+echo "== Bash 로 하네스 자신을 건드릴 수 없다"
+check "rm 으로 DB 삭제 차단" 'Bash 로도 변경할 수 없다' \
+  "$(hook "$(B 'rm .claude/harness/harness.db' default)")"
+check "sed -i 로 엔진 변경 차단" 'Bash 로도 변경할 수 없다' \
+  "$(hook "$(B 'sed -i s/a/b/ .claude/harness/bin/harness.py' default)")"
+check "리다이렉트로 LEARNED.md 변경 차단" 'Bash 로도 변경할 수 없다' \
+  "$(hook "$(B 'echo x > .claude/harness/LEARNED.md' default)")"
+check "sqlite3 로 DB 변경 차단" 'Bash 로도 변경할 수 없다' \
+  "$(hook "$(B 'sqlite3 .claude/harness/harness.db \"UPDATE meta SET v=1\"' default)")"
+check "제어 명령을 뒤에 붙여 회피할 수 없다" 'Bash 로도 변경할 수 없다' \
+  "$(hook "$(B 'rm .claude/harness/bin/harness && echo ok' default)")"
+check "allow 로도 열리지 않는다고 알린다" 'allow` 로도 열리지 않는다' \
+  "$(hook "$(B 'rm .claude/harness/harness.db' default)")"
+check_empty "래퍼 실행은 막지 않는다" \
+  "$(hook "$(B '.claude/harness/bin/harness status' default)")"
+check_empty "python3 로 엔진 실행은 막지 않는다" \
+  "$(hook "$(B 'python3 .claude/harness/bin/harness.py status' default)")"
+check_empty "읽기 명령은 막지 않는다" \
+  "$(hook "$(B 'cat .claude/harness/LEARNED.md' default)")"
+check_empty "무관한 쓰기는 막지 않는다" "$(hook "$(B 'rm src/tmp.txt' default)")"
+
+echo "== loop new / loop adopt 는 사용자 동의를 받는다"
+check "loop new 는 ask" '"permissionDecision": "ask"' \
+  "$(hook "$(B '.claude/harness/bin/harness loop new --reason \"작업 전환\"' default)")"
+check "loop new 의 결과를 사유와 함께 설명한다" '승격 결정을 건너뛰게 된다' \
+  "$(hook "$(B '.claude/harness/bin/harness loop new --reason \"작업 전환\"' default)")"
+check "loop adopt 는 ask" '"permissionDecision": "ask"' \
+  "$(hook "$(B '.claude/harness/bin/harness loop adopt 260101-abcdef --reason x' default)")"
+check "사유 없는 loop new 는 거부" '사유 없이 loop new' \
+  "$(hook "$(B '.claude/harness/bin/harness loop new' default)")"
+check "bypassPermissions 에서는 loop new 거부" '"permissionDecision": "deny"' \
+  "$(hook "$(B '.claude/harness/bin/harness loop new --reason x' bypassPermissions)")"
+check_empty "loop 조회는 동의 없이" "$(hook "$(B '.claude/harness/bin/harness loop' default)")"
+check_empty "loop intent 는 동의 없이" \
+  "$(hook "$(B '.claude/harness/bin/harness loop intent \"작업\"' default)")"
+
+echo "== 재발 판정은 저장된 maturity 를 믿지 않는다"
+sql "INSERT INTO loop(id,created_at,closed_at) VALUES
+ ('250301-s00001','2025-03-01T10:00:00+0900','x'),
+ ('250302-s00002','2025-03-02T10:00:00+0900','x'),
+ ('250303-s00003','2025-03-03T10:00:00+0900','x'),
+ ('250401-s00004','2025-04-01T10:00:00+0900','x'),
+ ('250402-s00005','2025-04-02T10:00:00+0900','x');
+ INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ ('2025-03-01T11:00:00+0900','250301-s00001','execution','block','syncrule','a'),
+ ('2025-03-02T11:00:00+0900','250302-s00002','execution','block','syncrule','b'),
+ ('2025-03-03T11:00:00+0900','250303-s00003','execution','block','syncrule','c'),
+ ('2025-04-01T11:00:00+0900','250401-s00004','execution','block','syncrule','d'),
+ ('2025-04-02T11:00:00+0900','250402-s00005','execution','block','syncrule','e');
+ INSERT INTO promotion VALUES('block:syncrule','block','rule','established',
+   '동기화 확인용','x','2025-03-15T00:00:00+0900','2025-03-15T00:00:00+0900');" >/dev/null
+check "저장값이 established 인 것을 확인" 'established' \
+  "$(sql "SELECT maturity FROM promotion WHERE key='block:syncrule'")"
+check "sync 없이도 재발이 대기 목록에 뜬다" 'block:syncrule' "$(cli promote)"
+setstage compounding
+sql "INSERT OR IGNORE INTO evidence VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
+check "sync 없이도 게이트가 막는다" 'promotion_decided' "$(cli advance --done || true)"
+check "Stop 훅도 sync 없이 막는다" '승격 결정이 남았다' \
+  "$(hook "$(STOP syncp '[Compounding] 끝')")"
+cli promote block:syncrule --as structure --note '원인 제거' >/dev/null
+check "결정하면 통과한다" '단계 1/7' "$(cli advance --done || true)"
+
+echo "== 절대 시각 비교 (타임존·DST)"
+TSOUT="$(python3 - "$(dirname "$ENGINE")" <<'PYTS'
+import sys
+sys.path.insert(0, sys.argv[1])
+import harness as h
+a, b = h.ts_epoch("2026-08-04T12:00:00+0900"), h.ts_epoch("2026-08-04T03:00:00+0000")
+assert a == b, ("같은 순간이 다르게 계산됨", a, b)
+early, late = h.ts_epoch("2026-11-01T01:45:00-0400"), h.ts_epoch("2026-11-01T01:30:00-0500")
+assert late > early, ("DST 순서 뒤집힘", early, late)
+assert "2026-11-01T01:30:00-0500" < "2026-11-01T01:45:00-0400", "문자열 비교 전제"
+assert h.ts_epoch("2026-08-04T12:00:00") > 0, "오프셋 없는 값"
+assert h.ts_epoch("") == 0.0 and h.ts_epoch(None) == 0.0, "빈 값"
+assert h.ts_epoch("쓰레기") == 0.0, "파싱 불가"
+print("ok")
+PYTS
+)"
+check "오프셋이 달라도 같은 순간으로 계산한다" 'ok' "$TSOUT"
+
+echo "== 우회 시도는 승격 대상이 아니다"
+check "no_reason 은 후보에서 빠진다" '^0$' "$(cli promote | grep -c 'block:no_reason')"
+check "bypass_mode 도 빠진다" '^0$' "$(cli promote | grep -c 'block:bypass_mode')"
+check "protected_bash 도 빠진다" '^0$' "$(cli promote | grep -c 'protected_bash')"
+check "그래도 stats 에는 남는다" 'no_reason' "$(cli stats)"
+
+echo "== 실패 회수의 작업 수 계산"
+PTF2() { printf '{"hook_event_name":"PostToolUseFailure","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"},"error":"%s"}' "$WORK" "$1" "$2"; }
+hook "$(PTF2 'onelooponly x' 'e1')" >/dev/null
+OUTL="$(hook "$(PTF2 'onelooponly x' 'e2')")"
+check "한 작업 안의 반복은 작업 수를 늘리지 않는다" '^0$' \
+  "$(printf '%s' "$OUTL" | grep -c '작업 2개')"
+check "그래도 횟수는 센다" '2번째' "$OUTL"
+
+echo "== init 이 기존 파일을 망가뜨리지 않는다"
+IW="$(mktemp -d)"
+(cd "$IW" && git init -q . && mkdir -p .claude \
+  && printf '{"permissions":[]}\n' > .claude/settings.json \
+  && printf '# 내 프로젝트\n\n예시: `@.claude/harness/LEARNED.md` 는 하네스가 만든다\n' > CLAUDE.md \
+  && printf '# step-six-harness (런타임 상태)\nnode_modules\n' > .gitignore)
+IOUT="$( (cd "$IW" && python3 "$ENGINE" init) 2>&1 )"; IRC=$?
+check "permissions 가 리스트여도 init 이 완주한다" '^0$' "$IRC"
+check "설치 완료를 보고한다" '하네스 설치 완료' "$IOUT"
+check "설명문 속 문자열은 앵커로 세지 않는다" '^2$' \
+  "$(grep -c '^@.claude/harness/' "$IW/CLAUDE.md")"
+check "기존 CLAUDE.md 내용을 보존한다" '내 프로젝트' "$(cat "$IW/CLAUDE.md")"
+check "주석 언급을 ignore 규칙으로 세지 않는다" 'harness.db' "$(cat "$IW/.gitignore")"
+check "손상된 settings 는 건드리지 않는다" '권한 허용을 건너뛰었다' "$IOUT"
+check "재실행은 앵커를 늘리지 않는다" '^2$' \
+  "$( (cd "$IW" && python3 "$ENGINE" init >/dev/null 2>&1); grep -c '^@.claude/harness/' "$IW/CLAUDE.md")"
+rm -rf "$IW"
 
 echo "== 손상 내성"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
