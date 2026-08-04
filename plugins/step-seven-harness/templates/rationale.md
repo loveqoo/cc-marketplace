@@ -291,7 +291,7 @@ X=.claude/harness/bin/harness; "$X" skip verification --reason x   # 탐지되�
 기록만 쌓는 시스템은 복리가 아니다. 이건 우리 의견이 아니라 관측된 결과다.
 
 AGENTS.md·CLAUDE.md 를 가진 오픈소스 레포 100개를 조사한 연구에서 가장 흔한 설정 냄새는
-**lint leakage 가 62%** 였다 — *린터나 훅으로 막을 수 있는 것을 산문으로 적어둔 것*. 두 번째는
+**lint leakage 가 62%** 였다 ([arXiv:2606.15828](https://arxiv.org/abs/2606.15828)) — *린터나 훅으로 막을 수 있는 것을 산문으로 적어둔 것*. 두 번째는
 context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻혀 무시된다). 흔한 악순환은
 이렇다: 실수 → 규칙 한 줄 추가 → 잠시 나아짐 → 또 다른 실수 → 또 한 줄. 파일이 터진다.
 
@@ -302,9 +302,9 @@ context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻
 
 | 장치 | 무엇을 하는가 | 어디서 온 발상인가 |
 | --- | --- | --- |
-| **실패 지점 주입** | 같은 도구 실패가 2번째면 그 자리에서 반복 횟수·이전 오류·관련 회고 파일을 알려준다 | CODESKILL 의 event-driven 회수 — 에러 메시지를 키로 **온라인** 회수하는 것이 작업 시작에 한 번 밀어넣는 것보다 효과가 컸다. 실패한 순간은 무엇을 물어볼지 이미 아는 유일한 순간이다 |
-| **승격 결정 강제** | 여러 작업에서 반복된 항목은 Compounding 의 종료 조건이다. 승격하거나 사유와 함께 보류해야 끝난다 | ExpeL 의 중요도 투표(0이 되면 삭제), cass 의 성숙도(`candidate→established→proven`) |
-| **예산과 정리** | `LEARNED.md` 는 줄 수 상한이 있고, `tidy` 가 삭제·병합 후보를 제시한다 | CODESKILL 의 skill bank 는 add/merge/**drop** 으로 **크기가 수렴**한다. 무한히 자라는 저장소는 실패한 저장소다 |
+| **실패 지점 주입** | 같은 도구 실패가 2번째면 그 자리에서 반복 횟수·이전 오류·관련 회고 파일을 알려준다 | [CODESKILL](https://arxiv.org/abs/2605.25430) 의 event-driven 회수 — 에러 메시지를 키로 **온라인** 회수하는 것이 작업 시작에 한 번 밀어넣는 것보다 효과가 컸다. 실패한 순간은 무엇을 물어볼지 이미 아는 유일한 순간이다 |
+| **승격 결정 강제** | 여러 작업에서 반복된 항목은 Compounding 의 종료 조건이다. 승격하거나 사유와 함께 보류해야 끝난다 | [ExpeL](https://arxiv.org/abs/2308.10144) 의 중요도 투표(0이 되면 삭제), [cass](https://github.com/Dicklesworthstone/cass_memory_system) 의 성숙도(`candidate→established→proven`) |
+| **예산과 정리** | `LEARNED.md` 는 줄 수 상한이 있고, `tidy` 가 삭제·병합 후보를 제시한다 | [CODESKILL](https://arxiv.org/abs/2605.25430) 의 skill bank 는 add/merge/**drop** 으로 **크기가 수렴**한다. 무한히 자라는 저장소는 실패한 저장소다 |
 
 ### 보류를 왜 승인 없이 허용하는가
 
@@ -341,8 +341,8 @@ context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻
 
 `established → proven` 은 "승격 후 재발 없이 작업 N개가 지났다"로만 판정한다. LLM 에게
 "이 규칙이 좋은가"를 묻지 않는다. cass 가 큐레이션 단계에 의도적으로 LLM 을 넣지 않은 이유가
-같다 — LLM 이 자기 판단을 다시 판단하면 등급이 표류하고(context collapse) 근거 없는 확신이
-쌓인다. 우리에게는 이미 객관 신호가 있다: **같은 이벤트가 또 걸리는가.**
+같다([cass_memory_system](https://github.com/Dicklesworthstone/cass_memory_system)) — LLM 이
+자기 판단을 다시 판단하면 등급이 표류하고(context collapse) 근거 없는 확신이 쌓인다. 우리에게는 이미 객관 신호가 있다: **같은 이벤트가 또 걸리는가.**
 
 ### 복리를 어떻게 측정하는가 (그리고 무엇을 측정할 수 없는가)
 
@@ -470,6 +470,25 @@ context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻
 스킵 사유가 합리적인지, 구조 변경이 지금 옳은지. 훅은 "합리적인 이유"를 판정할 수 없다.
 그래서 사유의 **기록**만 강제하고, 판정은 사람에게 넘긴다. 이게 훅으로 가능한 최대치이고
 동시에 감사 가능한 형태다.
+
+## 참고한 사례
+
+이 하네스의 복리 장치는 아래를 조사해 공통으로 나온 것만 골라 넣었다. 각 사례가 어느 장치가
+됐는지는 저장소 README 의 표에 정리돼 있다.
+
+- [ExpeL: LLM Agents Are Experiential Learners](https://arxiv.org/abs/2308.10144) — 통찰
+  저장소를 투표로 관리하고 중요도 0이면 삭제한다
+- [CODESKILL: Learning Self-Evolving Skills for Coding Agents](https://arxiv.org/abs/2605.25430)
+  — skill bank 가 add/merge/drop 으로 수렴한다. 에러 메시지를 키로 한 온라인 회수
+- [cass_memory_system](https://github.com/Dicklesworthstone/cass_memory_system) — 규칙의
+  성숙도·반감기, 큐레이션에 LLM 을 넣지 않는 이유
+- [Cursor Rules: globs·description](https://techsy.io/en/blog/cursor-rules-guide) — 내용보다
+  발동 조건이 레버다
+- [Configuration Smells in AGENTS.md Files](https://arxiv.org/abs/2606.15828) — 레포 100개에서
+  lint leakage 62%, context bloat 42%
+- [The AGENTS.md Bloat Problem](https://codex.danielvaughan.com/2026/03/27/agents-md-bloat-problem/)
+  — 규칙을 더하기만 하면 초반 지시가 묻힌다
+- [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026) — 배경
 
 ## 막혔을 때
 
