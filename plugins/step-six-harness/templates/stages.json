@@ -1,10 +1,26 @@
 {
   "version": 2,
   "path_classes": {
-    "docs": ["docs/**"],
-    "dev": [".dev/**"],
-    "tests": ["tests/**", "test/**", "**/*_test.*", "**/*.test.*", "**/*.spec.*"],
-    "context": [".claude/**", "CLAUDE.md", "**/CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"]
+    "docs": [
+      "docs/**"
+    ],
+    "dev": [
+      ".dev/**"
+    ],
+    "tests": [
+      "tests/**",
+      "test/**",
+      "**/*_test.*",
+      "**/*.test.*",
+      "**/*.spec.*"
+    ],
+    "context": [
+      ".claude/**",
+      "CLAUDE.md",
+      "**/CLAUDE.md",
+      "CLAUDE.local.md",
+      "AGENTS.md"
+    ]
   },
   "folder_rules": {
     "dev_subdirs": [
@@ -16,9 +32,15 @@
       "experiment",
       "scratch"
     ],
-    "docs_subdirs": ["spec", "adr", "retrospect"],
+    "docs_subdirs": [
+      "spec",
+      "adr",
+      "retrospect"
+    ],
     "numbered_name_pattern": "^[0-9]{3}-[a-z0-9][a-z0-9-]*\\.md$",
-    "new_toplevel_dir_stages": ["scaffolding"],
+    "new_toplevel_dir_stages": [
+      "scaffolding"
+    ],
     "loop_prefixed_dirs": [
       "plan",
       "learning",
@@ -27,7 +49,10 @@
       "log",
       "experiment"
     ],
-    "prefix_exempt_names": ["INDEX.md", "README.md"],
+    "prefix_exempt_names": [
+      "INDEX.md",
+      "README.md"
+    ],
     "protected_paths": [
       ".claude/harness/bin/**",
       ".claude/harness/harness.db",
@@ -37,8 +62,9 @@
     ]
   },
   "stop_continue": {
-    "enabled": false,
-    "max_per_prompt": 3
+    "enabled": true,
+    "max_per_prompt": 6,
+    "no_progress_limit": 2
   },
   "stop_block_limits": {
     "prefix": 1,
@@ -47,8 +73,16 @@
     "promotion_decided": 2
   },
   "promotion": {
-    "kinds": ["block", "tool_fail"],
-    "exclude_rules": ["no_reason", "bypass_mode", "protected", "protected_bash"],
+    "kinds": [
+      "block",
+      "tool_fail"
+    ],
+    "exclude_rules": [
+      "no_reason",
+      "bypass_mode",
+      "protected",
+      "protected_bash"
+    ],
     "min_loops": 3,
     "max_per_cycle": 3,
     "proven_after_loops": 3,
@@ -65,9 +99,15 @@
         ".claude/commands/**",
         ".claude/skills/**"
       ],
-      "structure": ["**"]
+      "structure": [
+        "**"
+      ]
     },
-    "verify_exclude": [".dev/**", "docs/**", ".claude/harness/LEARNED.md"]
+    "verify_exclude": [
+      ".dev/**",
+      "docs/**",
+      ".claude/harness/LEARNED.md"
+    ]
   },
   "tidy": {
     "dir_file_threshold": 12,
@@ -81,8 +121,13 @@
       "skippable": false,
       "summary": "이번에 할 작업과 '무엇이 끝인지'를 정한다. 필요하면 작업 후보를 나열해 사용자와 합의한다(선택).",
       "hint": "작업이 불분명하면 후보를 나열해 사용자와 합의하라(선택 — 이미 명확하면 건너뛴다). 정해지면 두 가지를 기록한다. ① `harness loop intent \"<작업>\"` — Context 의 recall 기준이 된다. ② `harness loop done-when \"<조건>\" ...` — 무엇이 '끝'인지. Verification 이 이것을 대조하고 Compounding 이 종료 판단의 근거로 쓴다. 둘 다 없으면 이 단계를 끝낼 수 없다. 조건은 검증 가능한 문장으로 쓰고, 회차가 바뀌어도 유지된다(바뀌면 `--clear` 후 다시 기록). 후보 목록을 남기려면 `.dev/plan/` 에 쓴다.",
-      "write": ["dev"],
-      "exit_criteria": ["intent_set", "acceptance"],
+      "write": [
+        "dev"
+      ],
+      "exit_criteria": [
+        "intent_set",
+        "acceptance"
+      ],
       "stop_requires": []
     },
     {
@@ -90,7 +135,12 @@
       "label": "Scaffolding",
       "summary": "이 작업에 맞는 구조인지 확인하고, 어긋나면 지금 바꾼다. 역할별 폴더링. 신규 최상위 폴더는 이 단계에서만 만들 수 있다. 쌓인 문서를 정리하고 인덱스를 갱신하는 것도 이 단계의 일이다.",
       "hint": "구조 변경은 대부분의 회차에서 할 일이 없고, 그게 정상이다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다. 그리고 **줄이는 것도 이 단계의 일이다** — `harness tidy` 가 정리 후보를 목록으로 준다(낡은 인덱스, 오래된 파일, 병합 후보, 재발한 승격, LEARNED.md 예산). 파일이 쌓였으면 통합·삭제하고, **그 폴더 안에 `INDEX.md` 를 만들어 갱신한다**(회차 접두사 없이 쓸 수 있다). 인덱스는 장식이 아니다 — `harness recall` 이 인덱스를 진입점으로 먼저 제시하므로, 수백 개 중 6개만 보이는 상황에서 전체를 대표한다. 규칙이 늘어 마찰이 커졌으면 `stages.json` 을 덜어내는 것도 여기서 한다. 쌓이면 복잡해지는 시스템은 복리가 아니다.",
-      "write": ["source", "tests", "context", "dev"],
+      "write": [
+        "source",
+        "tests",
+        "context",
+        "dev"
+      ],
       "exit_criteria": [],
       "stop_requires": []
     },
@@ -99,7 +149,10 @@
       "label": "Context",
       "summary": "유저/프로젝트/폴더 스코프로 계층 기록. 전부 싣지 말고 '이럴 때 이걸 봐라'로 유도.",
       "hint": "과거 실수·회고 조회: `harness recall <키워드|경로>`. Selection 에서 정한 작업과 관련된 것만 골라 읽어라 — 무관한 과거 실수까지 읽지 마라.",
-      "write": ["context", "dev"],
+      "write": [
+        "context",
+        "dev"
+      ],
       "exit_criteria": [],
       "stop_requires": []
     },
@@ -108,16 +161,28 @@
       "label": "Planning",
       "summary": "모호한 지점을 질문으로 끌어내고 계획을 파일로 떨군다. 인간 검토·승인 후 실행.",
       "hint": "계획을 다른 모델이나 서브에이전트에게 적대적으로 검토받는 것을 고려하라(권고 — 강제하지 않는다). 이 환경에 codex·antigravity 플러그인과 서브에이전트가 있다. 사용자가 원하면 여러 모델에 돌린다.",
-      "write": ["dev", "context"],
-      "exit_criteria": ["plan_file", "plan_approved"],
-      "skip_requires": ["plan_file"],
+      "write": [
+        "dev",
+        "context"
+      ],
+      "exit_criteria": [
+        "plan_file",
+        "plan_approved"
+      ],
+      "skip_requires": [
+        "plan_file"
+      ],
       "stop_requires": []
     },
     {
       "id": "execution",
       "label": "Execution",
       "summary": "계획대로 실행. 중요 기능은 테스트로 먼저 동작 확인. 병렬·Ralph Loop 고려.",
-      "write": ["source", "tests", "dev"],
+      "write": [
+        "source",
+        "tests",
+        "dev"
+      ],
       "exit_criteria": [],
       "stop_requires": []
     },
@@ -126,9 +191,16 @@
       "label": "Verification",
       "summary": "완료 조건 대조. 자기검증 회피 — 서브에이전트/타 모델/브라우저/dry-run.",
       "hint": "Selection 에서 기록한 완료 조건을 하나씩 대조하라 — 아래에 그대로 제시된다. 검증 결과도 적대적으로 재검토받는 것을 고려하라(권고). 사용자가 원하면 여러 모델에 돌린다.",
-      "write": ["tests", "dev"],
-      "exit_criteria": ["verification_evidence"],
-      "stop_requires": ["verification_evidence"]
+      "write": [
+        "tests",
+        "dev"
+      ],
+      "exit_criteria": [
+        "verification_evidence"
+      ],
+      "stop_requires": [
+        "verification_evidence"
+      ]
     },
     {
       "id": "compounding",
@@ -136,19 +208,39 @@
       "skippable": false,
       "summary": "회고를 기록하고, 작업이 끝났는지 스스로 판단한다. 여러 작업에서 반복된 항목은 승격을 결정해야 끝낼 수 있다.",
       "hint": "회고를 쓴 뒤 두 갈래 중 하나를 고른다. 판단 근거는 Selection 에서 기록한 완료 조건이다 — 아래에 그대로 제시된다. 작업이 끝났으면 `harness advance --done` (Selection 으로 돌아가 새 작업을 정한다). 후속 회차가 남았으면 `harness advance --cycle` (Scaffolding 부터 다시, 같은 작업 유지). 판단은 자율이다. 여러 작업에서 반복된 항목이 있으면 아래에 제시되고, 그 결정 없이는 이 단계를 끝낼 수 없다 — `harness promote`. 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
-      "write": ["dev", "context", "tests"],
-      "exit_criteria": ["retro_file", "promotion_decided"],
-      "stop_requires": ["retro_file", "promotion_decided"]
+      "write": [
+        "dev",
+        "context",
+        "tests"
+      ],
+      "exit_criteria": [
+        "retro_file",
+        "promotion_decided"
+      ],
+      "stop_requires": [
+        "retro_file",
+        "promotion_decided"
+      ]
     }
   ],
   "evidence_signals": {
-    "plan_file": { "write_glob": [".dev/plan/**/*.md"] },
+    "plan_file": {
+      "write_glob": [
+        ".dev/plan/**/*.md"
+      ]
+    },
     "retro_file": {
-      "write_glob": [".dev/retrospect/**/*.md", ".dev/learning/**/*.md"]
+      "write_glob": [
+        ".dev/retrospect/**/*.md",
+        ".dev/learning/**/*.md"
+      ]
     },
     "verification_evidence": {
       "bash_pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?test\\b|\\bpytest\\b|\\bgo\\s+test\\b|\\bcargo\\s+test\\b|\\bmake\\s+(test|check|lint)\\b|\\bvitest\\b|\\bjest\\b|\\bruff\\b|\\bmypy\\b|\\btsc\\b|--dry-run\\b",
-      "tools": ["Agent", "Task"],
+      "tools": [
+        "Agent",
+        "Task"
+      ],
       "tool_pattern": "^mcp__claude-in-chrome__|^mcp__playwright__"
     }
   }

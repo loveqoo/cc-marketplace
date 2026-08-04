@@ -48,6 +48,14 @@ jcheck() { # jcheck <label> <json-path> <expected-json> <json-text>
   fi
 }
 
+check_no_prefix_complaint() { # <label> <hook-output>
+  if printf '%s' "$2" | grep -q '말머리는'; then
+    FAIL=$((FAIL + 1)); printf '  FAIL %s\n     말머리 불만이 나왔다: %s\n' "$1" "$2"
+  else
+    PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"
+  fi
+}
+
 sql() { python3 - "$WORK/.claude/harness/harness.db" "$1" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
@@ -244,13 +252,13 @@ echo "== 결함 B 회귀: 턴 중 단계 전이 시 이전 말머리 허용"
 setstage scaffolding
 hook '{"hook_event_name":"PreToolUse","cwd":"'"$WORK"'","prompt_id":"pz","tool_name":"Read","tool_input":{}}' >/dev/null
 setstage execution
-check_empty "그 턴에 관여한 단계의 말머리는 통과" "$(hook "$(STOP pz '[Scaffolding] 완료')")"
+check_no_prefix_complaint "그 턴에 관여한 단계의 말머리는 통과" "$(hook "$(STOP pz '[Scaffolding] 완료')")"
 check "무관한 단계 말머리는 차단" '"decision": "block"' "$(hook "$(STOP pz2 '[Context] 완료')")"
 
 echo "== 말머리는 번호가 아니라 단계 이름으로 검증한다"
-check_empty "이름만 써도 통과" "$(hook "$(STOP pn1 '[Execution] 완료')")"
-check_empty "대소문자 무시" "$(hook "$(STOP pn2 '[execution] 완료')")"
-check_empty "앞뒤 공백 허용" "$(hook "$(STOP pn3 '[ Execution ] 완료')")"
+check_no_prefix_complaint "이름만 써도 통과" "$(hook "$(STOP pn1 '[Execution] 완료')")"
+check_no_prefix_complaint "대소문자 무시" "$(hook "$(STOP pn2 '[execution] 완료')")"
+check_no_prefix_complaint "앞뒤 공백 허용" "$(hook "$(STOP pn3 '[ Execution ] 완료')")"
 check "번호를 병기하면 차단 (중복 정보)" '"decision": "block"' \
   "$(hook "$(STOP pn4 '[4/6 Execution] 완료')")"
 check "이름 없이 번호만 쓰면 차단" '"decision": "block"' "$(hook "$(STOP pn5 '[4/6] 완료')")"
@@ -267,7 +275,7 @@ check "1회차 차단" '검증 증거가 없다' "$(hook "$(STOP pv '[Verificati
 check "2회차 차단 (limit 2)" '"decision": "block"' "$(hook "$(STOP pv '[Verification] 끝')")"
 check "3회차는 우회를 사용자에게 노출" 'systemMessage' "$(hook "$(STOP pv '[Verification] 끝')")"
 hook '{"hook_event_name":"PostToolUse","cwd":"'"$WORK"'","tool_name":"Bash","tool_input":{"command":"npm test"}}' >/dev/null
-check_empty "증거 적립 후 통과" "$(hook "$(STOP pv2 '[Verification] 끝')")"
+check_no_prefix_complaint "증거 적립 후 통과" "$(hook "$(STOP pv2 '[Verification] 끝')")"
 
 echo "== docs 예외"
 setstage scaffolding
@@ -875,6 +883,94 @@ check "행 조회 오류가 나지 않는다" '^0$' \
   "$(printf '%s' "$RJ" | grep -c 'No item with that key')"
 check "임계에 닿으면 사용자에게도 알린다" 'systemMessage' "$RJ"
 rm -rf "$RW"
+
+echo "== 턴 이어붙임과 진전 감지"
+# 이 경로에 테스트가 없어서 두 버그를 놓쳤다: root 미정의(즉시 예외), 그리고
+# 이어붙임 이벤트가 이벤트 수를 늘려 진전 감지가 자기 자신을 진전으로 센 것.
+CW="$(mktemp -d)"
+(cd "$CW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ccli() { (cd "$CW" && python3 "$ENGINE" "$@"); }
+csql() { python3 - "$CW/.claude/harness/harness.db" "$1" <<'PYC'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+q = sys.argv[2]
+if q.count(";") > 1:
+    con.executescript(q)
+else:
+    for row in con.execute(q):
+        print("|".join("" if v is None else str(v) for v in row))
+con.commit()
+PYC
+}
+cstop() { printf '{"hook_event_name":"Stop","cwd":"%s","prompt_id":"%s","last_assistant_message":"[Scaffolding] 했다"}' "$CW" "$1" \
+  | CLAUDE_PROJECT_DIR="$CW" python3 "$ENGINE" hook 2>&1; }
+cwork() { csql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES (strftime('%Y-%m-%dT%H:%M:%S','now')||'+0900','$CLID','scaffolding','edit',NULL,'$1');" >/dev/null; }
+
+ccli loop intent "이어붙임" >/dev/null
+ccli loop done-when "진전 없으면 멈춘다" >/dev/null
+ccli advance >/dev/null
+CLID="$(csql "SELECT v FROM meta WHERE k='head'")"
+
+check "예외 없이 동작한다" '^0$' "$(printf '%s' "$(cstop e0)" | grep -c 'is not defined')"
+check "1회는 이어붙인다" '"decision": "block"' "$(cstop p1)"
+check "이어붙임 횟수를 알려준다" '이어붙임 2/6' "$(cstop p1)"
+check "진전이 없으면 3회째에 멈춘다" '진전이 없어 멈춘다' "$(cstop p1)"
+check "무엇을 하라고 알려준다" '사람에게 물어라' "$(cstop p1)"
+check "멈춘 사실이 기록된다" '^1$' \
+  "$(csql "SELECT COUNT(DISTINCT target) FROM event WHERE kind='stop_stalled'")"
+
+echo "  -- 진전이 있으면 상한까지 밀어준다"
+i=1
+while [ "$i" -le 6 ]; do cwork "f$i.py"; OUT="$(cstop p2)"; i=$((i + 1)); done
+check "6회까지는 계속 이어붙인다" '이어붙임 6/6' "$OUT"
+cwork "f7.py"
+check "상한을 넘으면 턴을 끝낸다" '상한 6회를 소진' "$(cstop p2)"
+check "상한 소진도 기록된다" 'continue_limit' \
+  "$(csql "SELECT rule FROM event WHERE kind='bypass' AND rule='continue_limit' LIMIT 1")"
+
+echo "  -- 진전이 중간에 끊기면 거기서 멈춘다"
+cwork g1.py; cstop p3 >/dev/null
+cwork g2.py; cstop p3 >/dev/null
+cstop p3 >/dev/null
+check "끊긴 뒤 두 번째에 멈춘다" '진전이 없어 멈춘다' "$(cstop p3)"
+
+echo "  -- 종료 조건이 남아 있으면 이어붙이지 않고 그것을 요구한다"
+csql "UPDATE stage SET status='pending' WHERE status='active';
+      UPDATE stage SET status='active' WHERE stage='verification';" >/dev/null
+check "미충족 조건이 이어붙임보다 앞선다" '검증 증거가 없다' \
+  "$(printf '{\"hook_event_name\":\"Stop\",\"cwd\":\"%s\",\"prompt_id\":\"pv\",\"last_assistant_message\":\"[Verification] 끝\"}' "$CW" \
+     | CLAUDE_PROJECT_DIR="$CW" python3 "$ENGINE" hook)"
+
+echo "  -- 마지막 단계에서는 이어붙이지 않는다"
+csql "UPDATE stage SET status='done' WHERE stage != 'compounding';
+      UPDATE stage SET status='active' WHERE stage='compounding';
+      INSERT OR IGNORE INTO evidence VALUES('$CLID','compounding','retro_file','r',strftime('%Y-%m-%dT%H:%M:%S','now')||'+0900');" >/dev/null
+check "마지막 단계에서는 작업을 닫으라고 안내한다" 'advance --done' \
+  "$(printf '{\"hook_event_name\":\"Stop\",\"cwd\":\"%s\",\"prompt_id\":\"pz\",\"last_assistant_message\":\"[Compounding] 끝\"}' "$CW" \
+     | CLAUDE_PROJECT_DIR="$CW" python3 "$ENGINE" hook)"
+
+check "하네스 자신의 기록은 진전으로 세지 않는다" 'ok' "$(python3 - "$CW" "$(dirname "$ENGINE")" <<'PYFP'
+import sys
+sys.path.insert(0, sys.argv[2])
+import harness as h
+root = sys.argv[1]
+con = h.connect(root)
+lid = h.head_loop(con)
+before = h.progress_fingerprint(con, lid, "scaffolding")
+# 하네스 자신의 기록만 늘린다 -> 지문이 그대로여야 한다
+with con:
+    for kind in h.FP_IGNORE_KINDS:
+        h.record_event(con, lid, "scaffolding", kind, "r", "t", "d")
+after = h.progress_fingerprint(con, lid, "scaffolding")
+assert before == after, ("자기 기록이 진전으로 셌다", before, after)
+# 모델 활동은 지문을 바꿔야 한다
+with con:
+    h.record_event(con, lid, "scaffolding", "edit", None, "z.py")
+assert h.progress_fingerprint(con, lid, "scaffolding") != after, "편집이 진전으로 안 셌다"
+print("ok")
+PYFP
+)"
+rm -rf "$CW"
 
 echo "== 손상 내성"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"

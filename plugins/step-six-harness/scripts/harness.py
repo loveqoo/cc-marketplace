@@ -102,6 +102,8 @@ EVENT_KINDS = {
     "promote_declined": "승격 보류",
     "promote_verify": "승격 시 변경 관측",
     "cycle_close": "회차 종료",
+    "stop_continue": "턴 이어붙임",
+    "stop_stalled": "진전 없어 이어붙임 중단",
 }
 
 # 승격 결정의 종류. 'declined' 는 "안 한다 + 사유" — 결정이지 회피가 아니다.
@@ -1321,27 +1323,8 @@ def hook_stop(inp, ctx):
         if not criterion_met(con, cfg, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"
                              % (stage["label"], CRITERIA_HELP.get(key, key))))
-    # 진행 유도 (opt-in, 기본 꺼짐). 남은 단계가 있으면 턴 종료를 막아 이어붙인다.
-    # 하네스는 원래 반응만 하고 턴을 시작하지 않는다. 이건 그 한계를 Stop 훅으로 미는 실험이다.
-    sc = cfg.get("stop_continue") or {}
-    if not problems and sc.get("enabled"):
-        left = con.execute("SELECT COUNT(*) c FROM stage WHERE loop_id=? "
-                           "AND status IN ('pending','active')", (lid,)).fetchone()["c"]
-        limit = int(sc.get("max_per_prompt", 3))
-        n = con.execute("SELECT COUNT(*) c FROM stop_block WHERE prompt_id=? "
-                        "AND key='continue'", (prompt_id,)).fetchone()["c"]
-        if left and n < limit:
-            with con:
-                con.execute("INSERT INTO stop_block(prompt_id,key,at) VALUES(?,?,?)",
-                            (prompt_id, "continue", now()))
-            return emit({"decision": "block", "reason": (
-                "작업이 아직 끝나지 않았다 (현재 %s, 남은 단계 %d). 멈추지 말고 이어서 진행하라 — "
-                "`harness status` 로 이 단계의 종료 조건을 확인하고 채운 뒤 `harness advance`. "
-                "작업이 정말 끝났으면 Compounding 에서 `harness advance --done` 으로 닫아라. "
-                "(이어붙임 %d/%d)" % (stage["label"], left, n + 1, limit))})
-
     if not problems:
-        return
+        return continue_or_stop(con, cfg, lid, sid, stage, prompt_id)
 
     blocked, exhausted = [], []
     with con:
@@ -1365,6 +1348,89 @@ def hook_stop(inp, ctx):
         # 조용히 통과시키지 않는다 — 우회 사실을 사용자에게 노출한다
         emit({"systemMessage": "harness: %s 단계를 미충족 상태로 종료했다 (%s). "
                                "차단 상한 소진." % (stage["label"], ", ".join(exhausted))})
+
+
+# 하네스가 **스스로** 남기는 기록은 진전이 아니다. 이걸 빼지 않으면 이어붙임
+# 이벤트가 이벤트 수를 늘려 지문이 매번 바뀌고, 진전 감지가 자기 자신을 진전으로
+# 세면서 영원히 발동하지 않는다 — 실제로 그렇게 만들어서 5회 헛돌았다.
+FP_IGNORE_KINDS = ("stop_continue", "stop_stalled", "stop_gate", "bypass", "cycle_close")
+
+
+def progress_fingerprint(con, lid, sid):
+    """'하네스가 아는 진전'의 지문.
+
+    읽기만 한 턴은 지문이 그대로다 — 그건 의도한 것이다. 단계 종료 조건은
+    증거·모델 활동·단계 전이로만 채워지므로, 그 셋이 그대로면 종료에 가까워지지
+    않았다. 지문이 연속으로 같으면 이어붙여도 같은 자리를 돈다.
+    """
+    ev = con.execute("SELECT COUNT(*) c FROM evidence WHERE loop_id=?",
+                     (lid,)).fetchone()["c"]
+    n = con.execute(
+        "SELECT COUNT(*) c FROM event WHERE loop_id=? AND kind NOT IN (%s)"
+        % ",".join("?" * len(FP_IGNORE_KINDS)),
+        (lid,) + FP_IGNORE_KINDS).fetchone()["c"]
+    return "%s:%d:%d" % (sid, ev, n)
+
+
+def stalled_rounds(con, prompt_id, fp):
+    """이 프롬프트에서 지문이 연속 몇 번 그대로였나."""
+    seen = [r["detail"] for r in con.execute(
+        "SELECT detail FROM event WHERE kind='stop_continue' AND target=? ORDER BY id",
+        (prompt_id,))]
+    stalled = 0
+    for d in reversed(seen):
+        if d != fp:
+            break
+        stalled += 1
+    return stalled, len(seen)
+
+
+def continue_or_stop(con, cfg, lid, sid, stage, prompt_id):
+    """종료 조건을 다 채웠는데 단계가 남았으면 턴 종료를 막아 이어붙인다.
+
+    하네스는 원래 반응만 하고 턴을 시작하지 않는다. 이건 그 한계를 Stop 훅으로
+    미는 것이고, 무인 실행의 유일한 추진 장치다.
+
+    **진전 감지가 이 기능을 켤 수 있게 만든 조건이다.** 없이 켰을 때 첫 e2e 에서
+    모델이 불가능한 명령을 4회 반복하며 헛돌았다. 진전이 없으면 이어붙이지
+    않으므로, 진전이 있을 때는 상한을 넉넉히 줄 수 있다.
+    """
+    if not cfg.at("stop_continue.enabled"):
+        return
+    left = con.execute("SELECT COUNT(*) c FROM stage WHERE loop_id=? "
+                       "AND status IN ('pending','active')", (lid,)).fetchone()["c"]
+    if not left:
+        return
+    limit = cfg.num("stop_continue.max_per_prompt", 6, low=1)
+    no_prog = cfg.num("stop_continue.no_progress_limit", 2, low=1)
+    fp = progress_fingerprint(con, lid, sid)
+    stalled, used = stalled_rounds(con, prompt_id, fp)
+
+    if stalled >= no_prog:
+        # 조용히 놓아주지 않는다. 헛돈 사실이 기록되고 사용자에게 보인다.
+        with con:
+            record_event(con, lid, sid, "stop_stalled", stage["id"], prompt_id,
+                         "지문 %s 가 %d회 연속 그대로 — 이어붙이기를 멈춘다" % (fp, stalled))
+        return emit({"systemMessage": (
+            "harness: %d회 이어붙였으나 진전이 없어 멈춘다 (%s 단계). 같은 지시를 "
+            "반복하는 대신 무엇이 막고 있는지 사람에게 물어라." % (used, stage["label"]))})
+    if used >= limit:
+        with con:
+            record_event(con, lid, sid, "bypass", "continue_limit", stage["id"],
+                         "이어붙임 상한 %d 소진" % limit)
+        return emit({"systemMessage":
+                     "harness: 이어붙임 상한 %d회를 소진해 턴을 끝낸다 (%s 단계)."
+                     % (limit, stage["label"])})
+
+    with con:
+        record_event(con, lid, sid, "stop_continue", str(used + 1), prompt_id, fp)
+    missing = exit_blockers(con, cfg, lid, sid)
+    todo = ("이 단계의 남은 종료 조건: %s" % ", ".join(missing) if missing
+            else "이 단계의 종료 조건은 채웠다 — `harness advance` 로 넘어가라")
+    return emit({"decision": "block", "reason": (
+        "작업이 아직 끝나지 않았다 (현재 %s, 남은 단계 %d). 멈추지 말고 이어서 진행하라. "
+        "%s. 작업이 정말 끝났으면 Compounding 에서 `harness advance --done` 으로 닫아라. "
+        "(이어붙임 %d/%d)" % (stage["label"], left, todo, used + 1, limit))})
 
 
 HOOKS = {
