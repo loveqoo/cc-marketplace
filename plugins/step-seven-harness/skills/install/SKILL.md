@@ -1,5 +1,5 @@
 ---
-description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md에 앵커 1줄을 추가하고 .claude/harness/ 에 원칙·규칙·상태 파일을 만든다. "하네스 설치", "작업 원칙 적용", "6단계 원칙 적용", "harness init" 요청 시 사용.
+description: 현재 프로젝트에 step-seven-harness를 설치한다. CLAUDE.md에 앵커 2줄을 추가하고 .claude/harness/ 에 원칙·규칙·상태 파일을 만든다. "하네스 설치", "작업 원칙 적용", "7단계 원칙 적용", "6단계 원칙 적용"(옛 이름), "harness init" 요청 시 사용.
 ---
 
 # 하네스 설치
@@ -11,7 +11,7 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
 1. 엔진 경로를 찾고 `init` 을 실행한다.
 
    ```sh
-   ENGINE="$(ls -t "$HOME"/.claude/plugins/cache/*/step-six-harness/*/scripts/harness.py 2>/dev/null | head -1)"
+   ENGINE="$(ls -t "$HOME"/.claude/plugins/cache/*/step-seven-harness/*/scripts/harness.py 2>/dev/null | head -1)"
    [ -n "$ENGINE" ] && python3 "$ENGINE" init
    ```
 

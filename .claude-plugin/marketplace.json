@@ -8,8 +8,8 @@
   },
   "plugins": [
     {
-      "name": "step-six-harness",
-      "source": "./plugins/step-six-harness",
+      "name": "step-seven-harness",
+      "source": "./plugins/step-seven-harness",
       "description": "작업 하네스 — Selection부터 Compounding까지 7단계를 훅으로 강제하고, 마지막에서 작업 종료와 다음 회차로 갈라진다. 반복된 실수는 승격을 결정해야 회차가 닫히고, 같은 실패를 다시 받으면 그 자리에서 과거 기록을 알려준다. 하네스 자신은 Write/Edit·Bash 양쪽에서 잠긴다. 완료 조건·폴더 규칙 가드, 스킵과 작업 종료는 사유와 승인 필요. `metrics` 로 승격 재발률·마찰 추세·우회 추세를 측정한다(점수는 없다).",
       "category": "workflow",
       "keywords": [

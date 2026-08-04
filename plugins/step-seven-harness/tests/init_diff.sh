@@ -5,7 +5,7 @@
 # 엔진을 16번 돌려 느리다. 리팩터를 건드릴 때 손으로 돌린다.
 # 리팩터 직전(0.18.0 = 77d6065)과 현재를 같은 픽스처에 돌려 출력과 파일트리를 비교한다.
 REPO=${1:-$(cd "$(dirname "$0")/../../.." && pwd)}
-NEW=$REPO/plugins/step-six-harness/scripts/harness.py
+NEW=$REPO/plugins/step-seven-harness/scripts/harness.py
 BASE=$(mktemp -d)
 
 # 0.18.0 엔진을 templates 와 함께 재구성한다 (plugin_root 가 ../templates 를 본다)
@@ -20,7 +20,7 @@ OLD="$BASE/old/scripts/harness.py"
 mkdir -p "$BASE/new/scripts" "$BASE/new/templates"
 cp "$NEW" "$BASE/new/scripts/harness.py"
 for f in stages.json POLICY.md rationale.md; do
-  cp "$REPO/plugins/step-six-harness/templates/$f" "$BASE/new/templates/$f"
+  cp "$REPO/plugins/step-seven-harness/templates/$f" "$BASE/new/templates/$f"
 done
 NEWI="$BASE/new/scripts/harness.py"
 
@@ -42,7 +42,7 @@ fixture() { # fixture <dir> <case>
 }
 
 # 해시·시각처럼 매번 달라지는 값을 지운다
-norm() { sed -E 's/[0-9]{6}-[0-9a-f]{6}/<HASH>/g; s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+[+-][0-9]{4}/<TS>/g; s#(/private)?/var/folders/[^ ]*#<DIR>#g; s#/tmp\.[A-Za-z0-9]+/p#<DIR>#g'; }
+norm() { sed -E 's/[0-9]{6}-[0-9a-f]{6}/<HASH>/g; s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+[+-][0-9]{4}/<TS>/g; s#(/private)?/var/folders/[^ ]*#<DIR>#g; s#/tmp\.[A-Za-z0-9]+/p#<DIR>#g; s/step-(six|seven)-harness/<PLUGIN>/g'; }  # 이름 변경은 의도된 차이다
 tree() { (cd "$1" && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort \
   | grep -v 'harness\.db' | grep -v '/bin/'); }
 bodies() { (cd "$1" && for f in CLAUDE.md .gitignore .claude/settings.json; do

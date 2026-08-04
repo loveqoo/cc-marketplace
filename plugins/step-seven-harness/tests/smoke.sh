@@ -1,6 +1,6 @@
 #!/bin/sh
-# step-six-harness 스모크 테스트.
-#   usage: sh plugins/step-six-harness/tests/smoke.sh
+# step-seven-harness 스모크 테스트.
+#   usage: sh plugins/step-seven-harness/tests/smoke.sh
 # 임시 프로젝트를 만들고 훅 이벤트 JSON 을 엔진에 먹여 판정을 검증한다.
 set -e
 
@@ -96,7 +96,7 @@ check "help 도 같은 목록" 'approve-plan' "$(python3 "$ENGINE" help)"
 check "승인 필요 명령을 표시" '사용자 승인 다이얼로그가 뜬다' "$(python3 "$ENGINE" --help)"
 check "외울 필요 없다고 안내" '외울 필요는 없다' "$(python3 "$ENGINE" help)"
 check "오타는 help 로 안내" 'harness help' "$(cli statuss 2>&1 || true)"
-check "하네스 밖에서도 help 동작" 'step-six-harness' "$(cd / && python3 "$ENGINE" help)"
+check "하네스 밖에서도 help 동작" 'step-seven-harness' "$(cd / && python3 "$ENGINE" help)"
 
 echo "== 작업 선정 (Selection)"
 check "작업 미정을 알린다" '작업 내용: (미정)' "$(cli status)"
@@ -689,7 +689,7 @@ IW="$(mktemp -d)"
 (cd "$IW" && git init -q . && mkdir -p .claude \
   && printf '{"permissions":[]}\n' > .claude/settings.json \
   && printf '# 내 프로젝트\n\n예시: `@.claude/harness/LEARNED.md` 는 하네스가 만든다\n' > CLAUDE.md \
-  && printf '# step-six-harness (런타임 상태)\nnode_modules\n' > .gitignore)
+  && printf '# step-seven-harness (런타임 상태)\nnode_modules\n' > .gitignore)
 IOUT="$( (cd "$IW" && python3 "$ENGINE" init) 2>&1 )"; IRC=$?
 check "permissions 가 리스트여도 init 이 완주한다" '^0$' "$IRC"
 check "설치 완료를 보고한다" '하네스 설치 완료' "$IOUT"
@@ -1108,7 +1108,7 @@ hook "$(W docs/x.md)" >/dev/null 2>&1; CRC=$?
 check "DB 손상 시 종료 코드 0" '^0$' "$CRC"
 check "traceback 을 내지 않는다" '^0$' \
   "$(hook "$(W docs/x.md)" 2>&1 >/dev/null | grep -c Traceback)"
-check "무슨 일인지 stderr 로 알린다" 'step-six-harness' \
+check "무슨 일인지 stderr 로 알린다" 'step-seven-harness' \
   "$(hook "$(W docs/x.md)" 2>&1 >/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

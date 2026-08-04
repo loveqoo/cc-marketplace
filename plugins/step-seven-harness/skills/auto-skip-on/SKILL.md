@@ -57,4 +57,4 @@ description: 단계 스킵의 사용자 동의 다이얼로그를 끄고 자동 
 2. 승인되면 상태를 확인시킨다: `.claude/harness/bin/harness auto-skip status`
 3. `status` 와 세션 시작 컨텍스트에 `⚠ 스킵 자동 승인 ON` 이 계속 표시된다는 점을 알린다 —
    켜둔 사실을 잊지 않게 하는 장치다.
-4. 작업이 끝나면 `/step-six-harness:auto-skip-off` 로 되돌리라고 권한다.
+4. 작업이 끝나면 `/step-seven-harness:auto-skip-off` 로 되돌리라고 권한다.

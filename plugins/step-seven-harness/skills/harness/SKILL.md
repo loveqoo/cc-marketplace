@@ -4,7 +4,7 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 
 # 하네스 제어
 
-제어 명령은 프로젝트 안의 래퍼로 실행한다. 없으면 `/step-six-harness:install` 이 먼저다.
+제어 명령은 프로젝트 안의 래퍼로 실행한다. 없으면 `/step-seven-harness:install` 이 먼저다.
 
 ```sh
 .claude/harness/bin/harness status

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""step-six-harness engine.
+"""step-seven-harness engine.
 
   harness.py hook     stdin 으로 훅 이벤트 JSON 을 받아 판정을 stdout 으로 낸다.
   harness.py <cmd>    모델/사람이 쓰는 CLI (status, advance, skip, allow, ...).
@@ -1568,7 +1568,7 @@ def run_hook():
         # 차단하지 않는다. exit 1 은 Claude Code 가 훅 오류로 표면화하므로,
         # 무력해지더라도 조용히 빠진다 — 세션을 벽돌로 만드는 것보다 낫다.
         # 단 세션 시작 때는 한 번 알린다. 조용히 죽으면 고장을 모른다.
-        sys.stderr.write("step-six-harness: %s\n" % exc)
+        sys.stderr.write("step-seven-harness: %s\n" % exc)
         if inp.get("hook_event_name") == "SessionStart":
             emit({"systemMessage":
                   "harness: 하네스가 오류로 비활성 상태다 (%s). 스키마가 오래됐으면 "
@@ -1625,14 +1625,18 @@ ENGINE_REL = os.path.join(HARNESS_DIR, "bin", "harness.py")
 # 엔진 사본을 프로젝트 안에서 먼저 찾는다. 프로젝트 밖의 파일을 실행하면
 # auto-mode 분류기와 샌드박스가 막는다 — 둘 다 실제로 겪은 문제다.
 WRAPPER = """#!/bin/sh
-# step-six-harness wrapper — 세션 시작마다 갱신된다. 직접 편집하지 마라.
+# step-seven-harness wrapper — 세션 시작마다 갱신된다. 직접 편집하지 마라.
 D="$(cd "$(dirname "$0")" && pwd)"
 P="$D/harness.py"
 if [ ! -f "$P" ]; then P="%s"; fi
 if [ ! -f "$P" ]; then
-  P="$(ls -t "$HOME"/.claude/plugins/cache/*/step-six-harness/*/scripts/harness.py 2>/dev/null | head -1)"
+  # 정확한 이름을 먼저, 그다음 이름에 덜 묶인 glob. 플러그인 이름이 바뀌어도
+  # (6->7 단계처럼) 마지막 폴백이 살아 있다. 여러 개면 최신 것을 쓴다.
+  P="$(ls -t "$HOME"/.claude/plugins/cache/*/step-seven-harness/*/scripts/harness.py \
+             "$HOME"/.claude/plugins/cache/*/*harness*/*/scripts/harness.py \
+             2>/dev/null | head -1)"
 fi
-[ -f "$P" ] || { echo "step-six-harness: engine not found" >&2; exit 1; }
+[ -f "$P" ] || { echo "step-seven-harness: engine not found" >&2; exit 1; }
 exec python3 "$P" "$@"
 """
 
@@ -2856,7 +2860,7 @@ def run_cli(argv):
     root = find_root(os.getcwd())
     if not root:
         print("이 프로젝트에는 하네스가 설치되지 않았다. `harness init` 또는 "
-              "/step-six-harness:install 을 실행하라.", file=sys.stderr)
+              "/step-seven-harness:install 을 실행하라.", file=sys.stderr)
         return 1
     con = connect(root)
     cfg = load_config(root, plugin_root())
@@ -3000,7 +3004,7 @@ def install_gitignore(root):
     with open(gi, "a", encoding="utf-8") as fh:
         if have and not have.endswith("\n"):
             fh.write("\n")
-        fh.write("\n# step-six-harness (런타임 상태 — 커밋하지 않는다)\n")
+        fh.write("\n# step-seven-harness (런타임 상태 — 커밋하지 않는다)\n")
         fh.write("\n".join(add) + "\n")
     return [".gitignore"]
 
@@ -3103,7 +3107,7 @@ def dump_json(data):
     print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-USAGE = """step-six-harness — 작업 하네스
+USAGE = """step-seven-harness — 작업 하네스
 
   0 Selection → 1 Scaffolding → 2 Context → 3 Planning
               → 4 Execution → 5 Verification → 6 Compounding

@@ -13,16 +13,16 @@ import tempfile
 
 REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
                        else os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, os.path.join(REPO, "plugins/step-six-harness/scripts"))
+sys.path.insert(0, os.path.join(REPO, "plugins/step-seven-harness/scripts"))
 import harness as h  # noqa: E402
 
 root = os.path.join(tempfile.mkdtemp(), "p")
 os.makedirs(root)
 subprocess.run(["git", "init", "-q", "."], cwd=root, check=True)
-subprocess.run([sys.executable, os.path.join(REPO, "plugins/step-six-harness/scripts/harness.py"),
+subprocess.run([sys.executable, os.path.join(REPO, "plugins/step-seven-harness/scripts/harness.py"),
                 "init"], cwd=root, check=True, stdout=subprocess.DEVNULL)
 con = h.connect(root)
-cfg = h.load_config(root, os.path.join(REPO, "plugins/step-six-harness"))
+cfg = h.load_config(root, os.path.join(REPO, "plugins/step-seven-harness"))
 LID = h.head_loop(con)
 OTHER = "260101-aaaaaa"
 
