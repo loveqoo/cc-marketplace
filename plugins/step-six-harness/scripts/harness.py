@@ -367,6 +367,16 @@ def check_write(con, cfg, root, lid, sid, rel):
         record_event(con, lid, sid, "block", rule, rel, reason)
         return "deny", reason
 
+    # 0. 하네스 자신을 보호한다. 예외(`allow`)로도 열리지 않는다.
+    #    엔진을 고치면 게이트를 무력화할 수 있고, DB 를 덮어쓰면 손상 시 차단하지 않는
+    #    설계(세션을 벽돌로 만들지 않기 위한 것) 때문에 게이트 전체가 조용히 꺼진다.
+    for pat in rules.get("protected_paths", []):
+        if glob_match(rel, pat):
+            return deny("protected", (
+                "하네스 자신은 수정할 수 없다 (%s). 규칙을 바꾸려면 "
+                "`.claude/harness/stages.json` 을 고치고, 엔진을 바꾸려면 플러그인을 "
+                "수정하라. 이 차단은 `allow` 로도 열리지 않는다." % rel))
+
     # 1. docs/ 는 인간 소유
     if cls == "docs" and not grant:
         return deny("docs_readonly", (
@@ -672,6 +682,25 @@ def hook_stop(inp, con, cfg, root, lid, sid):
         if not has_evidence(con, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"
                              % (stage["label"], CRITERIA_HELP.get(key, key))))
+    # 진행 유도 (opt-in, 기본 꺼짐). 남은 단계가 있으면 턴 종료를 막아 이어붙인다.
+    # 하네스는 원래 반응만 하고 턴을 시작하지 않는다. 이건 그 한계를 Stop 훅으로 미는 실험이다.
+    sc = cfg.get("stop_continue") or {}
+    if not problems and sc.get("enabled"):
+        left = con.execute("SELECT COUNT(*) c FROM stage WHERE loop_id=? "
+                           "AND status IN ('pending','active')", (lid,)).fetchone()["c"]
+        limit = int(sc.get("max_per_prompt", 3))
+        n = con.execute("SELECT COUNT(*) c FROM stop_block WHERE prompt_id=? "
+                        "AND key='continue'", (prompt_id,)).fetchone()["c"]
+        if left and n < limit:
+            with con:
+                con.execute("INSERT INTO stop_block(prompt_id,key,at) VALUES(?,?,?)",
+                            (prompt_id, "continue", now()))
+            return emit({"decision": "block", "reason": (
+                "작업이 아직 끝나지 않았다 (현재 %s, 남은 단계 %d). 멈추지 말고 이어서 진행하라 — "
+                "`harness status` 로 이 단계의 종료 조건을 확인하고 채운 뒤 `harness advance`. "
+                "작업이 정말 끝났으면 Compounding 에서 `harness advance --done` 으로 닫아라. "
+                "(이어붙임 %d/%d)" % (stage["label"], left, n + 1, limit))})
+
     if not problems:
         return
 
@@ -780,9 +809,15 @@ def argv_positional(argv):
     return out
 
 
+ENGINE_REL = os.path.join(HARNESS_DIR, "bin", "harness.py")
+
+# 엔진 사본을 프로젝트 안에서 먼저 찾는다. 프로젝트 밖의 파일을 실행하면
+# auto-mode 분류기와 샌드박스가 막는다 — 둘 다 실제로 겪은 문제다.
 WRAPPER = """#!/bin/sh
 # step-six-harness wrapper — 세션 시작마다 갱신된다. 직접 편집하지 마라.
-P="%s"
+D="$(cd "$(dirname "$0")" && pwd)"
+P="$D/harness.py"
+if [ ! -f "$P" ]; then P="%s"; fi
 if [ ! -f "$P" ]; then
   P="$(ls -t "$HOME"/.claude/plugins/cache/*/step-six-harness/*/scripts/harness.py 2>/dev/null | head -1)"
 fi
@@ -791,17 +826,42 @@ exec python3 "$P" "$@"
 """
 
 
-def refresh_wrapper(root):
-    path = os.path.join(root, WRAPPER_REL)
-    body = WRAPPER % os.path.abspath(__file__)
+def _write_if_changed(path, body, mode=None):
     try:
-        if not os.path.isfile(path) or open(path, encoding="utf-8").read() != body:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(body)
-            os.chmod(path, 0o755)
+        if os.path.isfile(path) and open(path, encoding="utf-8").read() == body:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        if mode is not None:
+            os.chmod(path, mode)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def refresh_engine(root):
+    """엔진 사본을 프로젝트 안에 둔다.
+
+    모델이 실행하는 명령이 작업 디렉터리 밖의 파일을 가리키면 분류기·샌드박스가
+    막는다. 사본은 gitignore 되고 세션 시작마다 갱신되므로 버전이 어긋나지 않는다.
+    """
+    src = os.path.abspath(__file__)
+    dst = os.path.join(root, ENGINE_REL)
+    if src == os.path.abspath(dst):
+        return False  # 사본 자신이 실행 중이면 덮어쓰지 않는다
+    try:
+        with open(src, encoding="utf-8") as fh:
+            body = fh.read()
+    except Exception:
+        return False
+    return _write_if_changed(dst, body, 0o644)
+
+
+def refresh_wrapper(root):
+    refresh_engine(root)
+    _write_if_changed(os.path.join(root, WRAPPER_REL),
+                      WRAPPER % os.path.abspath(__file__), 0o755)
 
 
 def cli_status(con, cfg, root, lid, sid, argv):

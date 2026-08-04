@@ -27,7 +27,17 @@
       "log",
       "experiment"
     ],
-    "prefix_exempt_names": ["INDEX.md", "README.md"]
+    "prefix_exempt_names": ["INDEX.md", "README.md"],
+    "protected_paths": [
+      ".claude/harness/bin/**",
+      ".claude/harness/harness.db",
+      ".claude/harness/harness.db-wal",
+      ".claude/harness/harness.db-shm"
+    ]
+  },
+  "stop_continue": {
+    "enabled": false,
+    "max_per_prompt": 3
   },
   "stop_block_limits": {
     "prefix": 1,

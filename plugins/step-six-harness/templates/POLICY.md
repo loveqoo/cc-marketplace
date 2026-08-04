@@ -22,7 +22,8 @@
 | `docs/` | **사람이 기록한다.** 아키텍처·컨벤션·스펙. 명시적 승인 없이 수정하지 않는다. `spec/`, `adr/`, `retrospect/` 는 `NNN-name.md` |
 | `tests/` | 검증에 필요한 모든 파일 |
 | `.dev/` | 작업의 흔적: `plan/`, `learning/`, `troubleshooting/`, `retrospect/`, `log/`, `experiment/`, `scratch/`. 파일명은 **`<작업해시>-<회차>-이름.md`** (`scratch/` 제외) |
-| `.claude/` | Claude 설정 |
+| `.claude/` | Claude 설정. `.claude/harness/stages.json` 과 원칙 문서는 고칠 수 있다 |
+| `.claude/harness/bin/`, `harness.db` | **하네스 자신. 수정할 수 없다** — 예외 등록으로도 열리지 않는다 |
 
 ## 지켜야 할 점
 

@@ -88,6 +88,23 @@ check "입력 순서를 보존한다" '1\. 테스트 전부 통과' "$(cli loop 
 check "status 에 완료 조건이 보인다" '완료 조건 (2개)' "$(cli status)"
 check "둘 다 기록하면 종료 조건이 충족된다" '충족 intent_set, acceptance' "$(cli status)"
 
+echo "== 엔진 사본이 프로젝트 안에 있다"
+check "엔진 사본 생성" 'harness\.py' "$(ls "$WORK/.claude/harness/bin/")"
+check "래퍼가 사본을 먼저 가리킨다" 'P="\$D/harness\.py"' "$(cat "$WORK/.claude/harness/bin/harness")"
+check "사본으로 실행된다" '단계 1/7 Selection' \
+  "$(cd "$WORK" && ./.claude/harness/bin/harness status | head -1)"
+
+echo "== 하네스 자신은 수정할 수 없다"
+check "엔진 사본 쓰기 차단" '하네스 자신은 수정할 수 없다' \
+  "$(hook "$(W .claude/harness/bin/harness.py)")"
+check "래퍼 쓰기 차단" '하네스 자신은 수정할 수 없다' \
+  "$(hook "$(W .claude/harness/bin/harness)")"
+check "DB 쓰기 차단 (손상시키면 게이트가 꺼진다)" '하네스 자신은 수정할 수 없다' \
+  "$(hook "$(W .claude/harness/harness.db)")"
+cli allow '.claude/harness/bin/**' --reason '엔진 수정 시도' >/dev/null
+check "예외 등록으로도 열리지 않는다" '하네스 자신은 수정할 수 없다' \
+  "$(hook "$(W .claude/harness/bin/harness.py)")"
+
 echo "== Selection 은 .dev 만 쓸 수 있다"
 check "Selection 에서 소스 쓰기 차단" 'Selection' "$(hook "$(W src/a.py)")"
 check_empty "Selection 에서 .dev 쓰기 허용" "$(hook "$(W ".dev/plan/$LID-1-cands.md")")"
