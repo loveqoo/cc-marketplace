@@ -391,7 +391,10 @@ def check_write(con, cfg, root, lid, sid, rel):
                         ".dev/ 하위 폴더는 %s 만 허용한다. '%s' 는 규칙 위반이다. "
                         "특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
                         % ("/".join(allowed), parts[1]))
-        if parts[1] in rules.get("loop_prefixed_dirs", []):
+        if parts[1] in rules.get("loop_prefixed_dirs", []) \
+                and parts[-1] not in rules.get("prefix_exempt_names", []):
+            # 누적 문서(INDEX.md 등)는 특정 회차의 소유가 아니므로 접두사가 의미상 틀리다.
+            # 파일이 쌓이면 이 인덱스가 361개를 대표하는 진입점이 된다.
             pre = file_prefix(con, lid)
             if not parts[-1].startswith(pre):
                 return deny("loop_prefix", (
@@ -1097,10 +1100,17 @@ def _expand_keywords(keywords):
     return out
 
 
+INDEX_NAMES = ("INDEX.md", "README.md")
+
+
 def _recall_files(root, keywords, limit=6):
-    """회고·학습·트러블슈팅 파일 중 키워드에 걸리는 것. 내용은 읽지 않고 경로만 준다."""
+    """회고·학습·트러블슈팅 파일 중 키워드에 걸리는 것. 내용은 읽지 않고 경로만 준다.
+
+    인덱스 파일은 키워드와 무관하게 항상 앞에 놓는다. 파일이 수백 개로 쌓이면
+    개별 파일 6개를 보여주는 것보다 전체를 요약한 인덱스 하나가 낫다.
+    """
     keywords = _expand_keywords(keywords) if keywords else set()
-    hits = []
+    indexes, hits = [], []
     for sub in RECALL_DIRS:
         d = os.path.join(root, ".dev", sub)
         if not os.path.isdir(d):
@@ -1110,6 +1120,9 @@ def _recall_files(root, keywords, limit=6):
             if not os.path.isfile(path):
                 continue
             rel = ".dev/%s/%s" % (sub, name)
+            if name in INDEX_NAMES:
+                indexes.append(rel)
+                continue
             if not keywords:
                 hits.append(rel)
                 continue
@@ -1121,7 +1134,7 @@ def _recall_files(root, keywords, limit=6):
                 pass
             if any(kw.lower() in hay for kw in keywords):
                 hits.append(rel)
-    return hits[:limit]
+    return indexes, hits[:max(0, limit - len(indexes))]
 
 
 def cli_recall(con, cfg, root, lid, sid, argv):
@@ -1197,7 +1210,11 @@ def cli_recall(con, cfg, root, lid, sid, argv):
             for r in matched:
                 print("  %-40s ×%d (작업 %d)" % (r["target"][:40], r["c"], r["loops"]))
 
-    files = _recall_files(root, keywords)
+    indexes, files = _recall_files(root, keywords)
+    if indexes:
+        print("\n인덱스 — 쌓인 기록의 진입점 (먼저 읽어라)")
+        for f in indexes:
+            print("  %s" % f)
     print("\n관련 회고·학습 파일 (필요하면 읽어라)")
     if not files:
         print("  (없음)")

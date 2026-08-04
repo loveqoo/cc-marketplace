@@ -92,7 +92,11 @@ check "docs/ 쓰기 차단" '"permissionDecision": "deny"' "$(hook "$(W docs/spe
 check_empty "Scaffolding 에서 신규 최상위 폴더 허용" "$(hook "$(W src/a.py)")"
 check ".dev 하위 폴더 규칙 위반 차단" '규칙 위반' "$(hook "$(W .dev/nope/a.md)")"
 check ".dev 깊은 경로도 폴더 규칙 적용" '규칙 위반' "$(hook "$(W .dev/nope/deep/a.md)")"
-check_empty ".dev 직속 누적 문서는 허용 (인덱스)" "$(hook "$(W .dev/INDEX.md)")"
+check_empty ".dev 직속 누적 문서는 허용" "$(hook "$(W .dev/INDEX.md)")"
+check_empty "누적 폴더 안 INDEX.md 는 접두사 면제" "$(hook "$(W .dev/retrospect/INDEX.md)")"
+check_empty "README.md 도 접두사 면제" "$(hook "$(W .dev/learning/README.md)")"
+check "면제 대상이 아닌 파일은 여전히 접두사 필요" '회차>-. 로 시작' \
+  "$(hook "$(W .dev/retrospect/362-foo.md)")"
 
 echo "== 루프 해시 파일명 강제"
 check "해시 접두사 없으면 차단" '회차>-. 로 시작' "$(hook "$(W .dev/plan/my-plan.md)")"
@@ -325,6 +329,9 @@ NEW="$(loopid)"
 printf 'api 리팩터링 회고\n비동기 처리에서 실수했다\n' > "$WORK/.dev/retrospect/$NEW-api.md"
 printf '무관한 학습\n' > "$WORK/.dev/learning/$NEW-unrelated.md"
 check "키워드로 회고 파일을 찾는다" 'api\.md' "$(cli recall 비동기)"
+printf '# 회고 인덱스\n전체 목록\n' > "$WORK/.dev/retrospect/INDEX.md"
+check "인덱스를 진입점으로 먼저 제시한다" '인덱스 — 쌓인 기록의 진입점' "$(cli recall 비동기)"
+check "키워드와 무관해도 인덱스는 나온다" 'retrospect/INDEX\.md' "$(cli recall zzz없는키워드)"
 check "경로 키워드가 조각으로 넓혀져 산문에 걸린다" 'api\.md' "$(cli recall src/api.ts)"
 check "무관한 파일은 걸리지 않는다" '^0$' \
   "$(cli recall 비동기 | grep -c unrelated || true)"

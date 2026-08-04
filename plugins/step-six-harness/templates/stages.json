@@ -26,7 +26,8 @@
       "retrospect",
       "log",
       "experiment"
-    ]
+    ],
+    "prefix_exempt_names": ["INDEX.md", "README.md"]
   },
   "stop_block_limits": {
     "prefix": 1,
@@ -48,7 +49,7 @@
       "id": "scaffolding",
       "label": "Scaffolding",
       "summary": "이 작업에 맞는 구조인지 확인하고, 어긋나면 지금 바꾼다. 역할별 폴더링. 신규 최상위 폴더는 이 단계에서만 만들 수 있다. 쌓인 문서를 정리하고 인덱스를 갱신하는 것도 이 단계의 일이다.",
-      "hint": "구조 변경은 대부분의 회차에서 할 일이 없고, 그게 정상이다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다. 그리고 **줄이는 것도 이 단계의 일이다** — `.dev/` 아래 회고·학습 문서가 쌓였으면 통합·삭제하고, `.dev/INDEX.md` 같은 인덱스 문서를 만들어 갱신한다. 규칙이 늘어 마찰이 커졌으면 `stages.json` 을 덜어내는 것도 여기서 한다. 쌓이면 복잡해지는 시스템은 복리가 아니다.",
+      "hint": "구조 변경은 대부분의 회차에서 할 일이 없고, 그게 정상이다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다. 그리고 **줄이는 것도 이 단계의 일이다** — `.dev/retrospect/` 나 `.dev/learning/` 에 파일이 쌓였으면 통합·삭제하고, **그 폴더 안에 `INDEX.md` 를 만들어 갱신한다**(회차 접두사 없이 쓸 수 있다). 인덱스는 장식이 아니다 — `harness recall` 이 인덱스를 진입점으로 먼저 제시하므로, 수백 개 중 6개만 보이는 상황에서 전체를 대표한다. 규칙이 늘어 마찰이 커졌으면 `stages.json` 을 덜어내는 것도 여기서 한다. 쌓이면 복잡해지는 시스템은 복리가 아니다.",
       "write": ["source", "tests", "context", "dev"],
       "exit_criteria": [],
       "stop_requires": []
