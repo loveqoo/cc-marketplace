@@ -270,6 +270,8 @@ def exit_blockers(con, cfg, lid, sid):
 
 
 CRITERIA_HELP = {
+    "intent_set": "이번 루프에서 할 작업을 `harness loop intent \"<작업>\"` 으로 "
+                  "기록해야 한다 (Context 의 recall 이 이것을 기준으로 조회한다)",
     "plan_file": "계획 파일을 .dev/plan/ 아래에 남겨야 한다",
     "plan_approved": "계획에 대한 사람의 승인이 필요하다 (harness approve-plan <file>)",
     "verification_evidence": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, "
@@ -1230,9 +1232,12 @@ def cli_loop(con, cfg, root, lid, sid, argv):
     pos = argv_positional(argv)
     sub = pos[0] if pos else "show"
     if sub == "new":
+        intent = argv_value(argv, "intent")
         with con:
             close_loop(con, lid)
-            nlid = create_loop(con, cfg, root, argv_value(argv, "intent"))
+            nlid = create_loop(con, cfg, root, intent)
+            if intent:
+                record_evidence(con, nlid, cfg["stages"][0]["id"], "intent_set", intent)
         print("루프 %s 종료 → 새 루프 %s, 단계 %s"
               % (lid, nlid, label_of(cfg, cfg["stages"][0]["id"])))
         return 0
@@ -1243,6 +1248,8 @@ def cli_loop(con, cfg, root, lid, sid, argv):
             return 2
         with con:
             con.execute("UPDATE loop SET intent=? WHERE id=?", (text, lid))
+            # Scaffolding 의 종료 조건. 작업을 기록하지 않으면 단계를 넘어갈 수 없다.
+            record_evidence(con, lid, sid, "intent_set", text)
         print("루프 %s 의 작업: %s" % (lid, text))
         print("Context 단계의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다.")
         return 0

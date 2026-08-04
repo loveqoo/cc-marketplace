@@ -69,6 +69,9 @@ check "하네스 밖에서도 help 동작" 'step-six-harness' "$(cd / && python3
 
 echo "== 작업 선정 (Scaffolding)"
 check "작업 미정을 알린다" '작업: (미정)' "$(cli status)"
+check "작업을 기록하지 않으면 Scaffolding 을 끝낼 수 없다" 'intent_set' \
+  "$(cli advance || true)"
+check "거부 시 방법을 알려준다" 'harness loop intent' "$(cli advance || true)"
 check "작업을 기록한다" 'src/auth.ts 토큰 갱신' \
   "$(cli loop intent 'src/auth.ts 토큰 갱신 수정')"
 check "status 에 작업이 보인다" '작업: src/auth.ts' "$(cli status)"
@@ -77,6 +80,7 @@ check "조회 명령이 미리 허용된다" 'harness recall' \
   "$(python3 -c "import json;print(json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'])")"
 check "동의 필요 명령은 허용하지 않는다" '^0$' \
   "$(python3 -c "import json;a=json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'];print(sum(1 for x in a if 'harness skip' in x or 'auto-skip on' in x))")"
+check "작업을 기록하면 종료 조건이 충족된다" '충족 intent_set' "$(cli status)"
 
 echo "== 폴더 가드"
 check "docs/ 쓰기 차단" '"permissionDecision": "deny"' "$(hook "$(W docs/spec/001-a.md)")"
