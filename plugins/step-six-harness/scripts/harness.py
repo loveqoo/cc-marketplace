@@ -199,11 +199,60 @@ def connect(root, create=False):
 
 # ----------------------------------------------------------------------- config
 
+class Cfg(dict):
+    """stages.json 접근자. 경로 문법과 형 강제를 한 곳에 모은다.
+
+    dict 를 상속하므로 `cfg["stages"]` 나 `isinstance(cfg, dict)` 가 그대로 동작한다.
+    이 클래스가 없을 때는 설정을 읽는 방식이 세 가지였고, `int()` 강제 변환
+    try/except 가 일곱 곳에 복붙돼 있었다 — 기본값이 어긋나도 알 수 없는 상태였다.
+    """
+
+    def at(self, path, default=None):
+        cur = self
+        for part in path.split("."):
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(part)
+            if cur is None:
+                return default
+        return cur
+
+    def num(self, path, default, low=None):
+        try:
+            n = int(self.at(path, default))
+        except (TypeError, ValueError):
+            n = int(default)
+        return n if low is None else max(low, n)
+
+    def seq(self, path, default=()):
+        v = self.at(path)
+        return list(v) if isinstance(v, (list, tuple)) else list(default)
+
+    def obj(self, path):
+        v = self.at(path)
+        return v if isinstance(v, dict) else {}
+
+
+class Ctx(object):
+    """한 번의 훅/명령 실행이 필요한 전부. 이전에는 이 다섯 개를 위치 인자로
+    열일곱 함수에 꿰어 날랐다 — 어떤 함수가 무엇을 만지는지 알 수 없었다.
+
+    각 함수는 첫 줄에서 **실제로 쓰는 것만** 풀어쓴다. 그 한 줄이 의존 범위를
+    문서화한다: `cli_metrics` 는 con·cfg 만 쓰고 파일시스템을 건드리지 않는다.
+    """
+
+    __slots__ = ("con", "cfg", "root", "lid", "sid")
+
+    def __init__(self, con, cfg, root, lid, sid):
+        self.con, self.cfg, self.root = con, cfg, root
+        self.lid, self.sid = lid, sid
+
+
 def load_config(root, plugin_root_dir=None):
     cfg = jload(os.path.join(root, CONFIG_REL))
     if cfg is None and plugin_root_dir:
         cfg = jload(os.path.join(plugin_root_dir, "templates", "stages.json"))
-    return cfg
+    return Cfg(cfg) if isinstance(cfg, dict) else cfg
 
 
 def stage_ids(cfg):
@@ -331,6 +380,44 @@ def norm_cmd(cmd):
     return head
 
 
+def events_where(con, kinds=None, loop_id=None, rule=None, target=None,
+                 from_epoch=None, to_epoch=None):
+    """이벤트를 고른다. 시각 경계는 **절대 시각**으로만 비교한다.
+
+    이 함수가 없을 때는 같은 관용구가 네 곳에 복붙돼 있었고, 그중 두 곳이
+    SQL 문자열 비교를 쓰고 있었다. 오프셋 유무나 공백 구분 형식이 섞이면
+    사전순과 실제 순서가 어긋나서 창 밖의 이벤트가 안으로 들어온다 —
+    두 릴리스에 걸쳐 같은 버그를 두 번 냈다. 경계 판정은 여기 한 곳에만 있다.
+    """
+    sql = ["SELECT at, loop_id, stage, kind, rule, target, detail FROM event WHERE 1=1"]
+    params = []
+    if kinds:
+        sql.append("AND kind IN (%s)" % ",".join("?" * len(kinds)))
+        params += list(kinds)
+    for col, val in (("loop_id", loop_id), ("rule", rule), ("target", target)):
+        if val is not None:
+            sql.append("AND IFNULL(%s,'-') = ?" % col)
+            params.append(val)
+    rows = con.execute(" ".join(sql), params).fetchall()
+    if from_epoch is None and to_epoch is None:
+        return rows
+    out = []
+    for r in rows:
+        t = ts_epoch(r["at"])
+        if from_epoch is not None and t < from_epoch:
+            continue
+        if to_epoch is not None and t >= to_epoch:
+            continue
+        out.append(r)
+    return out
+
+
+def loops_created_after(con, epoch):
+    """그 시각 이후에 만들어진 작업 수. created_at 도 문자열로 비교하면 안 된다."""
+    return sum(1 for r in con.execute("SELECT created_at FROM loop")
+               if ts_epoch(r["created_at"]) > epoch)
+
+
 def has_evidence(con, lid, kind):
     return con.execute("SELECT 1 FROM evidence WHERE loop_id=? AND kind=? LIMIT 1",
                        (lid, kind)).fetchone() is not None
@@ -358,8 +445,10 @@ def acceptance_of(con, lid):
 # ExpeL 의 중요도 투표와 CODESKILL 의 add/merge/drop 이 공통으로 말하는 것:
 # 저장소는 쌓이면 안 되고 수렴해야 하며, 살아남는 기준은 근거다.
 
-def promo_cfg(cfg):
-    return cfg.get("promotion") or {}
+def promo_match(item):
+    """block 은 규칙이, 나머지는 대상이 의미 있는 키다. events_where 용 필터."""
+    col = "rule" if item["kind"] == "block" else "target"
+    return {col: item["name"]}
 
 
 def promo_key(kind, rule, target):
@@ -373,18 +462,14 @@ def promo_key(kind, rule, target):
 
 def repeated_items(con, cfg):
     """여러 작업에서 반복된 항목. 한 작업 안의 반복은 우연일 수 있다."""
-    pc = promo_cfg(cfg)
-    kinds = pc.get("kinds") or ["block", "tool_fail"]
-    try:
-        min_loops = max(2, int(pc.get("min_loops", 3)))
-    except (TypeError, ValueError):
-        min_loops = 3
+    kinds = cfg.seq("promotion.kinds", ("block", "tool_fail"))
+    min_loops = cfg.num("promotion.min_loops", 3, low=2)
     # 승격할 수 없는 규칙은 후보에서 뺀다. `no_reason`·`bypass_mode`·`protected` 는
     # 모델이 게이트를 우회하려 한 기록이다 — 하네스가 제대로 동작한 증거이지
     # 기계화할 습관이 아니다. 이걸 승격 대상으로 올리면 "우회 시도를 승격하라"는
     # 뜻이 되고, 사용자가 봐야 할 규율 신호가 결정 절차로 세탁된다. stats 에는 남는다.
-    skip = set(pc.get("exclude_rules") or
-               ["no_reason", "bypass_mode", "protected", "protected_bash"])
+    skip = set(cfg.seq("promotion.exclude_rules",
+                       ("no_reason", "bypass_mode", "protected", "protected_bash")))
     out = []
     for kind in kinds:
         key_col = "rule" if kind == "block" else "target"
@@ -402,28 +487,19 @@ def repeated_items(con, cfg):
     return out
 
 
-def _events_since(con, item, since):
-    """승격 이후 같은 항목이 다시 걸렸는지. 승격이 통했는지의 유일한 객관 증거다.
+def recurrence(con, p):
+    """승격 이후 같은 항목이 다시 걸렸는지 → (횟수, 작업 수).
 
-    비교는 Python 에서 절대 시각으로 한다 — SQL 문자열 비교는 오프셋·DST 에서
-    순서가 뒤집힌다. 한 항목의 이벤트 수는 작으므로 행을 가져와도 싸다.
-    또한 경계를 1초 뒤로 둔다: 승격을 기록한 그 초에 남은 이벤트는 승격 이전의
-    사실이므로 재발로 세면 방금 내린 결정이 즉시 무효화된다.
+    승격이 통했는지의 유일한 객관 증거다. 경계를 1초 뒤로 두는 이유: 승격을
+    기록한 그 초에 남은 이벤트는 승격 **이전**의 사실이므로, 재발로 세면 방금
+    내린 결정이 즉시 무효화된다.
     """
-    key_col = "rule" if item["kind"] == "block" else "target"
-    cutoff = ts_epoch(since) + 1 if since else 0.0
-    rows = con.execute(
-        "SELECT at, loop_id FROM event WHERE kind=? AND IFNULL(%s,'-')=?" % key_col,
-        (item["kind"], item["name"])).fetchall()
-    hits = [r for r in rows if ts_epoch(r["at"]) >= cutoff]
+    item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
+    base = p["recheck_at"] or p["at"]
+    hits = events_where(con, kinds=(item["kind"],),
+                        from_epoch=(ts_epoch(base) + 1) if base else 0.0,
+                        **promo_match(item))
     return len(hits), len({r["loop_id"] for r in hits})
-
-
-def _reopen_after(cfg):
-    try:
-        return max(1, int(promo_cfg(cfg).get("reopen_after_loops", 2)))
-    except (TypeError, ValueError):
-        return 2
 
 
 def is_regressed(con, cfg, p):
@@ -435,9 +511,7 @@ def is_regressed(con, cfg, p):
     """
     if p["maturity"] == "regressed":
         return True
-    item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
-    _, loops = _events_since(con, item, p["recheck_at"] or p["at"])
-    return loops >= _reopen_after(cfg)
+    return recurrence(con, p)[1] >= cfg.num("promotion.reopen_after_loops", 2, low=1)
 
 
 def sync_promotions(con, cfg):
@@ -447,28 +521,21 @@ def sync_promotions(con, cfg):
     established → regressed: 승격 후에도 M개 작업에서 다시 걸렸다. 승격이
     통하지 않았다는 뜻이므로 다시 결정 대상으로 돌린다.
     """
-    try:
-        proven_after = max(1, int(promo_cfg(cfg).get("proven_after_loops", 3)))
-    except (TypeError, ValueError):
-        proven_after = 3
+    proven_after = cfg.num("promotion.proven_after_loops", 3, low=1)
+    reopen_after = cfg.num("promotion.reopen_after_loops", 2, low=1)
     changed = []
     for p in con.execute("SELECT * FROM promotion").fetchall():
         if p["maturity"] == "regressed":
             continue
-        item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
-        _, loops = _events_since(con, item, p["recheck_at"] or p["at"])
-        if loops >= _reopen_after(cfg):
+        _, loops = recurrence(con, p)
+        if loops >= reopen_after:
             con.execute("UPDATE promotion SET maturity='regressed' WHERE key=?",
                         (p["key"],))
             changed.append((p["key"], "regressed"))
             continue
         if p["maturity"] == "proven" or p["decision"] == "declined":
             continue
-        # 작업 수도 절대 시각으로 센다 — created_at 문자열 비교는 위와 같은 이유로 틀린다.
-        base = ts_epoch(p["at"])
-        since = sum(1 for r in con.execute("SELECT created_at FROM loop")
-                    if ts_epoch(r["created_at"]) > base)
-        if loops == 0 and since >= proven_after:
+        if loops == 0 and loops_created_after(con, ts_epoch(p["at"])) >= proven_after:
             con.execute("UPDATE promotion SET maturity='proven' WHERE key=?",
                         (p["key"],))
             changed.append((p["key"], "proven"))
@@ -486,11 +553,7 @@ def pending_promotions(con, cfg, limit=None):
         elif is_regressed(con, cfg, p):
             out.append(dict(item, regressed=p["decision"]))
     if limit is None:
-        pc = promo_cfg(cfg)
-        try:
-            limit = max(1, int(pc.get("max_per_cycle", 3)))
-        except (TypeError, ValueError):
-            limit = 3
+        limit = cfg.num("promotion.max_per_cycle", 3, low=1)
     return out[:limit]
 
 
@@ -514,20 +577,10 @@ def cycle_window_start(con, lid):
     return (row["created_at"] if row else None) or ""
 
 
-def _window_events(con, lid, start, kinds=None):
-    """[start, 지금) 안의 이 작업 이벤트. 비교는 절대 시각으로 한다."""
-    lo = ts_epoch(start)
-    sql = "SELECT at, kind, rule, target FROM event WHERE loop_id=?"
-    params = [lid]
-    if kinds:
-        sql += " AND kind IN (%s)" % ",".join("?" * len(kinds))
-        params += list(kinds)
-    return [r for r in con.execute(sql, params) if ts_epoch(r["at"]) >= lo]
-
-
 def cycle_counters(con, lid, start):
     """이 회차의 마찰 수치. 회피 지표를 반드시 함께 담는다 — 차단만 보면 속는다."""
-    rows = _window_events(con, lid, start)
+    lo = ts_epoch(start)
+    rows = events_where(con, loop_id=lid, from_epoch=lo)
     tally = {}
     for r in rows:
         tally[r["kind"]] = tally.get(r["kind"], 0) + 1
@@ -539,13 +592,9 @@ def cycle_counters(con, lid, start):
             edits[r["target"]] = edits.get(r["target"], 0) + 1
 
     # 반복 실패: 이 회차의 실패 중 그 명령이 **이전에도** 실패한 적 있는 것.
-    # 여기도 절대 시각으로 비교해야 한다. SQL 문자열 비교를 쓰면 형식이 조금만
-    # 달라도(공백 구분 vs 'T', 오프셋 유무) 창 밖의 것이 안으로 들어온다.
     # 작업 경계를 넘어 센다 — 지난 작업에서 실패한 명령이 또 실패하는 것이 요점이다.
-    lo = ts_epoch(start)
-    seen_before = {r["target"] for r in con.execute(
-        "SELECT at, target FROM event WHERE kind='tool_fail'")
-        if ts_epoch(r["at"]) < lo}
+    seen_before = {r["target"] for r in
+                   events_where(con, kinds=("tool_fail",), to_epoch=lo)}
     refails, seen_now = 0, set()
     for r in rows:
         if r["kind"] != "tool_fail":
@@ -584,8 +633,7 @@ def record_cycle_close(con, cfg, lid, sid):
 
 
 def verify_globs(cfg, as_kind):
-    v = (promo_cfg(cfg).get("verify_globs") or {}).get(as_kind)
-    return v if isinstance(v, list) else None
+    return cfg.seq("promotion.verify_globs.%s" % as_kind) or None
 
 
 def promote_change_seen(con, cfg, lid, as_kind):
@@ -599,9 +647,10 @@ def promote_change_seen(con, cfg, lid, as_kind):
     pats = verify_globs(cfg, as_kind)
     if not pats:
         return None
-    excl = promo_cfg(cfg).get("verify_exclude") or []
+    excl = cfg.seq("promotion.verify_exclude")
     start = cycle_window_start(con, lid)
-    for r in _window_events(con, lid, start, ("edit",)):
+    for r in events_where(con, kinds=("edit",), loop_id=lid,
+                          from_epoch=ts_epoch(start)):
         rel = r["target"] or ""
         if any(glob_match(rel, p) for p in excl):
             continue
@@ -628,10 +677,7 @@ def learned_lines(con, cfg):
 
 
 def learned_budget(cfg):
-    try:
-        return max(1, int(promo_cfg(cfg).get("learned_max_lines", 20)))
-    except (TypeError, ValueError):
-        return 20
+    return cfg.num("promotion.learned_max_lines", 20, low=1)
 
 
 LEARNED_HEAD = """# 승격된 규칙
@@ -738,86 +784,141 @@ def new_toplevel_dir(root, rel):
     return None if os.path.isdir(os.path.join(root, parts[0])) else parts[0]
 
 
-def check_write(con, cfg, root, lid, sid, rel):
+class WriteReq(object):
+    """쓰기 한 건에 대한 판정 요청. 규칙 함수들이 공유하는 계산을 한 번만 한다."""
+
+    __slots__ = ("ctx", "rel", "cls", "stage", "lbl", "grant", "parts")
+
+    def __init__(self, ctx, rel):
+        self.ctx, self.rel = ctx, rel
+        self.cls = classify(rel, ctx.cfg)
+        self.stage = stage_obj(ctx.cfg, ctx.sid)
+        self.lbl = label_of(ctx.cfg, ctx.sid)
+        self.grant = find_grant(ctx.con, ctx.lid, rel)
+        self.parts = rel.split("/")
+
+    def seq(self, name, default=()):
+        return self.ctx.cfg.seq("folder_rules." + name, default)
+
+
+# 규칙 하나는 "위반 사유 문자열 또는 None" 을 돌려준다. 순서가 의미를 갖는다 —
+# 아래 WRITE_RULES 의 나열 순서가 곧 우선순위이고, 그게 이 표의 존재 이유다.
+# 이전에는 92줄 if-체인이어서 순서가 코드 흐름에 숨어 있었다.
+
+def _w_protected(w):
+    """하네스 자신. 예외(`allow`)로도 열리지 않으므로 grant 를 보지 않는다.
+
+    엔진을 고치면 게이트를 무력화할 수 있고, DB 를 덮어쓰면 손상 시 차단하지 않는
+    설계(세션을 벽돌로 만들지 않기 위한 것) 때문에 게이트 전체가 조용히 꺼진다.
+    """
+    for pat in w.seq("protected_paths"):
+        if glob_match(w.rel, pat):
+            return ("하네스 자신은 수정할 수 없다 (%s). 규칙을 바꾸려면 "
+                    "`.claude/harness/stages.json` 을 고치고, 엔진을 바꾸려면 플러그인을 "
+                    "수정하라. 이 차단은 `allow` 로도 열리지 않는다." % w.rel)
+
+
+def _w_docs_readonly(w):
+    """docs/ 는 사람 소유."""
+    if w.cls == "docs" and not w.grant:
+        return ("docs/ 는 사람이 기록하는 영역이라 하네스가 쓰기를 막는다 (%s). "
+                "정말 필요하면 사용자에게 승인을 받아라: "
+                "`.claude/harness/bin/harness allow \"%s\" --reason \"...\"`"
+                % (w.rel, w.rel))
+
+
+def _w_stage_write(w):
+    """단계별 쓰기 허용 클래스."""
+    allowed = w.stage.get("write", [])
+    if w.cls not in allowed and not w.grant:
+        return ("현재 단계 %s 에서는 '%s' 클래스 경로에 쓸 수 없다 (%s). 허용: %s. "
+                "단계를 진행하려면 `.claude/harness/bin/harness advance`, "
+                "건너뛰려면 `... skip <stage> --reason \"...\"`."
+                % (w.lbl, w.cls, w.rel, ", ".join(allowed) or "(없음)"))
+
+
+def _w_new_toplevel(w):
+    """신규 최상위 폴더는 Scaffolding 에서만."""
+    if w.cls != "source":
+        return None
+    top = new_toplevel_dir(w.ctx.root, w.rel)
+    if top and w.ctx.sid not in w.seq("new_toplevel_dir_stages", ("scaffolding",)):
+        return ("신규 최상위 폴더 '%s/' 는 Scaffolding 단계에서만 만들 수 있다 (현재 %s). "
+                "구조 변경이 필요하면 Scaffolding 으로 되돌아가서 합의하라." % (top, w.lbl))
+
+
+def _w_dev_subdir(w):
+    """`.dev/` 하위 폴더 이름.
+
+    `.dev/` 직속 파일(예: .dev/INDEX.md)은 제약하지 않는다 — 특정 회차에 속하지
+    않는 누적 문서의 자리가 필요하다. 폴더명 제약은 유지한다.
+    """
+    if w.cls != "dev" or len(w.parts) < 3:
+        return None
+    allowed = w.seq("dev_subdirs")
+    if allowed and w.parts[1] not in allowed:
+        return (".dev/ 하위 폴더는 %s 만 허용한다. '%s' 는 규칙 위반이다. "
+                "특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
+                % ("/".join(allowed), w.parts[1]))
+
+
+def _w_loop_prefix(w):
+    """산출물 파일명의 `<작업해시>-<회차>-` 접두사.
+
+    누적 문서(INDEX.md 등)는 특정 회차의 소유가 아니므로 접두사가 의미상 틀리다.
+    파일이 쌓이면 그 인덱스가 수백 개를 대표하는 진입점이 된다.
+    """
+    if w.cls != "dev" or len(w.parts) < 3:
+        return None
+    if w.parts[1] not in w.seq("loop_prefixed_dirs"):
+        return None
+    if w.parts[-1] in w.seq("prefix_exempt_names"):
+        return None
+    pre = file_prefix(w.ctx.con, w.ctx.lid)
+    if not w.parts[-1].startswith(pre):
+        return ("이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. "
+                "'%s' 대신 '%s%s' 로 써라. 앞단 해시(%s)로 grep 하면 한 작업의 "
+                "산출물이 회차와 무관하게 모인다."
+                % (w.parts[-1], pre, w.parts[-1], w.ctx.lid))
+
+
+def _w_docs_naming(w):
+    """docs 하위 번호 명명 규칙 (grant 로 쓰기가 허용된 경우에만 도달)."""
+    if w.cls != "docs" or len(w.parts) < 3:
+        return None
+    if w.parts[1] not in w.seq("docs_subdirs"):
+        return None
+    pat = w.ctx.cfg.at("folder_rules.numbered_name_pattern")
+    if pat and not re.match(pat, w.parts[-1]):
+        return ("docs/%s/ 파일명은 NNN-name.md 형식이어야 한다. "
+                "'%s' 는 규칙 위반이다." % (w.parts[1], w.parts[-1]))
+
+
+WRITE_RULES = (
+    ("protected", _w_protected),
+    ("docs_readonly", _w_docs_readonly),
+    ("stage_write", _w_stage_write),
+    ("new_toplevel", _w_new_toplevel),
+    ("dev_subdir", _w_dev_subdir),
+    ("loop_prefix", _w_loop_prefix),
+    ("docs_naming", _w_docs_naming),
+)
+
+
+def check_write(ctx, rel):
     """(decision, reason). decision None 이면 판정하지 않음.
 
     차단은 event 에 적립한다 — 어떤 규칙에 몇 번 걸리는지가 복리의 원료다.
     """
-    stage = stage_obj(cfg, sid)
-    lbl = label_of(cfg, sid)
-    cls = classify(rel, cfg)
-    rules = cfg.get("folder_rules", {})
-    grant = find_grant(con, lid, rel)
-
-    def deny(rule, reason):
-        record_event(con, lid, sid, "block", rule, rel, reason)
-        return "deny", reason
-
-    # 0. 하네스 자신을 보호한다. 예외(`allow`)로도 열리지 않는다.
-    #    엔진을 고치면 게이트를 무력화할 수 있고, DB 를 덮어쓰면 손상 시 차단하지 않는
-    #    설계(세션을 벽돌로 만들지 않기 위한 것) 때문에 게이트 전체가 조용히 꺼진다.
-    for pat in rules.get("protected_paths", []):
-        if glob_match(rel, pat):
-            return deny("protected", (
-                "하네스 자신은 수정할 수 없다 (%s). 규칙을 바꾸려면 "
-                "`.claude/harness/stages.json` 을 고치고, 엔진을 바꾸려면 플러그인을 "
-                "수정하라. 이 차단은 `allow` 로도 열리지 않는다." % rel))
-
-    # 1. docs/ 는 인간 소유
-    if cls == "docs" and not grant:
-        return deny("docs_readonly", (
-            "docs/ 는 사람이 기록하는 영역이라 하네스가 쓰기를 막는다 (%s). "
-            "정말 필요하면 사용자에게 승인을 받아라: "
-            "`.claude/harness/bin/harness allow \"%s\" --reason \"...\"`" % (rel, rel)))
-
-    # 2. 단계별 쓰기 허용 클래스
-    if cls not in stage.get("write", []) and not grant:
-        return deny("stage_write", (
-            "현재 단계 %s 에서는 '%s' 클래스 경로에 쓸 수 없다 (%s). 허용: %s. "
-            "단계를 진행하려면 `.claude/harness/bin/harness advance`, "
-            "건너뛰려면 `... skip <stage> --reason \"...\"`."
-            % (lbl, cls, rel, ", ".join(stage.get("write", [])) or "(없음)")))
-
-    # 3. 신규 최상위 폴더는 Scaffolding 에서만 (승인된 구조 영역은 제외)
-    top = new_toplevel_dir(root, rel) if cls == "source" else None
-    if top and sid not in rules.get("new_toplevel_dir_stages", ["scaffolding"]):
-        return deny("new_toplevel", (
-            "신규 최상위 폴더 '%s/' 는 Scaffolding 단계에서만 만들 수 있다 (현재 %s). "
-            "구조 변경이 필요하면 Scaffolding 으로 되돌아가서 합의하라." % (top, lbl)))
-
-    parts = rel.split("/")
-
-    # 4. .dev 하위 폴더 규칙 + 작업 해시 파일명
-    #    `.dev/` 직속 파일(예: .dev/INDEX.md)은 제약하지 않는다 — 누적 인덱스처럼
-    #    특정 회차에 속하지 않는 문서의 자리가 필요하다. 폴더명 제약은 유지한다.
-    if cls == "dev" and len(parts) >= 3:
-        allowed = rules.get("dev_subdirs", [])
-        if allowed and parts[1] not in allowed:
-            return deny("dev_subdir",
-                        ".dev/ 하위 폴더는 %s 만 허용한다. '%s' 는 규칙 위반이다. "
-                        "특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
-                        % ("/".join(allowed), parts[1]))
-        if parts[1] in rules.get("loop_prefixed_dirs", []) \
-                and parts[-1] not in rules.get("prefix_exempt_names", []):
-            # 누적 문서(INDEX.md 등)는 특정 회차의 소유가 아니므로 접두사가 의미상 틀리다.
-            # 파일이 쌓이면 이 인덱스가 361개를 대표하는 진입점이 된다.
-            pre = file_prefix(con, lid)
-            if not parts[-1].startswith(pre):
-                return deny("loop_prefix", (
-                    "이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. "
-                    "'%s' 대신 '%s%s' 로 써라. 앞단 해시(%s)로 grep 하면 한 작업의 "
-                    "산출물이 회차와 무관하게 모인다." % (parts[-1], pre, parts[-1], lid)))
-
-    # 5. docs 하위 번호 명명 규칙 (grant 로 쓰기가 허용된 경우에만 도달)
-    if cls == "docs" and len(parts) >= 3 and parts[1] in rules.get("docs_subdirs", []):
-        pat = rules.get("numbered_name_pattern")
-        if pat and not re.match(pat, parts[-1]):
-            return deny("docs_naming",
-                        "docs/%s/ 파일명은 NNN-name.md 형식이어야 한다. "
-                        "'%s' 는 규칙 위반이다." % (parts[1], parts[-1]))
-
-    if grant:
-        con.execute("UPDATE wgrant SET uses_left=uses_left-1 WHERE id=?", (grant["id"],))
+    w = WriteReq(ctx, rel)
+    for name, rule in WRITE_RULES:
+        reason = rule(w)
+        if reason:
+            record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
+            return "deny", reason
+    if w.grant:
+        ctx.con.execute("UPDATE wgrant SET uses_left=uses_left-1 WHERE id=?",
+                        (w.grant["id"],))
     return None, None
 
 
@@ -878,7 +979,8 @@ def pre_decision(decision, reason):
 
 # ------------------------------------------------------------------------ hooks
 
-def hook_session_start(inp, con, cfg, root, lid, sid):
+def hook_session_start(inp, ctx):
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     refresh_wrapper(root)
     # LEARNED.md 는 CLAUDE.md 앵커로 **이 순간** 로드된다. 그러니 여기서 맞춰야 한다.
     # promote 에서만 재생성하면 그 사이 재발한 규칙이 계속 실린다.
@@ -984,7 +1086,7 @@ def ctrl_decision(con, sub, cmd, mode, lid, sid):
     elif sub not in CONSENT_CMDS:
         return
 
-    reason = arg_value(cmd, "reason")
+    reason = raw_flag(cmd, "reason")
     if sub != "approve-plan" and not reason:
         record_event(con, lid, sid, "block", "no_reason", sub, cmd[:200])
         return emit(pre_decision("deny",
@@ -1010,7 +1112,8 @@ def ctrl_decision(con, sub, cmd, mode, lid, sid):
     return emit(pre_decision("ask", detail))
 
 
-def hook_pre_tool_use(inp, con, cfg, root, lid, sid):
+def hook_pre_tool_use(inp, ctx):
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     tool = inp.get("tool_name") or ""
     ti = inp.get("tool_input") or {}
     mode = inp.get("permission_mode") or "default"
@@ -1059,13 +1162,14 @@ def hook_pre_tool_use(inp, con, cfg, root, lid, sid):
     if not rel:
         return
     with con:
-        decision, reason = check_write(con, cfg, root, lid, sid, rel)
+        decision, reason = check_write(ctx, rel)
     if decision:
         emit(pre_decision(decision, reason))
 
 
-def hook_post_tool_use(inp, con, cfg, root, lid, sid):
+def hook_post_tool_use(inp, ctx):
     """증거만 조용히 적립한다. 컨텍스트로 출력하지 않는다."""
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     tool = inp.get("tool_name") or ""
     ti = inp.get("tool_input") or {}
     signals = cfg.get("evidence_signals", {})
@@ -1097,11 +1201,12 @@ def hook_post_tool_use(inp, con, cfg, root, lid, sid):
                 record_evidence(con, lid, sid, "verification_evidence", "tool:" + tool)
 
 
-def hook_post_tool_use_failure(inp, con, cfg, root, lid, sid):
+def hook_post_tool_use_failure(inp, ctx):
     """도구 실패를 적립한다. 같은 실패가 반복되는 것이 '동일한 실수'의 직접 증거다.
 
     오류 필드명이 문서에 명시돼 있지 않아 후보를 순서대로 시도한다.
     """
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     tool = inp.get("tool_name") or ""
     ti = inp.get("tool_input") or {}
     err = ""
@@ -1144,7 +1249,9 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
     lines = ["[harness] '%s' 실패가 %d번째다%s."
              % (target, n, " (작업 %d개에 걸쳐)" % loops if loops > 1 else "")]
 
-    p = con.execute("SELECT decision, maturity, note FROM promotion WHERE key=?",
+    # 전체 행을 가져온다. is_regressed 가 kind/key/recheck_at 을 쓰므로 일부 열만
+    # 고르면 sqlite3.Row 가 IndexError 를 낸다 — 훅이 fail-open 이라 조용히 죽었다.
+    p = con.execute("SELECT * FROM promotion WHERE key=?",
                     ("tool_fail:%s" % target,)).fetchone()
     if p and p["decision"] == "declined":
         lines.append("이 항목은 승격을 보류한 적이 있다: %s — 또 걸린다면 그 판단이 "
@@ -1176,10 +1283,7 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
     # 승격 임계에 닿으면 사용자에게도 보인다 — 모델이 같은 벽을 반복하는 것은
     # 사용자가 알아야 할 사실이다. 단 이미 결정된 항목에는 결정을 요구한다고
     # 말하지 않는다 — 결정이 있는데 또 요구하면 메시지가 거짓이 된다.
-    try:
-        thr = int(promo_cfg(cfg).get("min_loops", 3))
-    except (TypeError, ValueError):
-        thr = 3
+    thr = cfg.num("promotion.min_loops", 3, low=2)
     undecided = p is None or is_regressed(con, cfg, p)
     if loops >= thr and undecided:
         out["systemMessage"] = ("harness: '%s' 실패가 작업 %d개에서 반복된다 — "
@@ -1191,7 +1295,8 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
     emit(out)
 
 
-def hook_stop(inp, con, cfg, root, lid, sid):
+def hook_stop(inp, ctx):
+    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
     stage = stage_obj(cfg, sid)
     prompt_id = inp.get("prompt_id") or "-"
     msg = (inp.get("last_assistant_message") or "").strip()
@@ -1297,7 +1402,7 @@ def run_hook():
                             "VALUES(?,?,?)", (pid, sid, now()))
         fn = HOOKS.get(inp.get("hook_event_name"))
         if fn:
-            fn(inp, con, cfg, root, lid, sid)
+            fn(inp, Ctx(con, cfg, root, lid, sid))
     except Exception as exc:
         # 차단하지 않는다. exit 1 은 Claude Code 가 훅 오류로 표면화하므로,
         # 무력해지더라도 조용히 빠진다 — 세션을 벽돌로 만드는 것보다 낫다.
@@ -1319,7 +1424,7 @@ def plugin_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def arg_value(cmd, name):
+def raw_flag(cmd, name):
     """따옴표가 살아 있는 raw 명령 문자열에서 --name 값을 뽑는다 (훅 경로 전용)."""
     m = re.search(r"--%s(?:=|\s+)(\"([^\"]*)\"|'([^']*)'|([^\s]+))" % name, cmd)
     return (m.group(2) or m.group(3) or m.group(4)) if m else None
@@ -1405,62 +1510,94 @@ def refresh_wrapper(root):
                       WRAPPER % os.path.abspath(__file__), 0o755)
 
 
-def cli_status(con, cfg, root, lid, sid, argv):
-    print("작업 %s · 회차 %d · 단계 %s"
-          % (lid, cycle_of(con, lid), label_of(cfg, sid)))
+def status_report(ctx):
+    """현재 상태. 출력하지 않는다 — 테스트가 값을 검사할 수 있어야 한다."""
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
-    if row and row["intent"]:
-        print("  작업 내용: %s" % row["intent"])
+    rows = stage_rows(con, lid)
+    stage = stage_obj(cfg, sid)
+    missing = exit_blockers(con, cfg, lid, sid)
+    crit = stage.get("exit_criteria") or []
+    return {
+        "loop": lid,
+        "cycle": cycle_of(con, lid),
+        "stage": sid,
+        "stage_label": label_of(cfg, sid),
+        "summary": stage["summary"],
+        "intent": (row["intent"] if row else None) or None,
+        "acceptance": acceptance_of(con, lid),
+        "write": list(stage.get("write", [])),
+        "prefix": file_prefix(con, lid),
+        "stages": [{"id": s["id"], "label": s["label"],
+                    "status": rows[s["id"]]["status"] if s["id"] in rows else "?"}
+                   for s in cfg["stages"]],
+        "exit_met": [k for k in crit if k not in missing],
+        "exit_missing": missing,
+        "evidence": {r["kind"]: r["c"] for r in con.execute(
+            "SELECT kind, COUNT(*) c FROM evidence WHERE loop_id=? GROUP BY kind",
+            (lid,))},
+        "skips": [dict(r) for r in skips_of(con, lid)],
+        "grants": [{"glob": g["glob"], "uses_left": g["uses_left"],
+                    "reason": g["reason"]} for g in con.execute(
+            "SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0", (lid,))],
+        "auto_skip": (auto_skip_scope_note(con) if auto_skip_on(con) else None),
+        "auto_skip_reason": get_meta(con, "auto_skip_reason", "-"),
+        "pending_promotions": [it["key"] for it in pending_promotions(con, cfg)],
+        "promoted": promotion_summary(con, cfg),
+        "tidy": tidy_headline(con, cfg, root),
+    }
+
+
+def render_status(d, cfg):
+    print("작업 %s · 회차 %d · 단계 %s" % (d["loop"], d["cycle"], d["stage_label"]))
+    if d["intent"]:
+        print("  작업 내용: %s" % d["intent"])
     else:
         print("  작업 내용: (미정) — %s 단계에서 정하고 "
               "`harness loop intent \"...\"` 로 기록하라"
               % stage_obj(cfg, cfg["stages"][0]["id"])["label"])
-    acc = acceptance_of(con, lid)
-    if acc:
-        print("  완료 조건 (%d개):" % len(acc))
-        for i, t in enumerate(acc, 1):
+    if d["acceptance"]:
+        print("  완료 조건 (%d개):" % len(d["acceptance"]))
+        for i, t in enumerate(d["acceptance"], 1):
             print("    %d. %s" % (i, t))
     else:
         print("  완료 조건: (미정) — `harness loop done-when \"<조건>\" ...` 으로 기록하라")
-    print("  요약: %s" % stage_obj(cfg, sid)["summary"])
-    print("  쓰기 허용: %s" % (", ".join(stage_obj(cfg, sid).get("write", [])) or "(없음)"))
-    print("  .dev/ 산출물 파일명 접두사: %s" % file_prefix(con, lid))
-    rows = stage_rows(con, lid)
-    print("  단계: " + " → ".join(
-        "%s(%s)" % (s["label"], rows[s["id"]]["status"] if s["id"] in rows else "?")
-        for s in cfg["stages"]))
-    crit = stage_obj(cfg, sid).get("exit_criteria")
-    if crit:
-        missing = exit_blockers(con, cfg, lid, sid)
-        done = [k for k in crit if k not in missing]
+    print("  요약: %s" % d["summary"])
+    print("  쓰기 허용: %s" % (", ".join(d["write"]) or "(없음)"))
+    print("  .dev/ 산출물 파일명 접두사: %s" % d["prefix"])
+    print("  단계: " + " → ".join("%s(%s)" % (s["label"], s["status"])
+                                  for s in d["stages"]))
+    if d["exit_met"] or d["exit_missing"]:
         print("  종료 조건: 충족 %s / 미충족 %s"
-              % (", ".join(done) or "-", ", ".join(missing) or "-"))
-    ev = con.execute("SELECT kind, COUNT(*) c FROM evidence WHERE loop_id=? "
-                     "GROUP BY kind", (lid,)).fetchall()
-    if ev:
-        print("  증거: %s" % ", ".join("%s×%d" % (r["kind"], r["c"]) for r in ev))
-    for r in skips_of(con, lid):
+              % (", ".join(d["exit_met"]) or "-", ", ".join(d["exit_missing"]) or "-"))
+    if d["evidence"]:
+        print("  증거: %s" % ", ".join("%s×%d" % kv for kv in d["evidence"].items()))
+    for r in d["skips"]:
         print("  스킵: %s — %s (승인: %s)" % (r["stage"], r["reason"], r["authorized_by"]))
-    for g in con.execute("SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0", (lid,)):
+    for g in d["grants"]:
         print("  예외: %s (남은 %d회) — %s" % (g["glob"], g["uses_left"], g["reason"]))
-    if auto_skip_on(con):
+    if d["auto_skip"]:
         print("  ⚠ 스킵 자동 승인 ON (%s) — 사유: %s. 끄려면 `harness auto-skip off`"
-              % (auto_skip_scope_note(con), get_meta(con, "auto_skip_reason", "-")))
-    pend = pending_promotions(con, cfg)
-    if pend:
+              % (d["auto_skip"], d["auto_skip_reason"]))
+    if d["pending_promotions"]:
         print("  승격 결정 대기 %d개 (Compounding 의 종료 조건): %s"
-              % (len(pend), ", ".join(it["key"] for it in pend)))
-    mat = promotion_summary(con, cfg)
-    if mat:
-        print("  승격됨: %s" % ", ".join("%s %d" % (k, v) for k, v in sorted(mat.items())))
-    head = tidy_headline(con, cfg, root)
-    if head:
-        print("  %s" % head)
+              % (len(d["pending_promotions"]), ", ".join(d["pending_promotions"])))
+    if d["promoted"]:
+        print("  승격됨: %s"
+              % ", ".join("%s %d" % kv for kv in sorted(d["promoted"].items())))
+    if d["tidy"]:
+        print("  %s" % d["tidy"])
+
+
+def cli_status(ctx, argv):
+    data = status_report(ctx)
+    dump_json(data) if "--json" in argv else render_status(data, ctx.cfg)
     return 0
 
 
-def _enter(con, cfg, root, lid, dest_idx):
+def _enter(ctx, dest_idx):
     """dest_idx 단계를 active 로. 범위를 넘으면 루프를 닫고 새 루프를 만든다."""
+    con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
     if dest_idx >= len(cfg["stages"]):
         close_loop(con, lid)
         return create_loop(con, cfg, root), cfg["stages"][0]["id"], True
@@ -1470,7 +1607,7 @@ def _enter(con, cfg, root, lid, dest_idx):
     return lid, sid, False
 
 
-def _hint_on_enter(con, cfg, root, lid, sid):
+def _hint_on_enter(ctx, lid, sid):
     """단계 진입 시의 안내.
 
     Context 는 **당겨가는** 단계다. 과거 기록을 밀어넣지 않는다 — 이번 task 와
@@ -1478,6 +1615,7 @@ def _hint_on_enter(con, cfg, root, lid, sid):
     관련 있는지는 모델이 판단한다.
     Compounding 은 반대다. 막 끝낸 루프 자신의 기록은 무조건 관련 있으니 밀어준다.
     """
+    con, cfg, root = ctx.con, ctx.cfg, ctx.root
     hint = stage_obj(cfg, sid).get("hint")
     if hint:
         print("\n%s" % hint)
@@ -1535,13 +1673,14 @@ def _hint_on_enter(con, cfg, root, lid, sid):
               "승격하지 않기로 하는 것도 결정이다.")
 
 
-def next_cycle(con, cfg, root, lid):
+def next_cycle(ctx):
     """같은 작업의 다음 회차. Selection 은 유지하고 나머지 단계를 초기화한다.
 
     증거를 초기화하지 않으면 2회차 Planning 이 1회차 계획서로 통과한다.
     intent_set 만 남긴다 — 작업은 그대로이므로 다시 선정할 필요가 없다.
     이전 회차의 계획·회고 파일은 파일로 남고, 파일명의 회차로 구분된다.
     """
+    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
     ids = stage_ids(cfg)
     # 작업 정의(무엇을·무엇이 끝인지)는 회차를 넘어 유지한다. 회차마다 다시 선언하게
     # 하면 긴 작업에서 기준이 표류한다 — 그게 완료 조건을 두는 이유와 정면으로 어긋난다.
@@ -1557,7 +1696,8 @@ def next_cycle(con, cfg, root, lid):
     return ids[1]
 
 
-def cli_advance(con, cfg, root, lid, sid, argv):
+def cli_advance(ctx, argv):
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     last = cfg["stages"][-1]["id"]
     want_done = "--done" in argv
     want_cycle = "--cycle" in argv
@@ -1604,9 +1744,9 @@ def cli_advance(con, cfg, root, lid, sid, argv):
             nsid = cfg["stages"][0]["id"]
             done_task = True
         elif sid == last:
-            nlid, nsid, done_task = lid, next_cycle(con, cfg, root, lid), False
+            nlid, nsid, done_task = lid, next_cycle(ctx), False
         else:
-            nlid, nsid, _ = _enter(con, cfg, root, lid, stage_index(cfg, sid) + 1)
+            nlid, nsid, _ = _enter(ctx, stage_index(cfg, sid) + 1)
             done_task = False
 
     if snap:
@@ -1624,12 +1764,13 @@ def cli_advance(con, cfg, root, lid, sid, argv):
             print("   파일명 접두사: %s" % file_prefix(con, nlid))
         print("→ 단계 %s" % label_of(cfg, nsid))
         print("   %s" % stage_obj(cfg, nsid)["summary"])
-    _hint_on_enter(con, cfg, root, nlid, nsid)
+    _hint_on_enter(ctx, nlid, nsid)
     return 0
 
 
-def cli_skip(con, cfg, root, lid, sid, argv):
+def cli_skip(ctx, argv):
     """PreToolUse 가 사람의 승인을 받은 뒤에만 여기까지 온다."""
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     pos = argv_positional(argv)
     target = pos[0] if pos else None
     reason = argv_value(argv, "reason")
@@ -1705,7 +1846,7 @@ def cli_skip(con, cfg, root, lid, sid, argv):
             record_event(con, lid, s, "skip", s, by, reason)
         if by == "auto":
             left = consume_auto_skip(con)
-        nlid, nsid, cycled = _enter(con, cfg, root, lid, dest + 1)
+        nlid, nsid, cycled = _enter(ctx, dest + 1)
     print("스킵(%s): %s" % ("자동 승인" if by == "auto" else "사용자 승인",
                             ", ".join(skipped) or "(없음)"))
     print("사유: %s" % reason)
@@ -1715,11 +1856,12 @@ def cli_skip(con, cfg, root, lid, sid, argv):
         print("작업 %s 종료 → 새 작업 %s, 단계 %s" % (lid, nlid, label_of(cfg, nsid)))
     else:
         print("→ 단계 %s" % label_of(cfg, nsid))
-        _hint_on_enter(con, cfg, root, nlid, nsid)
+        _hint_on_enter(ctx, nlid, nsid)
     return 0
 
 
-def cli_allow(con, cfg, root, lid, sid, argv):
+def cli_allow(ctx, argv):
+    con, lid = ctx.con, ctx.lid
     pos = argv_positional(argv)
     glob = pos[0] if pos else None
     reason = argv_value(argv, "reason")
@@ -1735,7 +1877,8 @@ def cli_allow(con, cfg, root, lid, sid, argv):
     return 0
 
 
-def cli_approve_plan(con, cfg, root, lid, sid, argv):
+def cli_approve_plan(ctx, argv):
+    con, root, lid, sid = ctx.con, ctx.root, ctx.lid, ctx.sid
     pos = argv_positional(argv)
     path = pos[0] if pos else None
     if not path:
@@ -1820,23 +1963,15 @@ def _recall_files(root, keywords, limit=6):
     return indexes, hits[:max(0, limit - len(indexes))]
 
 
-def tidy_cfg(cfg):
-    return cfg.get("tidy") or {}
-
-
 def tidy_report(con, cfg, root):
     """정리 후보. 판정은 전부 파일시스템 사실이고 LLM 이 끼지 않는다.
 
     "정리하라"는 권고는 아무 일도 만들지 않았다. 무엇을 정리할지의 목록이라야
     행동이 된다. 삭제·병합 자체는 여전히 자율이다 — 후보만 제시한다.
     """
-    tc = tidy_cfg(cfg)
-    try:
-        thr = max(1, int(tc.get("dir_file_threshold", 12)))
-        age_days = max(1, int(tc.get("age_days", 30)))
-        group_min = max(2, int(tc.get("merge_group", 3)))
-    except (TypeError, ValueError):
-        thr, age_days, group_min = 12, 30, 3
+    thr = cfg.num("tidy.dir_file_threshold", 12, low=1)
+    age_days = cfg.num("tidy.age_days", 30, low=1)
+    group_min = cfg.num("tidy.merge_group", 3, low=2)
     cutoff = time.time() - age_days * 86400
     open_loops = {r["id"] for r in
                   con.execute("SELECT id FROM loop WHERE closed_at IS NULL")}
@@ -1924,12 +2059,17 @@ def tidy_headline(con, cfg, root):
     return "정리 후보: %s — `harness tidy` 로 목록을 본다" % ", ".join(bits)
 
 
-def cli_tidy(con, cfg, root, lid, sid, argv):
+def cli_tidy(ctx, argv):
     """줄이는 것도 일이다. 쌓이면 복잡해지는 시스템은 복리가 아니다."""
+    con, cfg, root = ctx.con, ctx.cfg, ctx.root
     with con:
         sync_promotions(con, cfg)
     refresh_learned(con, cfg, root)
     rep = tidy_report(con, cfg, root)
+    if "--json" in argv:
+        dump_json({k: ([dict(r) for r in v] if k == "regressed" else v)
+                   for k, v in rep.items()})
+        return 0
     limit = 12
 
     print("정리 후보 (Scaffolding 단계의 일이다. 삭제·병합 여부는 자율)")
@@ -2021,89 +2161,135 @@ def _bucket(rows, n=3):
     return out
 
 
-def cli_metrics(con, cfg, root, lid, sid, argv):
-    """복리 측정. 점수를 만들지 않는다 — 합치면 그 하나를 최적화하게 된다."""
+TREND_KEYS = (("blocks", "차단"), ("refails", "반복실패"), ("churn", "재편집"),
+              ("bypass", "우회"), ("skips", "스킵"), ("declines", "보류"))
+
+
+def trend_verdict(avgs):
+    """Goodhart 가드. 차단은 아무것도 시도하지 않거나 우회해도 줄어든다.
+
+    그래서 마찰과 회피를 **함께** 판정한다. 둘을 한 점수로 합치면 이 구분이
+    사라지고, 회피가 개선으로 보인다.
+    """
+    if len(avgs) < 2:
+        return None
+    first, last = avgs[0], avgs[-1]
+    friction = last["blocks"] + last["refails"] < first["blocks"] + first["refails"]
+    evasion = (last["bypass"] + last["skips"] + last["declines"]
+               > first["bypass"] + first["skips"] + first["declines"])
+    if friction and evasion:
+        return "evasion"
+    if friction:
+        return "improving"
+    if evasion:
+        return "mismatch"
+    return "flat"
+
+
+VERDICT_TEXT = {
+    "evasion": "⚠ 마찰이 줄었지만 우회·스킵·보류가 늘었다 — 개선이 아니라 회피일 수 "
+               "있다. 게이트가 연극이 되고 있는지 보라.",
+    "improving": "✓ 마찰이 줄고 우회는 늘지 않았다 — 개선 신호다 "
+                 "(작업 난이도 차이는 통제하지 못한다).",
+    "mismatch": "⚠ 우회가 늘었는데 마찰은 줄지 않았다 — 규칙이 맞지 않는지 보라.",
+}
+
+
+def metrics_report(ctx):
+    """복리 측정 데이터. 출력하지 않는다."""
+    con, cfg = ctx.con, ctx.cfg
     with con:
         sync_promotions(con, cfg)
     lc = con.execute("SELECT COUNT(*) c, MIN(created_at) a, MAX(created_at) b "
                      "FROM loop").fetchone()
     cyc = _cycle_rows(con)
+    buckets, avgs = [], []
+    for lo, hi, rows in _bucket(cyc):
+        avg = {k: sum(r.get(k, 0) for r in rows) / float(len(rows))
+               for k, _ in TREND_KEYS}
+        avgs.append(avg)
+        buckets.append({
+            "from": lo, "to": hi, "avg": avg,
+            "fails": sum(r.get("fails", 0) for r in rows),
+            "refails": sum(r.get("refails", 0) for r in rows),
+        })
+    return {
+        "loops": lc["c"],
+        "cycles": len(cyc),
+        "span": [(lc["a"] or "")[:10], (lc["b"] or "")[:10]] if lc["a"] else None,
+        "survival": _survival(con, cfg),
+        "buckets": buckets,
+        "verdict": trend_verdict(avgs),
+    }
+
+
+NO_CYCLES = "  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done` 때 쌓인다)"
+
+
+def render_metrics(d):
     print("복리 측정 — 작업 %d개, 기록된 회차 %d개%s"
-          % (lc["c"], len(cyc),
-             " (%s ~ %s)" % ((lc["a"] or "")[:10], (lc["b"] or "")[:10])
-             if lc["a"] else ""))
+          % (d["loops"], d["cycles"],
+             " (%s ~ %s)" % tuple(d["span"]) if d["span"] else ""))
 
     print("\n① 승격 생존율 — 무엇이 실제로 막았나")
-    agg = _survival(con, cfg)
+    agg = d["survival"]
     if not agg:
         print("  (아직 승격이 없다. 여러 작업에서 반복된 항목이 생기면 쌓인다)")
     else:
         for k in sorted(agg, key=lambda x: -agg[x]["n"]):
-            d = agg[k]
-            vs = ("변경관측 %d/%d" % (d["vy"], d["vn"])) if d["vn"] else ""
+            v = agg[k]
+            seen = ("변경관측 %d/%d" % (v["vy"], v["vn"])) if v["vn"] else ""
             print("  %-10s %2d건 중 %2d건 재발 (%s)  %s"
-                  % (k, d["n"], d["re"], _pct(d["re"], d["n"]).strip(), vs))
-        small = sum(d["n"] for d in agg.values())
-        if small < 20:
-            print("  ⚠ 표본 %d건. 비율을 믿지 마라 — 20~30건은 있어야 한다." % small)
+                  % (k, v["n"], v["re"], _pct(v["re"], v["n"]).strip(), seen))
+        total = sum(v["n"] for v in agg.values())
+        if total < 20:
+            print("  ⚠ 표본 %d건. 비율을 믿지 마라 — 20~30건은 있어야 한다." % total)
         print("  재발 = 승격 이후 같은 항목이 다시 걸린 것. 변경관측 = 그 회차에 "
               "주장에 맞는 파일 변경이 있었나.")
 
     print("\n② 회차 추세 — 마찰과 회피를 나란히 본다")
-    if not cyc:
-        print("  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done` 때 쌓인다)")
+    if not d["buckets"]:
+        print(NO_CYCLES)
     else:
-        keys = [("blocks", "차단"), ("refails", "반복실패"), ("churn", "재편집"),
-                ("bypass", "우회"), ("skips", "스킵"), ("declines", "보류")]
-        print("  %-12s %s" % ("회차구간", " ".join("%8s" % t for _, t in keys)))
-        buckets = _bucket(cyc)
-        avgs = []
-        for lo, hi, rows in buckets:
-            a = {k: sum(r.get(k, 0) for r in rows) / float(len(rows)) for k, _ in keys}
-            avgs.append(a)
-            print("  %-12s %s" % ("%d-%d회" % (lo, hi),
-                                  " ".join("%8.1f" % a[k] for k, _ in keys)))
-        if len(avgs) >= 2:
-            first, last = avgs[0], avgs[-1]
-            friction = last["blocks"] + last["refails"] < first["blocks"] + first["refails"]
-            evasion = (last["bypass"] + last["skips"] + last["declines"]
-                       > first["bypass"] + first["skips"] + first["declines"])
-            # Goodhart 가드. 차단은 아무것도 시도하지 않거나 우회해도 줄어든다.
-            if friction and evasion:
-                print("  ⚠ 마찰이 줄었지만 우회·스킵·보류가 늘었다 — 개선이 아니라 "
-                      "회피일 수 있다. 게이트가 연극이 되고 있는지 보라.")
-            elif friction:
-                print("  ✓ 마찰이 줄고 우회는 늘지 않았다 — 개선 신호다 "
-                      "(작업 난이도 차이는 통제하지 못한다).")
-            elif evasion:
-                print("  ⚠ 우회가 늘었는데 마찰은 줄지 않았다 — 규칙이 맞지 않는지 보라.")
+        print("  %-12s %s" % ("회차구간", " ".join("%8s" % t for _, t in TREND_KEYS)))
+        for b in d["buckets"]:
+            print("  %-12s %s" % ("%d-%d회" % (b["from"], b["to"]),
+                                  " ".join("%8.1f" % b["avg"][k] for k, _ in TREND_KEYS)))
+        if d["verdict"] in VERDICT_TEXT:
+            print("  " + VERDICT_TEXT[d["verdict"]])
 
     print("\n③ 반복 실패 비율 — 실패 주입이 겨냥한 것")
     # 누적 비율(전체 실패 중 첫 실패가 아닌 것)은 쓰지 않는다. 명령 종류는 적고
     # 실행은 많으니 시간이 지나면 무조건 100% 에 수렴한다 — 창이 없는 비율은
     # 아무것도 말해주지 않는다. 회차 구간별로만 읽는다.
-    if not cyc:
-        print("  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done` 때 쌓인다)")
+    if not d["buckets"]:
+        print(NO_CYCLES)
     else:
-        for lo, hi, rows in _bucket(cyc):
-            tf = sum(r.get("fails", 0) for r in rows)
-            tr = sum(r.get("refails", 0) for r in rows)
+        for b in d["buckets"]:
             print("  %-12s 실패 %3d건 중 이전에도 실패한 것 %3d건 (%s)"
-                  % ("%d-%d회" % (lo, hi), tf, tr, _pct(tr, tf).strip()))
+                  % ("%d-%d회" % (b["from"], b["to"]), b["fails"], b["refails"],
+                     _pct(b["refails"], b["fails"]).strip()))
         print("  '이전에도 실패한 것' = 그 회차 시작 전에 이미 같은 명령이 실패한 적 있음.")
 
     print("\n측정하지 못하는 것: 결과물의 품질, 그 회차가 필요했는지, 사람이 아낀 시간.")
     print("점수를 만들지 않는 이유: 하나로 합치면 그 하나를 최적화하게 된다.")
+
+
+def cli_metrics(ctx, argv):
+    """복리 측정. 점수를 만들지 않는다 — 합치면 그 하나를 최적화하게 된다."""
+    data = metrics_report(ctx)
+    dump_json(data) if "--json" in argv else render_metrics(data)
     return 0
 
 
-def cli_promote(con, cfg, root, lid, sid, argv):
+def cli_promote(ctx, argv):
     """반복된 항목을 승격하거나, 승격하지 않기로 결정한다.
 
     승인 다이얼로그를 띄우지 않는다 — 이건 게이트 우회가 아니라 기록이기 때문이다.
     대신 결정은 전부 event 에 남아 `stats` 에 드러나고, 승격 후에도 같은 항목이
     다시 걸리면 결정이 무효화되어 다시 올라온다. 무성의한 보류는 되돌아온다.
     """
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     with con:
         changed = sync_promotions(con, cfg)
     # 목록만 보는 경로에서도 갱신한다. 성숙도를 바꿨는데 파일을 그대로 두면
@@ -2126,30 +2312,8 @@ def cli_promote(con, cfg, root, lid, sid, argv):
     note = argv_value(argv, "note") or argv_value(argv, "reason")
 
     if not pos:
-        pend = pending_promotions(con, cfg)
-        print("승격 결정이 필요한 항목 (%d개)" % len(pend))
-        if not pend:
-            print("  (없음 — 여러 작업에서 반복된 항목이 아직 없다)")
-        for it in pend:
-            mark = ""
-            if it.get("regressed"):
-                mark = "  ← %s 로 승격했는데 다시 걸렸다" % it["regressed"]
-            print("  %-34s ×%d, 작업 %d개%s"
-                  % (it["key"][:34], it["count"], it["loops"], mark))
-        if pend:
-            print("\n결정 방법 (하나 고른다):")
-            for k, desc in PROMOTE_AS.items():
-                flag = "--decline --reason \"...\"" if k == "declined" \
-                    else "--as %s --note \"...\"" % k
-                print("  harness promote <key> %-32s %s" % (flag, desc))
-        done = con.execute("SELECT key, decision, maturity, note FROM promotion "
-                           "ORDER BY at DESC LIMIT 8").fetchall()
-        if done:
-            print("\n이미 결정된 항목")
-            for r in done:
-                print("  %-30s %-10s %-12s %s"
-                      % (r["key"][:30], r["decision"], r["maturity"],
-                         (r["note"] or "-")[:40]))
+        data = promote_report(ctx)
+        dump_json(data) if "--json" in argv else render_promote(data)
         return 0
 
     key = pos[0]
@@ -2224,17 +2388,18 @@ def cli_promote(con, cfg, root, lid, sid, argv):
     if as_kind == "declined":
         print("  보류도 결정이다. 이 항목이 앞으로 %s개 작업에서 다시 걸리면 "
               "결정이 무효화되어 다시 올라온다."
-              % promo_cfg(cfg).get("reopen_after_loops", 2))
+              % cfg.num("promotion.reopen_after_loops", 2, low=1))
     else:
         print("  성숙도 established. 재발 없이 작업 %s개가 지나면 proven 이 된다."
-              % promo_cfg(cfg).get("proven_after_loops", 3))
+              % cfg.num("promotion.proven_after_loops", 3, low=1))
     left = pending_promotions(con, cfg)
     print("남은 결정: %d개" % len(left))
     return 0
 
 
-def cli_recall(con, cfg, root, lid, sid, argv):
+def cli_recall(ctx, argv):
     """과거 관측 기록과 회고 파일을 조회한다 (pull). 무엇이 관련 있는지는 호출자가 판단한다."""
+    con, root, lid = ctx.con, ctx.root, ctx.lid
     keywords = argv_positional(argv)
     kind = argv_value(argv, "kind")
     rule = argv_value(argv, "rule")
@@ -2319,8 +2484,9 @@ def cli_recall(con, cfg, root, lid, sid, argv):
     return 0
 
 
-def cli_stats(con, cfg, root, lid, sid, argv):
+def cli_stats(ctx, argv):
     """누적 수치. --loop 를 주면 현재 작업만."""
+    con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
     only = "--loop" in argv
     cond, params = ("WHERE loop_id = ?", [lid]) if only else ("", [])
     print("범위: %s" % ("현재 작업 %s" % lid if only else "전체 누적"))
@@ -2375,8 +2541,9 @@ def cli_stats(con, cfg, root, lid, sid, argv):
     return 0
 
 
-def cli_auto_skip(con, cfg, root, lid, sid, argv):
+def cli_auto_skip(ctx, argv):
     """스킵 자동 승인 토글. on 은 PreToolUse 가 사람의 동의를 받은 뒤에만 도달한다."""
+    con, lid = ctx.con, ctx.lid
     pos = argv_positional(argv)
     mode = pos[0] if pos else "status"
     if mode == "off":
@@ -2435,7 +2602,8 @@ def cli_auto_skip(con, cfg, root, lid, sid, argv):
     return 2
 
 
-def cli_loop(con, cfg, root, lid, sid, argv):
+def cli_loop(ctx, argv):
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     pos = argv_positional(argv)
     sub = pos[0] if pos else "show"
     if sub == "new":
@@ -2545,7 +2713,7 @@ def run_cli(argv):
                   % (cmd, ", ".join(sorted(CLI))), file=sys.stderr)
             return 2
         try:
-            return fn(con, cfg, root, lid, sid, argv[1:])
+            return fn(Ctx(con, cfg, root, lid, sid), argv[1:])
         except sqlite3.OperationalError as exc:
             # 스키마가 플러그인보다 오래됐을 때 traceback 대신 할 일을 알려준다.
             # 마이그레이션은 하지 않는다 — DB 는 커밋하지 않는 런타임 상태이고,
@@ -2606,10 +2774,13 @@ def ensure_permissions(root):
     return len(added)
 
 
-def cli_init(argv):
-    root = os.path.abspath(argv[0] if argv else os.getcwd())
-    pr = plugin_root()
-    created = []
+# 설치는 여섯 가지 서로 다른 일이다. 한 함수에 154줄로 뭉쳐 있으면 하나가
+# 예외를 던졌을 때 어디까지 됐는지 알 수 없고(실제로 부분 설치 상태가 남았다),
+# 각각을 따로 테스트할 수도 없다. 단계마다 "무엇을 만들었나"를 돌려준다.
+
+def install_templates(root, pr):
+    """원칙·근거·설정 문서. **이미 있으면 덮어쓰지 않는다** — 사용자가 고친 것이다."""
+    made = []
     for rel, src in ((CONFIG_REL, "templates/stages.json"),
                      (POLICY_REL, "templates/POLICY.md"),
                      (RATIONALE_REL, "templates/rationale.md")):
@@ -2621,24 +2792,80 @@ def cli_init(argv):
             body = fh.read()
         with open(dst, "w", encoding="utf-8") as fh:
             fh.write(body)
-        created.append(rel)
+        made.append(rel)
+    return made
 
-    cfg = load_config(root, pr)
+
+def install_db(root, cfg):
+    """스키마를 적용하고 활성 작업을 보장한다. 업그레이드 경로가 이 함수다 —
+    `CREATE TABLE IF NOT EXISTS` 라서 재실행이 곧 스키마 갱신이다."""
+    made = []
     fresh = not os.path.isfile(os.path.join(root, DB_REL))
     con = connect(root, create=True)
-    con.executescript(SCHEMA)
-    con.commit()
-    lid = head_loop(con)
-    if not lid or not active_stage(con, lid):
-        with con:
-            lid = create_loop(con, cfg, root)
-        created.append("%s (loop %s)" % (DB_REL, lid))
-    elif fresh:
-        created.append(DB_REL)
-    # 앵커가 가리키는 파일이 없으면 CLAUDE.md 임포트가 깨진다. 빈 상태로라도 만든다.
-    if refresh_learned(con, cfg, root):
-        created.append(LEARNED_REL)
-    con.close()
+    try:
+        con.executescript(SCHEMA)
+        con.commit()
+        lid = head_loop(con)
+        if not lid or not active_stage(con, lid):
+            with con:
+                lid = create_loop(con, cfg, root)
+            made.append("%s (loop %s)" % (DB_REL, lid))
+        elif fresh:
+            made.append(DB_REL)
+        # 앵커가 가리키는 파일이 없으면 CLAUDE.md 임포트가 깨진다. 빈 상태로라도 만든다.
+        if refresh_learned(con, cfg, root):
+            made.append(LEARNED_REL)
+    finally:
+        con.close()
+    return made, lid
+
+
+def install_gitignore(root):
+    """런타임 상태를 커밋 대상에서 뺀다."""
+    gi = os.path.join(root, ".gitignore")
+    want = [".claude/harness/harness.db", ".claude/harness/harness.db-wal",
+            ".claude/harness/harness.db-shm", ".claude/harness/bin/"]
+    have = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
+    # 행 단위로 본다. substring 으로 보면 주석에 경로가 언급된 것만으로
+    # "이미 있다"고 판단해 실제 ignore 규칙을 넣지 않는다.
+    lines = {ln.strip() for ln in have.splitlines()}
+    add = [w for w in want if w not in lines]
+    if not add:
+        return []
+    with open(gi, "a", encoding="utf-8") as fh:
+        if have and not have.endswith("\n"):
+            fh.write("\n")
+        fh.write("\n# step-six-harness (런타임 상태 — 커밋하지 않는다)\n")
+        fh.write("\n".join(add) + "\n")
+    return [".gitignore"]
+
+
+def install_anchors(root):
+    """CLAUDE.md 에 앵커 두 줄. POLICY 는 사람이 정한 원칙, LEARNED 는 하네스가
+    승격한 규칙 — 한 파일에 섞으면 생성 대상과 손으로 쓴 것이 구분되지 않는다."""
+    cm = os.path.join(root, "CLAUDE.md")
+    body = open(cm, encoding="utf-8").read() if os.path.isfile(cm) else ""
+    # 행 단위로 본다. 코드 예시나 설명문에 앵커 문자열이 있으면 substring 판정은
+    # 실제 import 행이 없는데도 있다고 착각한다.
+    lines = {ln.strip() for ln in body.splitlines()}
+    add = [a for a in ("@%s" % POLICY_REL.replace(os.sep, "/"),
+                       "@%s" % LEARNED_REL.replace(os.sep, "/"))
+           if a not in lines]
+    if not add:
+        return []
+    with open(cm, "a", encoding="utf-8") as fh:
+        if body and not body.endswith("\n"):
+            fh.write("\n")
+        fh.write("\n" + "\n".join(add) + "\n")
+    return ["CLAUDE.md (앵커 %d줄)" % len(add)]
+
+
+def cli_init(argv):
+    root = os.path.abspath(argv[0] if argv else os.getcwd())
+    pr = plugin_root()
+    created = install_templates(root, pr)
+    db_made, lid = install_db(root, load_config(root, pr))
+    created += db_made
     refresh_wrapper(root)
 
     nperm = ensure_permissions(root)
@@ -2648,39 +2875,55 @@ def cli_init(argv):
         print("주의: .claude/settings.json 을 읽을 수 없어 권한 허용을 건너뛰었다.",
               file=sys.stderr)
 
-    gi = os.path.join(root, ".gitignore")
-    want = [".claude/harness/harness.db", ".claude/harness/harness.db-wal",
-            ".claude/harness/harness.db-shm", ".claude/harness/bin/"]
-    have = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
-    # 행 단위로 본다. substring 으로 보면 주석에 경로가 언급된 것만으로
-    # "이미 있다"고 판단해 실제 ignore 규칙을 넣지 않는다.
-    have_lines = {ln.strip() for ln in have.splitlines()}
-    add = [w for w in want if w not in have_lines]
-    if add:
-        with open(gi, "a", encoding="utf-8") as fh:
-            if have and not have.endswith("\n"):
-                fh.write("\n")
-            fh.write("\n# step-six-harness (런타임 상태 — 커밋하지 않는다)\n")
-            fh.write("\n".join(add) + "\n")
-        created.append(".gitignore")
+    created += install_gitignore(root)
+    created += install_anchors(root)
+    render_init(root, created, lid)
+    return 0
 
-    # 앵커는 두 줄이다. POLICY 는 사람이 정한 원칙, LEARNED 는 하네스가 승격한 규칙.
-    # 둘을 한 파일에 섞으면 생성 대상과 손으로 쓴 것이 구분되지 않는다.
-    cm = os.path.join(root, "CLAUDE.md")
-    body = open(cm, encoding="utf-8").read() if os.path.isfile(cm) else ""
-    # 행 단위로 본다. 코드 예시나 설명문에 앵커 문자열이 있으면 substring 판정은
-    # 실제 import 행이 없는데도 있다고 착각한다.
-    body_lines = {ln.strip() for ln in body.splitlines()}
-    add_anchors = [a for a in ("@%s" % POLICY_REL.replace(os.sep, "/"),
-                               "@%s" % LEARNED_REL.replace(os.sep, "/"))
-                   if a not in body_lines]
-    if add_anchors:
-        with open(cm, "a", encoding="utf-8") as fh:
-            if body and not body.endswith("\n"):
-                fh.write("\n")
-            fh.write("\n" + "\n".join(add_anchors) + "\n")
-        created.append("CLAUDE.md (앵커 %d줄)" % len(add_anchors))
 
+# ----------------------------------------------------------------------- render
+#
+# 계산과 출력을 가른다. 섞여 있을 때는 테스트가 stdout 을 grep 할 수밖에 없었고,
+# 그래서 내가 `'^[^g]*$'` 처럼 **실패할 수 없는** 정규식을 썼다 — LEARNED.md
+# 표류가 초록 상태로 출하된 직접 원인이다. 보고 명령은 `--json` 으로 구조를
+# 그대로 내보내므로, 테스트가 산문이 아니라 값을 검사할 수 있다.
+
+def promote_report(ctx):
+    """승격 결정 현황. 계산만 한다."""
+    return {
+        "pending": pending_promotions(ctx.con, ctx.cfg),
+        "options": [{"as": k, "why": v} for k, v in PROMOTE_AS.items()],
+        "decided": [dict(r) for r in ctx.con.execute(
+            "SELECT key, decision, maturity, note FROM promotion "
+            "ORDER BY at DESC LIMIT 8")],
+    }
+
+
+def render_promote(d):
+    pend = d["pending"]
+    print("승격 결정이 필요한 항목 (%d개)" % len(pend))
+    if not pend:
+        print("  (없음 — 여러 작업에서 반복된 항목이 아직 없다)")
+    for it in pend:
+        mark = ("  ← %s 로 승격했는데 다시 걸렸다" % it["regressed"]
+                if it.get("regressed") else "")
+        print("  %-34s ×%d, 작업 %d개%s"
+              % (it["key"][:34], it["count"], it["loops"], mark))
+    if pend:
+        print("\n결정 방법 (하나 고른다):")
+        for o in d["options"]:
+            flag = ("--decline --reason \"...\"" if o["as"] == "declined"
+                    else "--as %s --note \"...\"" % o["as"])
+            print("  harness promote <key> %-32s %s" % (flag, o["why"]))
+    if d["decided"]:
+        print("\n이미 결정된 항목")
+        for r in d["decided"]:
+            print("  %-30s %-10s %-12s %s"
+                  % (r["key"][:30], r["decision"], r["maturity"],
+                     (r["note"] or "-")[:40]))
+
+
+def render_init(root, created, lid):
     print("하네스 설치 완료: %s" % root)
     for c in created:
         print("  + %s" % c)
@@ -2689,7 +2932,10 @@ def cli_init(argv):
     print("활성 작업: %s" % lid)
     print("커밋 대상: .claude/harness/{POLICY.md,LEARNED.md,stages.json,rationale.md}, "
           "CLAUDE.md")
-    return 0
+
+
+def dump_json(data):
+    print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 USAGE = """step-six-harness — 작업 하네스
@@ -2701,6 +2947,9 @@ USAGE = """step-six-harness — 작업 하네스
 
 현재 상태
   status                       현재 작업·회차·단계·종료 조건·증거·스킵 기록·예외
+
+  보고 명령(status·metrics·tidy·promote)은 `--json` 으로 구조를 그대로 낸다.
+  산문 대신 값을 검사해야 할 때 쓴다.
   loop                         작업 해시와 브랜치 (.dev/ 파일명 접두사는 해시-회차)
 
 과거 기록 조회 (Context 단계에서 쓴다)

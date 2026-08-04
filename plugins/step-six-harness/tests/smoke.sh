@@ -29,6 +29,25 @@ check_empty() { # check_empty <label> <actual>
   fi
 }
 
+# JSON 경로의 값을 정확히 비교한다. 정규식이 아니므로 "무엇이든 통과"가 불가능하다.
+jq1() { python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for p in sys.argv[1].split('.'):
+    d = d[int(p)] if isinstance(d, list) else d[p]
+print(json.dumps(d, ensure_ascii=False, sort_keys=True))
+" "$1"; }
+
+jcheck() { # jcheck <label> <json-path> <expected-json> <json-text>
+  actual="$(printf '%s' "$4" | jq1 "$2" 2>/dev/null)"
+  if [ "$actual" = "$3" ]; then
+    PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %s\n     경로: %s\n     기대: %s\n     실제: %s\n' \
+      "$1" "$2" "$3" "$actual"
+  fi
+}
+
 sql() { python3 - "$WORK/.claude/harness/harness.db" "$1" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
@@ -714,6 +733,12 @@ MOUT="$(mcli advance --cycle)"
 check "회차 경계에서 집계를 보고한다" '회차 1 기록' "$MOUT"
 check "차단 수를 센다" '차단 2' "$MOUT"
 check "반복 실패를 따로 센다" '반복 1' "$MOUT"
+MSNAP="$(msql "SELECT detail FROM event WHERE kind='cycle_close'")"
+jcheck "스냅샷의 차단 수가 정확히 2" blocks 2 "$MSNAP"
+jcheck "스냅샷의 실패 수가 정확히 2" fails 2 "$MSNAP"
+jcheck "스냅샷의 반복 실패가 정확히 1" refails 1 "$MSNAP"
+jcheck "스냅샷의 재편집 최대가 정확히 3" churn 3 "$MSNAP"
+jcheck "우회는 0" bypass 0 "$MSNAP"
 check "cycle_close 이벤트가 남는다" '^1$' \
   "$(msql "SELECT COUNT(*) FROM event WHERE kind='cycle_close'")"
 check "집계가 JSON 으로 저장된다" 'churn' \
@@ -752,6 +777,7 @@ for i in range(12):
 con.commit()
 PYG
 check "마찰↓ 우회↑ 는 회피로 경고한다" '회피일 수 있다' "$(mcli metrics)"
+jcheck "판정 필드가 evasion" verdict '"evasion"' "$(mcli metrics --json)"
 python3 - "$MW/.claude/harness/harness.db" <<'PYG2'
 import json, sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
@@ -766,6 +792,7 @@ for i in range(12):
 con.commit()
 PYG2
 check "마찰↓ 우회→ 는 개선 신호로 읽는다" '개선 신호' "$(mcli metrics)"
+jcheck "판정 필드가 improving" verdict '"improving"' "$(mcli metrics --json)"
 check "그래도 난이도는 통제 못 한다고 적는다" '난이도 차이는 통제하지 못한다' "$(mcli metrics)"
 
 echo "== 승격 주장 대비 실제 변경 관측"
@@ -802,6 +829,52 @@ check "그 사실이 event 로 남는다" 'change_seen=no' \
 check "rule 승격은 검증 대상이 아니다" '^0$' \
   "$(msql "SELECT COUNT(*) FROM event WHERE kind='promote_verify' AND rule='rule'")"
 rm -rf "$MW"
+
+echo "== --json 은 산문이 아니라 값을 낸다"
+# 상태를 먼저 고정한다. 현재 상태에 기대를 맞추면 앞의 테스트가 바뀔 때마다 깨진다.
+setstage context
+SJ="$(cli status --json)"
+jcheck "현재 단계" stage '"context"' "$SJ"
+jcheck "단계 라벨" stage_label '"3/7 Context"' "$SJ"
+jcheck "Context 의 쓰기 허용 클래스" write '["context", "dev"]' "$SJ"
+jcheck "Context 는 종료 조건이 없다" exit_missing '[]' "$SJ"
+jcheck "단계 개수는 7" stages.6.id '"compounding"' "$SJ"
+setstage selection
+jcheck "Selection 은 종료 조건이 둘" exit_missing \
+  '["intent_set", "acceptance"]' "$(cli status --json)"
+check "접두사가 해시-회차 형태다" '^"[0-9]\{6\}-[0-9a-f]\{6\}-1-"$' \
+  "$(printf '%s' "$SJ" | jq1 prefix)"
+TJ="$(cli tidy --json)"
+jcheck "정리 후보 구조가 있다" dirs '[]' "$TJ"
+check "metrics --json 이 파싱된다" '^[0-9]' \
+  "$(printf '%s' "$(cli metrics --json)" | jq1 loops)"
+
+echo "== 결정된 항목에 대한 실패 주입 (부분 열 회귀)"
+# is_regressed 는 kind/key/recheck_at 을 쓴다. 일부 열만 SELECT 하면 sqlite3.Row 가
+# IndexError 를 내고, 훅이 fail-open 이라 조용히 죽는다 — 0.18.0 에 있던 버그다.
+RW="$(mktemp -d)"
+(cd "$RW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+python3 - "$RW/.claude/harness/harness.db" <<'PYR'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("INSERT INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+            ("tool_fail:cargo test", "tool_fail", "declined", "declined",
+             "환경 문제", "x", "2026-01-01T00:00:00+0900", "2026-01-01T00:00:00+0900"))
+for i, l in enumerate(("r1", "r2", "r3")):
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("2026-01-0%dT10:00:00+0900" % (i + 1), l, "execution",
+                 "tool_fail", "Bash", "cargo test", "err%d" % i))
+con.commit()
+PYR
+RJ="$(printf '{"hook_event_name":"PostToolUseFailure","cwd":"%s","tool_name":"Bash","tool_input":{"command":"cargo test"},"error":"again"}' "$RW" \
+      | CLAUDE_PROJECT_DIR="$RW" python3 "$ENGINE" hook 2>&1)"
+check "결정된 항목에도 주입이 동작한다" 'additionalContext' "$RJ"
+check "보류였음을 알려준다" '승격을 보류한 적이 있다' "$RJ"
+check "행 조회 오류가 나지 않는다" '^0$' \
+  "$(printf '%s' "$RJ" | grep -c 'No item with that key')"
+check "임계에 닿으면 사용자에게도 알린다" 'systemMessage' "$RJ"
+rm -rf "$RW"
 
 echo "== 손상 내성"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
