@@ -91,6 +91,8 @@ setstage scaffolding
 check "docs/ 쓰기 차단" '"permissionDecision": "deny"' "$(hook "$(W docs/spec/001-a.md)")"
 check_empty "Scaffolding 에서 신규 최상위 폴더 허용" "$(hook "$(W src/a.py)")"
 check ".dev 하위 폴더 규칙 위반 차단" '규칙 위반' "$(hook "$(W .dev/nope/a.md)")"
+check ".dev 깊은 경로도 폴더 규칙 적용" '규칙 위반' "$(hook "$(W .dev/nope/deep/a.md)")"
+check_empty ".dev 직속 누적 문서는 허용 (인덱스)" "$(hook "$(W .dev/INDEX.md)")"
 
 echo "== 루프 해시 파일명 강제"
 check "해시 접두사 없으면 차단" '회차>-. 로 시작' "$(hook "$(W .dev/plan/my-plan.md)")"

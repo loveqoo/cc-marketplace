@@ -381,14 +381,17 @@ def check_write(con, cfg, root, lid, sid, rel):
 
     parts = rel.split("/")
 
-    # 4. .dev 하위 폴더 규칙 + 루프 해시 파일명
-    if cls == "dev" and len(parts) >= 2:
+    # 4. .dev 하위 폴더 규칙 + 작업 해시 파일명
+    #    `.dev/` 직속 파일(예: .dev/INDEX.md)은 제약하지 않는다 — 누적 인덱스처럼
+    #    특정 회차에 속하지 않는 문서의 자리가 필요하다. 폴더명 제약은 유지한다.
+    if cls == "dev" and len(parts) >= 3:
         allowed = rules.get("dev_subdirs", [])
         if allowed and parts[1] not in allowed:
             return deny("dev_subdir",
-                        ".dev/ 하위는 %s 만 허용한다. '%s' 는 규칙 위반이다."
+                        ".dev/ 하위 폴더는 %s 만 허용한다. '%s' 는 규칙 위반이다. "
+                        "특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
                         % ("/".join(allowed), parts[1]))
-        if len(parts) >= 3 and parts[1] in rules.get("loop_prefixed_dirs", []):
+        if parts[1] in rules.get("loop_prefixed_dirs", []):
             pre = file_prefix(con, lid)
             if not parts[-1].startswith(pre):
                 return deny("loop_prefix", (
