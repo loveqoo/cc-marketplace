@@ -1217,6 +1217,13 @@ PYP
 )"
 check "_bucket n=0..40 라벨·분할·연속성" '실패: 없음' "$POUT"
 
+echo "== 문서 구조 (중복·링크)"
+DOUT="$(python3 "$(dirname "$0")/doc_check.py" "$MC" 2>&1)"; DRC=$?
+check "문서에 산문 중복·깨진 링크가 없다" '^0$' "$DRC"
+check "검사가 실제로 문서를 읽었다" '산문' "$DOUT"
+if [ "$DRC" != 0 ]; then printf '%s\n' "$DOUT" | tail -6 | sed 's/^/     /'; fi
+
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

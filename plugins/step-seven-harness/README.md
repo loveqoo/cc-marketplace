@@ -230,9 +230,10 @@ Claude에게 이렇게 말하면 됩니다.
 이 플러그인의 코드를 수정하실 때 쓰는 검사 셋입니다.
 
 ```bash
-sh tests/smoke.sh        # 375개, 매번 돌립니다
+sh tests/smoke.sh             # 매번 돌립니다 (문서 검사 포함)
 python3 tests/math_check.py   # 측정 산술을 손계산과 대조
-sh tests/init_diff.sh    # 설치 동작이 리팩터 전과 같은지 차등 실행
+python3 tests/doc_check.py    # 문서의 산문 중복·깨진 링크
+sh tests/init_diff.sh         # 설치 동작이 리팩터 전과 같은지 차등 실행
 ```
 
 `smoke.sh` 는 출력을 파일로 받아 **종료 코드를 확인하십시오.** 파이프로 넘기면 종료 상태가
@@ -254,10 +255,6 @@ sh tests/init_diff.sh    # 설치 동작이 리팩터 전과 같은지 차등 �
 경로이므로 회고·계획 파일, 상태 DB, `LEARNED.md`, 승격 이력이 전부 그대로 쓰입니다.
 
 </details>
-
----
-
-MIT · [loveqoo](https://github.com/loveqoo)
 
 ---
 
