@@ -100,7 +100,8 @@ EVENT_KINDS = {
     "edit": "파일 편집",
     "promote": "승격 결정",
     "promote_declined": "승격 보류",
-    "promote_regressed": "승격 후 재발",
+    "promote_verify": "승격 시 변경 관측",
+    "cycle_close": "회차 종료",
 }
 
 # 승격 결정의 종류. 'declined' 는 "안 한다 + 사유" — 결정이지 회피가 아니다.
@@ -126,11 +127,19 @@ def ts_epoch(s):
     오프셋 없는 값) DST 전환이 있으면 사전순과 실제 순서가 어긋난다. 예:
     `2026-11-01T01:45:00-0400` 보다 `2026-11-01T01:30:00-0500` 이 실제로는
     나중인데 문자열로는 작다 — 재발 판정이 조용히 뒤집힌다.
+
+    파싱에 실패하면 0.0 을 돌려주는데, 그건 "아주 오래됨"으로 취급되어 이벤트가
+    측정 창에서 조용히 빠진다. 그래서 하네스가 쓰지 않는 형식까지 받아둔다 —
+    공백 구분 형태는 SQLite `datetime()` 의 출력이고 그건 UTC 다.
     """
     if not s:
         return 0.0
     txt = str(s).strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    for fmt, utc in (("%Y-%m-%dT%H:%M:%S%z", False),
+                     ("%Y-%m-%d %H:%M:%S%z", False),
+                     ("%Y-%m-%dT%H:%M:%S", False),
+                     ("%Y-%m-%d %H:%M:%S", True),
+                     ("%Y-%m-%d", False)):
         try:
             tm = time.strptime(txt, fmt)
         except ValueError:
@@ -138,6 +147,8 @@ def ts_epoch(s):
         off = getattr(tm, "tm_gmtoff", None)
         if off is not None:
             return calendar.timegm(tm) - off
+        if utc:
+            return calendar.timegm(tm)
         try:
             return time.mktime(tm)  # 오프셋이 없으면 로컬 시각으로 읽는다
         except (OverflowError, ValueError):
@@ -481,6 +492,122 @@ def pending_promotions(con, cfg, limit=None):
         except (TypeError, ValueError):
             limit = 3
     return out[:limit]
+
+
+# ---------------------------------------------------------------- measurement
+#
+# 측정할 수 있는 것은 **마찰**이고 알고 싶은 것은 **가치**다. 마찰은 대리 지표다.
+# 그래서 여러 지표를 하나의 점수로 합치지 않는다 — 합치면 그 하나를 최적화하게 되고,
+# 차단은 아무것도 시도하지 않거나 우회하는 것으로도 줄어든다. 나란히 놓고 사람이 읽는다.
+#
+# 스키마를 바꾸지 않는다. 두 기능 모두 새 event 종류로만 기록하므로 구버전 DB 에서
+# "no such column" 으로 하네스가 죽는 일이 없다.
+
+def cycle_window_start(con, lid):
+    """이번 회차가 시작된 시각. 마지막 회차 종료 기록이 없으면 작업 생성 시각."""
+    row = con.execute(
+        "SELECT MAX(at) a FROM event WHERE loop_id=? AND kind='cycle_close'",
+        (lid,)).fetchone()
+    if row and row["a"]:
+        return row["a"]
+    row = con.execute("SELECT created_at FROM loop WHERE id=?", (lid,)).fetchone()
+    return (row["created_at"] if row else None) or ""
+
+
+def _window_events(con, lid, start, kinds=None):
+    """[start, 지금) 안의 이 작업 이벤트. 비교는 절대 시각으로 한다."""
+    lo = ts_epoch(start)
+    sql = "SELECT at, kind, rule, target FROM event WHERE loop_id=?"
+    params = [lid]
+    if kinds:
+        sql += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+        params += list(kinds)
+    return [r for r in con.execute(sql, params) if ts_epoch(r["at"]) >= lo]
+
+
+def cycle_counters(con, lid, start):
+    """이 회차의 마찰 수치. 회피 지표를 반드시 함께 담는다 — 차단만 보면 속는다."""
+    rows = _window_events(con, lid, start)
+    tally = {}
+    for r in rows:
+        tally[r["kind"]] = tally.get(r["kind"], 0) + 1
+
+    # 재편집 최대치: 한 파일을 몇 번 고쳤나. 구조 냄새의 대리 지표.
+    edits = {}
+    for r in rows:
+        if r["kind"] == "edit":
+            edits[r["target"]] = edits.get(r["target"], 0) + 1
+
+    # 반복 실패: 이 회차의 실패 중 그 명령이 **이전에도** 실패한 적 있는 것.
+    # 여기도 절대 시각으로 비교해야 한다. SQL 문자열 비교를 쓰면 형식이 조금만
+    # 달라도(공백 구분 vs 'T', 오프셋 유무) 창 밖의 것이 안으로 들어온다.
+    # 작업 경계를 넘어 센다 — 지난 작업에서 실패한 명령이 또 실패하는 것이 요점이다.
+    lo = ts_epoch(start)
+    seen_before = {r["target"] for r in con.execute(
+        "SELECT at, target FROM event WHERE kind='tool_fail'")
+        if ts_epoch(r["at"]) < lo}
+    refails, seen_now = 0, set()
+    for r in rows:
+        if r["kind"] != "tool_fail":
+            continue
+        if r["target"] in seen_before or r["target"] in seen_now:
+            refails += 1
+        seen_now.add(r["target"])
+
+    return {
+        "dur": max(0, int(time.time() - lo)) if start else 0,
+        "blocks": tally.get("block", 0),
+        "fails": tally.get("tool_fail", 0),
+        "refails": refails,
+        "churn": max(edits.values()) if edits else 0,
+        "edits": tally.get("edit", 0),
+        "gates": tally.get("stop_gate", 0),
+        "bypass": tally.get("bypass", 0),
+        "skips": tally.get("skip", 0),
+        "declines": tally.get("promote_declined", 0),
+        "promotes": tally.get("promote", 0),
+    }
+
+
+def record_cycle_close(con, cfg, lid, sid):
+    """회차 경계에서 그 회차의 집계를 한 줄로 남긴다.
+
+    stage 행은 작업이 닫힐 때 삭제되므로 나중에 회차별 비용을 되살릴 수 없다.
+    경계에서 스냅샷을 남기면 event 는 작업이 닫혀도 살아남아 측정이 가능해진다.
+    """
+    start = cycle_window_start(con, lid)
+    c = cycle_counters(con, lid, start)
+    c["cycle"] = cycle_of(con, lid)
+    record_event(con, lid, sid, "cycle_close", str(c["cycle"]),
+                 "%s-%d" % (lid, c["cycle"]), json.dumps(c, ensure_ascii=False))
+    return c
+
+
+def verify_globs(cfg, as_kind):
+    v = (promo_cfg(cfg).get("verify_globs") or {}).get(as_kind)
+    return v if isinstance(v, list) else None
+
+
+def promote_change_seen(con, cfg, lid, as_kind):
+    """승격 주장에 맞는 파일 변경이 이 회차에 실제로 있었는가.
+
+    `--as hook` 이라고 써놓고 아무것도 고치지 않아도 게이트는 만족된다 —
+    노트는 주장이다. 막지는 않는다(무엇을 고쳐야 하는지는 판단이므로). 대신
+    관측 사실을 기록해서, 나중에 `metrics` 가 주장과 사실을 나란히 보여준다.
+    None 은 '검증 대상 아님'이다 (rule 은 LEARNED.md 이고 하네스가 쓴다).
+    """
+    pats = verify_globs(cfg, as_kind)
+    if not pats:
+        return None
+    excl = promo_cfg(cfg).get("verify_exclude") or []
+    start = cycle_window_start(con, lid)
+    for r in _window_events(con, lid, start, ("edit",)):
+        rel = r["target"] or ""
+        if any(glob_match(rel, p) for p in excl):
+            continue
+        if any(glob_match(rel, p) for p in pats):
+            return True
+    return False
 
 
 def promotion_summary(con, cfg):
@@ -1464,9 +1591,13 @@ def cli_advance(con, cfg, root, lid, sid, argv):
                   "사람의 승인을 받아라." % sid)
         return 1
 
+    snap = None
     with con:
         con.execute("UPDATE stage SET status='done', left_at=? "
                     "WHERE loop_id=? AND stage=?", (now(), lid, sid))
+        # 회차 경계에서만 스냅샷을 남긴다. close_loop 이 stage 를 지우기 전에.
+        if sid == last:
+            snap = record_cycle_close(con, cfg, lid, sid)
         if sid == last and want_done:
             close_loop(con, lid)
             nlid = create_loop(con, cfg, root)
@@ -1478,6 +1609,11 @@ def cli_advance(con, cfg, root, lid, sid, argv):
             nlid, nsid, _ = _enter(con, cfg, root, lid, stage_index(cfg, sid) + 1)
             done_task = False
 
+    if snap:
+        print("회차 %d 기록: 차단 %d · 실패 %d(반복 %d) · 재편집 최대 %d · "
+              "우회 %d · 스킵 %d"
+              % (snap["cycle"], snap["blocks"], snap["fails"], snap["refails"],
+                 snap["churn"], snap["bypass"], snap["skips"]))
     if done_task:
         print("작업 %s 종료 — 기록은 각 폴더의 파일에 남아 있다." % lid)
         print("새 작업 %s → 단계 %s" % (nlid, label_of(cfg, nsid)))
@@ -1832,6 +1968,135 @@ def cli_tidy(con, cfg, root, lid, sid, argv):
     return 0
 
 
+def _pct(part, whole):
+    return "  -  " if not whole else "%4.0f%%" % (100.0 * part / whole)
+
+
+def _survival(con, cfg):
+    """승격 종류별 재발률. 각 승격이 그 자체로 하나의 실험이다.
+
+    "하네스 있기 전/후"는 비교할 수 없지만 "이 규칙을 승격한 전/후"는 비교할 수
+    있다. 이것이 이 하네스에서 유일하게 엄밀한 측정이다.
+    """
+    verified = {}
+    for r in con.execute("SELECT target, detail FROM event "
+                         "WHERE kind='promote_verify' ORDER BY id"):
+        verified[r["target"]] = (r["detail"] or "").endswith("yes")
+    agg = {}
+    for p in con.execute("SELECT * FROM promotion"):
+        d = agg.setdefault(p["decision"], {"n": 0, "re": 0, "vn": 0, "vy": 0})
+        d["n"] += 1
+        if is_regressed(con, cfg, p):
+            d["re"] += 1
+        if p["key"] in verified:
+            d["vn"] += 1
+            d["vy"] += 1 if verified[p["key"]] else 0
+    return agg
+
+
+def _cycle_rows(con):
+    out = []
+    for r in con.execute("SELECT at, detail FROM event WHERE kind='cycle_close' "
+                         "ORDER BY id"):
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            d["at"] = r["at"]
+            out.append(d)
+    return out
+
+
+def _bucket(rows, n=3):
+    """회차를 n등분한다. 개별 비교는 작업 난이도에 교란되므로 구간으로만 읽는다."""
+    if len(rows) < n * 2:
+        return [(1, len(rows), rows)] if rows else []
+    size = len(rows) // n
+    out = []
+    for i in range(n):
+        lo = i * size
+        hi = len(rows) if i == n - 1 else (i + 1) * size
+        out.append((lo + 1, hi, rows[lo:hi]))
+    return out
+
+
+def cli_metrics(con, cfg, root, lid, sid, argv):
+    """복리 측정. 점수를 만들지 않는다 — 합치면 그 하나를 최적화하게 된다."""
+    with con:
+        sync_promotions(con, cfg)
+    lc = con.execute("SELECT COUNT(*) c, MIN(created_at) a, MAX(created_at) b "
+                     "FROM loop").fetchone()
+    cyc = _cycle_rows(con)
+    print("복리 측정 — 작업 %d개, 기록된 회차 %d개%s"
+          % (lc["c"], len(cyc),
+             " (%s ~ %s)" % ((lc["a"] or "")[:10], (lc["b"] or "")[:10])
+             if lc["a"] else ""))
+
+    print("\n① 승격 생존율 — 무엇이 실제로 막았나")
+    agg = _survival(con, cfg)
+    if not agg:
+        print("  (아직 승격이 없다. 여러 작업에서 반복된 항목이 생기면 쌓인다)")
+    else:
+        for k in sorted(agg, key=lambda x: -agg[x]["n"]):
+            d = agg[k]
+            vs = ("변경관측 %d/%d" % (d["vy"], d["vn"])) if d["vn"] else ""
+            print("  %-10s %2d건 중 %2d건 재발 (%s)  %s"
+                  % (k, d["n"], d["re"], _pct(d["re"], d["n"]).strip(), vs))
+        small = sum(d["n"] for d in agg.values())
+        if small < 20:
+            print("  ⚠ 표본 %d건. 비율을 믿지 마라 — 20~30건은 있어야 한다." % small)
+        print("  재발 = 승격 이후 같은 항목이 다시 걸린 것. 변경관측 = 그 회차에 "
+              "주장에 맞는 파일 변경이 있었나.")
+
+    print("\n② 회차 추세 — 마찰과 회피를 나란히 본다")
+    if not cyc:
+        print("  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done` 때 쌓인다)")
+    else:
+        keys = [("blocks", "차단"), ("refails", "반복실패"), ("churn", "재편집"),
+                ("bypass", "우회"), ("skips", "스킵"), ("declines", "보류")]
+        print("  %-12s %s" % ("회차구간", " ".join("%8s" % t for _, t in keys)))
+        buckets = _bucket(cyc)
+        avgs = []
+        for lo, hi, rows in buckets:
+            a = {k: sum(r.get(k, 0) for r in rows) / float(len(rows)) for k, _ in keys}
+            avgs.append(a)
+            print("  %-12s %s" % ("%d-%d회" % (lo, hi),
+                                  " ".join("%8.1f" % a[k] for k, _ in keys)))
+        if len(avgs) >= 2:
+            first, last = avgs[0], avgs[-1]
+            friction = last["blocks"] + last["refails"] < first["blocks"] + first["refails"]
+            evasion = (last["bypass"] + last["skips"] + last["declines"]
+                       > first["bypass"] + first["skips"] + first["declines"])
+            # Goodhart 가드. 차단은 아무것도 시도하지 않거나 우회해도 줄어든다.
+            if friction and evasion:
+                print("  ⚠ 마찰이 줄었지만 우회·스킵·보류가 늘었다 — 개선이 아니라 "
+                      "회피일 수 있다. 게이트가 연극이 되고 있는지 보라.")
+            elif friction:
+                print("  ✓ 마찰이 줄고 우회는 늘지 않았다 — 개선 신호다 "
+                      "(작업 난이도 차이는 통제하지 못한다).")
+            elif evasion:
+                print("  ⚠ 우회가 늘었는데 마찰은 줄지 않았다 — 규칙이 맞지 않는지 보라.")
+
+    print("\n③ 반복 실패 비율 — 실패 주입이 겨냥한 것")
+    # 누적 비율(전체 실패 중 첫 실패가 아닌 것)은 쓰지 않는다. 명령 종류는 적고
+    # 실행은 많으니 시간이 지나면 무조건 100% 에 수렴한다 — 창이 없는 비율은
+    # 아무것도 말해주지 않는다. 회차 구간별로만 읽는다.
+    if not cyc:
+        print("  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done` 때 쌓인다)")
+    else:
+        for lo, hi, rows in _bucket(cyc):
+            tf = sum(r.get("fails", 0) for r in rows)
+            tr = sum(r.get("refails", 0) for r in rows)
+            print("  %-12s 실패 %3d건 중 이전에도 실패한 것 %3d건 (%s)"
+                  % ("%d-%d회" % (lo, hi), tf, tr, _pct(tr, tf).strip()))
+        print("  '이전에도 실패한 것' = 그 회차 시작 전에 이미 같은 명령이 실패한 적 있음.")
+
+    print("\n측정하지 못하는 것: 결과물의 품질, 그 회차가 필요했는지, 사람이 아낀 시간.")
+    print("점수를 만들지 않는 이유: 하나로 합치면 그 하나를 최적화하게 된다.")
+    return 0
+
+
 def cli_promote(con, cfg, root, lid, sid, argv):
     """반복된 항목을 승격하거나, 승격하지 않기로 결정한다.
 
@@ -1925,6 +2190,7 @@ def cli_promote(con, cfg, root, lid, sid, argv):
     kind = key.split(":", 1)[0]
     # 보류의 성숙도는 'declined' 다. established 로 두면 "확립된 규칙"과 구분되지 않는다.
     maturity = "declined" if as_kind == "declined" else "established"
+    seen = promote_change_seen(con, cfg, lid, as_kind)
     with con:
         con.execute(
             "INSERT INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) "
@@ -1936,6 +2202,10 @@ def cli_promote(con, cfg, root, lid, sid, argv):
         record_event(con, lid, sid,
                      "promote_declined" if as_kind == "declined" else "promote",
                      as_kind, key, note)
+        if seen is not None:
+            # 주장과 사실을 따로 남긴다. metrics 가 나란히 보여준다.
+            record_event(con, lid, sid, "promote_verify", as_kind, key,
+                         "change_seen=%s" % ("yes" if seen else "no"))
     wrote = refresh_learned(con, cfg, root)
 
     print("%s: %s → %s" % ("보류 기록" if as_kind == "declined" else "승격 기록",
@@ -1945,6 +2215,12 @@ def cli_promote(con, cfg, root, lid, sid, argv):
         print("  %s 갱신 (%d/%d줄)"
               % (LEARNED_REL.replace(os.sep, "/"), len(learned_lines(con, cfg)),
                  learned_budget(cfg)))
+    if seen is False:
+        print("  ⚠ 이 회차에 그에 맞는 파일 변경이 관측되지 않았다 (%s). 막지는 않지만 "
+              "기록된다 — `harness metrics` 가 주장과 사실을 나란히 보여준다."
+              % ", ".join(verify_globs(cfg, as_kind) or []))
+    elif seen:
+        print("  설정/구조 변경이 이 회차에 관측됐다 — 주장이 사실로 뒷받침된다.")
     if as_kind == "declined":
         print("  보류도 결정이다. 이 항목이 앞으로 %s개 작업에서 다시 걸리면 "
               "결정이 무효화되어 다시 올라온다."
@@ -2236,6 +2512,7 @@ CLI = {
     "stats": cli_stats,
     "promote": cli_promote,
     "tidy": cli_tidy,
+    "metrics": cli_metrics,
 }
 
 
@@ -2287,7 +2564,7 @@ WRAPPER_CMD = ".claude/harness/bin/harness"
 # 읽기 전용·정상 진행 명령만 미리 허용한다. 동의가 필요한 명령
 # (skip / allow / approve-plan / auto-skip on / loop new|adopt) 은 의도적으로 제외한다.
 SAFE_PERMS = ["Bash(%s %s)" % (WRAPPER_CMD, c)
-              for c in ("status", "advance", "loop", "help", "tidy", "promote")] \
+              for c in ("status", "advance", "loop", "help", "tidy", "promote", "metrics")] \
     + ["Bash(%s %s:*)" % (WRAPPER_CMD, c)
        for c in ("recall", "stats", "loop intent", "promote")] \
     + ["Bash(%s auto-skip status)" % WRAPPER_CMD]
@@ -2442,6 +2719,9 @@ USAGE = """step-six-harness — 작업 하네스
                                이후 다시 반복되면 결정이 무효화되어 다시 올라온다
   tidy                         정리 후보 — 낡은 인덱스, 오래된 파일, 병합 후보,
                                재발한 승격, LEARNED.md 예산 (Scaffolding 에서 쓴다)
+  metrics                      복리 측정 — 승격 종류별 재발률(무엇이 실제로 막았나),
+                               회차 추세와 그 짝인 우회 추세, 반복 실패 비율.
+                               점수는 만들지 않는다
 
 단계 진행
   advance                      다음 단계로. 종료 조건이 남으면 거부하고 무엇이 남았는지 알려준다

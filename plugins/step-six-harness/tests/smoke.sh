@@ -675,6 +675,134 @@ check "재실행은 앵커를 늘리지 않는다" '^2$' \
   "$( (cd "$IW" && python3 "$ENGINE" init >/dev/null 2>&1); grep -c '^@.claude/harness/' "$IW/CLAUDE.md")"
 rm -rf "$IW"
 
+echo "== 회차 종료 스냅샷"
+MW="$(mktemp -d)"
+(cd "$MW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+check "데이터가 없으면 그렇다고 말한다" '회차 종료 기록이 없다' \
+  "$( (cd "$MW" && python3 "$ENGINE" metrics) )"
+check "승격이 없으면 그렇다고 말한다" '아직 승격이 없다' \
+  "$( (cd "$MW" && python3 "$ENGINE" metrics) )"
+mcli() { (cd "$MW" && python3 "$ENGINE" "$@"); }
+msql() { python3 - "$MW/.claude/harness/harness.db" "$1" <<'PYM'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+q = sys.argv[2]
+if q.count(";") > 1:
+    con.executescript(q)
+else:
+    for row in con.execute(q):
+        print("|".join("" if v is None else str(v) for v in row))
+con.commit()
+PYM
+}
+MLID="$(msql "SELECT v FROM meta WHERE k='head'")"
+mcli loop intent "측정 확인" >/dev/null
+mcli loop done-when "cycle_close 가 남는다" >/dev/null
+# 마찰을 만든다: 차단 2건, 실패 2건(같은 명령 반복), 재편집 3회
+msql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ (datetime('now'),'$MLID','execution','block','stage_write','a.py'),
+ (datetime('now'),'$MLID','execution','block','stage_write','b.py'),
+ (datetime('now'),'$MLID','execution','tool_fail','Bash','npm test'),
+ (datetime('now'),'$MLID','execution','tool_fail','Bash','npm test'),
+ (datetime('now'),'$MLID','execution','edit',NULL,'src/x.py'),
+ (datetime('now'),'$MLID','execution','edit',NULL,'src/x.py'),
+ (datetime('now'),'$MLID','execution','edit',NULL,'src/x.py');" >/dev/null
+msql "UPDATE stage SET status='pending' WHERE status='active';
+ UPDATE stage SET status='active' WHERE stage='compounding';
+ INSERT OR IGNORE INTO evidence VALUES('$MLID','compounding','retro_file','r',datetime('now'));" >/dev/null
+MOUT="$(mcli advance --cycle)"
+check "회차 경계에서 집계를 보고한다" '회차 1 기록' "$MOUT"
+check "차단 수를 센다" '차단 2' "$MOUT"
+check "반복 실패를 따로 센다" '반복 1' "$MOUT"
+check "cycle_close 이벤트가 남는다" '^1$' \
+  "$(msql "SELECT COUNT(*) FROM event WHERE kind='cycle_close'")"
+check "집계가 JSON 으로 저장된다" 'churn' \
+  "$(msql "SELECT detail FROM event WHERE kind='cycle_close'")"
+check "재편집 최대치를 담는다" '"churn": 3' \
+  "$(msql "SELECT detail FROM event WHERE kind='cycle_close'")"
+check "작업이 닫혀도 스냅샷은 남는다" '^1$' \
+  "$(msql "UPDATE loop SET closed_at=datetime('now') WHERE id='$MLID'" >/dev/null; \
+     msql "SELECT COUNT(*) FROM event WHERE kind='cycle_close'")"
+
+echo "== metrics 출력"
+MM="$(mcli metrics)"
+check "승격 절이 있다" '승격 생존율' "$MM"
+check "회차 추세 절이 있다" '회차 추세' "$MM"
+check "반복 실패 절이 있다" '반복 실패 비율' "$MM"
+check "측정 못 하는 것을 명시한다" '측정하지 못하는 것' "$MM"
+check "점수를 만들지 않는 이유를 적는다" '점수를 만들지 않는' "$MM"
+check "표본이 작으면 경고한다" '비율을 믿지 마라' \
+  "$(msql "INSERT OR REPLACE INTO promotion VALUES('block:m1','block','hook','established','n','x',datetime('now'),datetime('now'))" >/dev/null; mcli metrics)"
+
+echo "== Goodhart 가드"
+# 마찰은 줄지만 우회가 느는 이력을 심는다 -> 경고가 떠야 한다
+python3 - "$MW/.claude/harness/harness.db" <<'PYG'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("DELETE FROM event WHERE kind='cycle_close'")
+for i in range(12):
+    snap = dict(cycle=1, dur=100, blocks=8 - i // 2, fails=4, refails=max(0, 3 - i // 4),
+                churn=3, edits=10, gates=0,
+                bypass=0 if i < 6 else 3, skips=0 if i < 6 else 2,
+                declines=0 if i < 6 else 2, promotes=0)
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("2026-0%d-01T10:00:00+0900" % (1 + i % 9), "x", "compounding",
+                 "cycle_close", "1", "x-%d" % i, json.dumps(snap)))
+con.commit()
+PYG
+check "마찰↓ 우회↑ 는 회피로 경고한다" '회피일 수 있다' "$(mcli metrics)"
+python3 - "$MW/.claude/harness/harness.db" <<'PYG2'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("DELETE FROM event WHERE kind='cycle_close'")
+for i in range(12):
+    snap = dict(cycle=1, dur=100, blocks=8 - i // 2, fails=4, refails=max(0, 3 - i // 4),
+                churn=3, edits=10, gates=0, bypass=0, skips=0, declines=0, promotes=0)
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("2026-0%d-01T10:00:00+0900" % (1 + i % 9), "x", "compounding",
+                 "cycle_close", "1", "x-%d" % i, json.dumps(snap)))
+con.commit()
+PYG2
+check "마찰↓ 우회→ 는 개선 신호로 읽는다" '개선 신호' "$(mcli metrics)"
+check "그래도 난이도는 통제 못 한다고 적는다" '난이도 차이는 통제하지 못한다' "$(mcli metrics)"
+
+echo "== 승격 주장 대비 실제 변경 관측"
+msql "INSERT INTO loop(id,created_at) VALUES('260701-v00001','2026-07-01T10:00:00+0900');
+ UPDATE meta SET v='260701-v00001' WHERE k='head';
+ INSERT INTO stage(loop_id,stage,status,entered_at) VALUES('260701-v00001','compounding','active','2026-07-01T10:00:00+0900');
+ INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ ('2026-07-01T11:00:00+0900','v1','execution','block','vrule','a'),
+ ('2026-07-01T11:00:00+0900','v2','execution','block','vrule','b'),
+ ('2026-07-01T11:00:00+0900','v3','execution','block','vrule','c');" >/dev/null
+VOUT="$(mcli promote block:vrule --as hook --note '고쳤다고 주장만 한다')"
+check "변경이 없으면 경고한다" '변경이 관측되지 않았다' "$VOUT"
+check "막지는 않는다" '승격 기록' "$VOUT"
+check "관측 결과가 event 로 남는다" 'change_seen=no' \
+  "$(msql "SELECT detail FROM event WHERE kind='promote_verify' AND target='block:vrule'")"
+msql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ (datetime('now'),'260701-v00001','compounding','edit',NULL,'.claude/harness/stages.json');" >/dev/null
+VOUT2="$(mcli promote block:vrule --as hook --note '이번엔 정말 고쳤다')"
+check "변경이 있으면 뒷받침한다고 말한다" '사실로 뒷받침된다' "$VOUT2"
+check "metrics 가 주장과 사실을 나란히 보여준다" '변경관측' "$(mcli metrics)"
+# .dev/ 만 고친 회차는 hook 승격의 근거가 아니다 (verify_exclude)
+msql "INSERT INTO loop(id,created_at) VALUES('260702-v00002','2026-07-02T10:00:00+0900');
+ UPDATE meta SET v='260702-v00002' WHERE k='head';
+ INSERT INTO stage(loop_id,stage,status,entered_at) VALUES('260702-v00002','compounding','active','2026-07-02T10:00:00+0900');
+ INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ ('2026-07-02T11:00:00+0900','w1','execution','block','wrule','a'),
+ ('2026-07-02T11:00:00+0900','w2','execution','block','wrule','b'),
+ ('2026-07-02T11:00:00+0900','w3','execution','block','wrule','c'),
+ (datetime('now'),'260702-v00002','compounding','edit',NULL,'.dev/plan/x.md');" >/dev/null
+check ".dev/ 편집만으로는 근거가 되지 않는다" '변경이 관측되지 않았다' \
+  "$(mcli promote block:wrule --as hook --note '계획만 썼다')"
+check "그 사실이 event 로 남는다" 'change_seen=no' \
+  "$(msql "SELECT detail FROM event WHERE kind='promote_verify' AND target='block:wrule'")"
+check "rule 승격은 검증 대상이 아니다" '^0$' \
+  "$(msql "SELECT COUNT(*) FROM event WHERE kind='promote_verify' AND rule='rule'")"
+rm -rf "$MW"
+
 echo "== 손상 내성"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 check_empty "DB 손상 시 차단하지 않음" "$(hook "$(W docs/x.md)" 2>/dev/null)"

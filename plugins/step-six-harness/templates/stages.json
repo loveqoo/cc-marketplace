@@ -53,7 +53,21 @@
     "max_per_cycle": 3,
     "proven_after_loops": 3,
     "reopen_after_loops": 2,
-    "learned_max_lines": 20
+    "learned_max_lines": 20,
+    "verify_globs": {
+      "hook": [
+        ".claude/harness/stages.json",
+        ".claude/hooks/**",
+        "**/hooks.json"
+      ],
+      "skill": [
+        "**/SKILL.md",
+        ".claude/commands/**",
+        ".claude/skills/**"
+      ],
+      "structure": ["**"]
+    },
+    "verify_exclude": [".dev/**", "docs/**", ".claude/harness/LEARNED.md"]
   },
   "tidy": {
     "dir_file_threshold": 12,
