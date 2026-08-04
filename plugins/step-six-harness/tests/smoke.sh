@@ -32,8 +32,12 @@ check_empty() { # check_empty <label> <actual>
 sql() { python3 - "$WORK/.claude/harness/harness.db" "$1" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
-for row in con.execute(sys.argv[2]):
-    print("|".join("" if v is None else str(v) for v in row))
+q = sys.argv[2]
+if q.count(";") > 1:
+    con.executescript(q)   # execute 는 여러 구문을 거부한다
+else:
+    for row in con.execute(q):
+        print("|".join("" if v is None else str(v) for v in row))
 con.commit()
 PY
 }
@@ -410,6 +414,154 @@ hook '{"hook_event_name":"PostToolUse","cwd":"'"$WORK"'","tool_name":"Bash","too
 OUT3="$(cli advance)"
 check "Compounding 진입 시 이 루프 관측을 밀어준다" '이 루프에서 관측된 것' "$OUT3"
 check "승격 논의를 유도한다" '복리가 아니라 일기' "$OUT3"
+
+echo "== 실패 지점 주입 (PostToolUseFailure)"
+PTF() { printf '{"hook_event_name":"PostToolUseFailure","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"},"error":"%s"}' "$WORK" "$1" "$2"; }
+check_empty "첫 실패는 조용하다 (배울 것이 없다)" "$(hook "$(PTF 'flakycmd run' 'boom one')")"
+OUTF="$(hook "$(PTF 'flakycmd run' 'boom two')")"
+check "두 번째 실패는 횟수를 알려준다" '2번째' "$OUTF"
+check "이전 오류를 함께 준다" 'boom one' "$OUTF"
+check "직접 다룬 기록이 없으면 인덱스로 유도한다" '인덱스에서 찾아보라' "$OUTF"
+check "임계 미달이면 사용자에게 알리지 않는다" '^[^s]*$' "$(printf '%s' "$OUTF" | grep -c systemMessage)"
+mkdir -p "$WORK/.dev/troubleshooting"
+echo 'flakycmd 는 먼저 setup 이 필요하다' > "$WORK/.dev/troubleshooting/flakycmd-fix.md"
+OUTF2="$(hook "$(PTF 'flakycmd run' 'boom three')")"
+check "관련 기록을 찾아 제시한다" 'flakycmd-fix.md' "$OUTF2"
+check "적립 전에 세므로 3번째로 표시된다" '3번째' "$OUTF2"
+
+echo "== 승격 (promote)"
+check "반복 항목이 없으면 빈 목록" '(없음' "$(cli promote)"
+sql "INSERT INTO loop(id,created_at,closed_at) VALUES
+ ('250101-p00001','2025-01-01T10:00:00+0900','2025-01-01T18:00:00+0900'),
+ ('250102-p00002','2025-01-02T10:00:00+0900','2025-01-02T18:00:00+0900'),
+ ('250103-p00003','2025-01-03T10:00:00+0900','2025-01-03T18:00:00+0900');
+ INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ ('2025-01-01T11:00:00+0900','250101-p00001','execution','block','fakerule','a.txt'),
+ ('2025-01-02T11:00:00+0900','250102-p00002','execution','block','fakerule','b.txt'),
+ ('2025-01-03T11:00:00+0900','250103-p00003','execution','block','fakerule','c.txt');" >/dev/null
+check "3개 작업에서 반복되면 목록에 뜬다" 'block:fakerule' "$(cli promote)"
+check "결정 방법을 함께 제시한다" 'decline --reason' "$(cli promote)"
+check "status 가 승격 대기를 노출한다" '승격 결정 대기' "$(cli status)"
+check "SessionStart 가 승격 대기를 알린다" '승격 결정 대기' \
+  "$(hook '{"hook_event_name":"SessionStart","cwd":"'"$WORK"'","source":"startup"}')"
+check "모르는 키는 거부한다" '반복 항목이 아니다' "$(cli promote block:nosuchrule --as hook --note x || true)"
+check "종류 없이는 거부한다" '골라야 한다' "$(cli promote block:fakerule || true)"
+check "사유 없이는 거부한다" '필요하다' "$(cli promote block:fakerule --as hook || true)"
+
+echo "== Compounding 종료 조건 promotion_decided"
+setstage compounding
+sql "INSERT OR IGNORE INTO evidence VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
+OUTP="$(cli advance --done || true)"
+check "승격 결정 없이는 작업을 닫을 수 없다" 'promotion_decided' "$OUTP"
+check "회고는 있으므로 회고를 요구하지 않는다" '^[^r]*$' "$(printf '%s' "$OUTP" | grep -c 'retro_file:')"
+check "Stop 훅도 막는다" '승격 결정이 남았다' \
+  "$(hook "$(STOP prm '[Compounding] 끝')")"
+
+echo "== rule 승격과 LEARNED.md"
+OUTR="$(cli promote block:fakerule --as rule --note '가짜 규칙은 이렇게 피한다')"
+check "승격이 기록된다" '승격 기록' "$OUTR"
+check "established 로 시작한다" 'established' "$OUTR"
+check "LEARNED.md 를 갱신한다" 'LEARNED.md' "$OUTR"
+check "LEARNED.md 에 줄이 들어간다" '가짜 규칙은 이렇게 피한다' "$(cat "$WORK/.claude/harness/LEARNED.md")"
+check "성숙도를 표시한다" 'established' "$(cat "$WORK/.claude/harness/LEARNED.md")"
+check "직접 편집하지 말라고 한다" '직접 편집하지 마라' "$(cat "$WORK/.claude/harness/LEARNED.md")"
+check "LEARNED.md 는 쓰기 금지 경로다" 'deny' "$(hook "$(W .claude/harness/LEARNED.md)")"
+check "예외로도 열리지 않는다고 알린다" 'allow` 로도 열리지 않는다' "$(hook "$(W .claude/harness/LEARNED.md)")"
+check "결정 후에는 작업을 닫을 수 있다" '단계 1/7' "$(cli advance --done)"
+
+echo "== 보류(decline)도 결정이다"
+sql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ ('2025-01-01T12:00:00+0900','250101-p00001','execution','tool_fail','Bash','fakecmd x'),
+ ('2025-01-02T12:00:00+0900','250102-p00002','execution','tool_fail','Bash','fakecmd x'),
+ ('2025-01-03T12:00:00+0900','250103-p00003','execution','tool_fail','Bash','fakecmd x');" >/dev/null
+OUTD="$(cli promote 'tool_fail:fakecmd x' --decline --reason '원인이 외부 환경이다')"
+check "보류는 보류로 표시된다" '보류 기록' "$OUTD"
+check "되돌아온다는 것을 알린다" '무효화' "$OUTD"
+check "보류 성숙도는 declined" 'declined' "$(sql "SELECT maturity FROM promotion WHERE key='tool_fail:fakecmd x'")"
+check "보류는 event 로 남는다" 'promote_declined' "$(sql "SELECT kind FROM event WHERE kind='promote_declined' LIMIT 1")"
+check "stats 가 보류를 노출한다" '승격 보류' "$(cli stats)"
+check "stats 가 승격 이력을 보여준다" '승격 이력' "$(cli stats)"
+check "보류 후에는 대기 목록에서 빠진다" '(없음' "$(cli promote)"
+
+echo "== 재발하면 결정이 무효화된다"
+sql "UPDATE promotion SET at='2025-01-01T00:00:00+0900', recheck_at='2025-01-01T00:00:00+0900'
+     WHERE key='block:fakerule';
+     INSERT INTO loop(id,created_at,closed_at) VALUES
+     ('250201-p00004','2025-02-01T10:00:00+0900','2025-02-01T18:00:00+0900'),
+     ('250202-p00005','2025-02-02T10:00:00+0900','2025-02-02T18:00:00+0900');
+     INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+     ('2025-02-01T11:00:00+0900','250201-p00004','execution','block','fakerule','d.txt'),
+     ('2025-02-02T11:00:00+0900','250202-p00005','execution','block','fakerule','e.txt');" >/dev/null
+OUTG="$(cli promote)"
+check "재발하면 다시 목록에 오른다" 'block:fakerule' "$OUTG"
+check "무엇으로 승격했었는지 알려준다" '다시 걸렸다' "$OUTG"
+check "성숙도가 regressed 다" 'regressed' "$(sql "SELECT maturity FROM promotion WHERE key='block:fakerule'")"
+check "재발은 LEARNED.md 에서 내려간다" '^[^g]*$' \
+  "$(grep -c '가짜 규칙' "$WORK/.claude/harness/LEARNED.md" || true)"
+check "tidy 가 재발을 짚는다" '다시 걸린 항목' "$(cli tidy)"
+OUTG2="$(cli promote block:fakerule --as structure --note '구조를 바꿔 원인을 없앴다')"
+check "다시 결정하면 established 로 돌아온다" 'established' "$OUTG2"
+check "재결정 후에는 목록에서 빠진다" '(없음' "$(cli promote)"
+
+echo "== LEARNED.md 예산"
+python3 - "$WORK/.claude/harness/harness.db" <<'PYEOF'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+for n in range(20):
+    con.execute("INSERT OR REPLACE INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+                ("filler:%d" % n, "block", "rule", "established",
+                 "채움 %d" % n, "x", "2025-01-01T00:00:00+0900",
+                 "2025-01-01T00:00:00+0900"))
+con.commit()
+PYEOF
+sql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+ ('2025-01-01T13:00:00+0900','250101-p00001','execution','block','budgetrule','a'),
+ ('2025-01-02T13:00:00+0900','250102-p00002','execution','block','budgetrule','b'),
+ ('2025-01-03T13:00:00+0900','250103-p00003','execution','block','budgetrule','c');" >/dev/null
+OUTB="$(cli promote block:budgetrule --as rule --note '예산을 넘기려는 규칙' || true)"
+check "예산이 차면 rule 승격을 거부한다" '예산이 찼다' "$OUTB"
+check "무엇을 먼저 하라고 알려준다" '먼저 한 줄을 비워라' "$OUTB"
+check "예산이 차도 hook 승격은 가능하다" '승격 기록' \
+  "$(cli promote block:budgetrule --as hook --note '훅으로 막았다')"
+check "tidy 가 예산 소진을 알린다" '예산 소진' "$(cli tidy)"
+
+echo "== tidy (정리 후보)"
+mkdir -p "$WORK/.dev/retrospect"
+rm -f "$WORK/.dev/retrospect/INDEX.md"
+i=1
+while [ "$i" -le 13 ]; do
+  echo "회고 $i" > "$WORK/.dev/retrospect/250101-abc123-$i-retro.md"
+  i=$((i + 1))
+done
+find "$WORK/.dev/retrospect" -name '*.md' -exec touch -t 202401011200 {} \;
+OUTT="$(cli tidy)"
+check "인덱스 없는 폴더를 짚는다" 'INDEX.md 가 없다' "$OUTT"
+check "오래된 파일을 짚는다" '오래된 파일' "$OUTT"
+check "며칠 지났는지 알려준다" '일$' "$OUTT"
+check "한 작업이 흘린 파일을 병합 후보로 묶는다" '병합할 후보' "$OUTT"
+check "삭제 여부는 자율이라고 명시한다" '자율' "$OUTT"
+setstage scaffolding
+check "Scaffolding 에서 한 줄로 요약한다" '정리 후보:' "$(cli status)"
+check "요약이 tidy 를 가리킨다" 'harness tidy' "$(cli status)"
+# INDEX.md 가 최신 파일보다 낡아야 '낡음' 이다 (같은 mtime 은 낡지 않음)
+echo "인덱스" > "$WORK/.dev/retrospect/INDEX.md"
+touch -t 202001011200 "$WORK/.dev/retrospect/INDEX.md"
+check "인덱스가 낡으면 짚는다" '낡았다' "$(cli tidy)"
+touch "$WORK/.dev/retrospect/INDEX.md"
+check "인덱스가 최신이면 짚지 않는다" '^0$' \
+  "$(cli tidy | grep -c '낡았다' || true)"
+
+echo "== init 이 만드는 것"
+check "LEARNED.md 앵커를 넣는다" '@.claude/harness/LEARNED.md' "$(cat "$WORK/CLAUDE.md")"
+check "POLICY.md 앵커도 유지한다" '@.claude/harness/POLICY.md' "$(cat "$WORK/CLAUDE.md")"
+check "재실행은 앵커를 중복하지 않는다" '^1$' \
+  "$(grep -c '@.claude/harness/LEARNED.md' "$WORK/CLAUDE.md")"
+check "promote 를 권한 허용에 넣는다" 'promote' "$(cat "$WORK/.claude/settings.json")"
+check "tidy 를 권한 허용에 넣는다" 'tidy' "$(cat "$WORK/.claude/settings.json")"
+
+echo "== help"
+check "promote 를 사용법에 적는다" 'promote <key>' "$(cli help)"
+check "tidy 를 사용법에 적는다" 'tidy  ' "$(cli help)"
 
 echo "== 손상 내성"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"

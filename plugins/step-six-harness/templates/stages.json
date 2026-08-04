@@ -32,7 +32,8 @@
       ".claude/harness/bin/**",
       ".claude/harness/harness.db",
       ".claude/harness/harness.db-wal",
-      ".claude/harness/harness.db-shm"
+      ".claude/harness/harness.db-shm",
+      ".claude/harness/LEARNED.md"
     ]
   },
   "stop_continue": {
@@ -42,7 +43,21 @@
   "stop_block_limits": {
     "prefix": 1,
     "verification_evidence": 2,
-    "retro_file": 2
+    "retro_file": 2,
+    "promotion_decided": 2
+  },
+  "promotion": {
+    "kinds": ["block", "tool_fail"],
+    "min_loops": 3,
+    "max_per_cycle": 3,
+    "proven_after_loops": 3,
+    "reopen_after_loops": 2,
+    "learned_max_lines": 20
+  },
+  "tidy": {
+    "dir_file_threshold": 12,
+    "age_days": 30,
+    "merge_group": 3
   },
   "stages": [
     {
@@ -59,7 +74,7 @@
       "id": "scaffolding",
       "label": "Scaffolding",
       "summary": "이 작업에 맞는 구조인지 확인하고, 어긋나면 지금 바꾼다. 역할별 폴더링. 신규 최상위 폴더는 이 단계에서만 만들 수 있다. 쌓인 문서를 정리하고 인덱스를 갱신하는 것도 이 단계의 일이다.",
-      "hint": "구조 변경은 대부분의 회차에서 할 일이 없고, 그게 정상이다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다. 그리고 **줄이는 것도 이 단계의 일이다** — `.dev/retrospect/` 나 `.dev/learning/` 에 파일이 쌓였으면 통합·삭제하고, **그 폴더 안에 `INDEX.md` 를 만들어 갱신한다**(회차 접두사 없이 쓸 수 있다). 인덱스는 장식이 아니다 — `harness recall` 이 인덱스를 진입점으로 먼저 제시하므로, 수백 개 중 6개만 보이는 상황에서 전체를 대표한다. 규칙이 늘어 마찰이 커졌으면 `stages.json` 을 덜어내는 것도 여기서 한다. 쌓이면 복잡해지는 시스템은 복리가 아니다.",
+      "hint": "구조 변경은 대부분의 회차에서 할 일이 없고, 그게 정상이다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다. 그리고 **줄이는 것도 이 단계의 일이다** — `harness tidy` 가 정리 후보를 목록으로 준다(낡은 인덱스, 오래된 파일, 병합 후보, 재발한 승격, LEARNED.md 예산). 파일이 쌓였으면 통합·삭제하고, **그 폴더 안에 `INDEX.md` 를 만들어 갱신한다**(회차 접두사 없이 쓸 수 있다). 인덱스는 장식이 아니다 — `harness recall` 이 인덱스를 진입점으로 먼저 제시하므로, 수백 개 중 6개만 보이는 상황에서 전체를 대표한다. 규칙이 늘어 마찰이 커졌으면 `stages.json` 을 덜어내는 것도 여기서 한다. 쌓이면 복잡해지는 시스템은 복리가 아니다.",
       "write": ["source", "tests", "context", "dev"],
       "exit_criteria": [],
       "stop_requires": []
@@ -104,11 +119,11 @@
       "id": "compounding",
       "label": "Compounding",
       "skippable": false,
-      "summary": "회고를 기록하고, 작업이 끝났는지 스스로 판단한다. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
-      "hint": "회고를 쓴 뒤 두 갈래 중 하나를 고른다. 판단 근거는 Selection 에서 기록한 완료 조건이다 — 아래에 그대로 제시된다. 작업이 끝났으면 `harness advance --done` (Selection 으로 돌아가 새 작업을 정한다). 후속 회차가 남았으면 `harness advance --cycle` (Scaffolding 부터 다시, 같은 작업 유지). 판단은 자율이다. 반복 항목은 `harness stats` 로 확인하라 — 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
+      "summary": "회고를 기록하고, 작업이 끝났는지 스스로 판단한다. 여러 작업에서 반복된 항목은 승격을 결정해야 끝낼 수 있다.",
+      "hint": "회고를 쓴 뒤 두 갈래 중 하나를 고른다. 판단 근거는 Selection 에서 기록한 완료 조건이다 — 아래에 그대로 제시된다. 작업이 끝났으면 `harness advance --done` (Selection 으로 돌아가 새 작업을 정한다). 후속 회차가 남았으면 `harness advance --cycle` (Scaffolding 부터 다시, 같은 작업 유지). 판단은 자율이다. 여러 작업에서 반복된 항목이 있으면 아래에 제시되고, 그 결정 없이는 이 단계를 끝낼 수 없다 — `harness promote`. 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
       "write": ["dev", "context", "tests"],
-      "exit_criteria": ["retro_file"],
-      "stop_requires": ["retro_file"]
+      "exit_criteria": ["retro_file", "promotion_decided"],
+      "stop_requires": ["retro_file", "promotion_decided"]
     }
   ],
   "evidence_signals": {

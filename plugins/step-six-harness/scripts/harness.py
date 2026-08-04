@@ -32,6 +32,7 @@ CONFIG_REL = os.path.join(HARNESS_DIR, "stages.json")
 WRAPPER_REL = os.path.join(HARNESS_DIR, "bin", "harness")
 POLICY_REL = os.path.join(HARNESS_DIR, "POLICY.md")
 RATIONALE_REL = os.path.join(HARNESS_DIR, "rationale.md")
+LEARNED_REL = os.path.join(HARNESS_DIR, "LEARNED.md")
 
 WRITE_TOOLS = {
     "Write": "file_path",
@@ -76,6 +77,11 @@ CREATE TABLE IF NOT EXISTS event (
   kind TEXT, rule TEXT, target TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS event_kind_idx ON event(kind, rule);
 CREATE INDEX IF NOT EXISTS event_target_idx ON event(target);
+-- 승격 결정. 반복되는 실수를 산문으로 남기고 끝내지 않았다는 증거다.
+-- event 처럼 루프가 닫혀도 남는다 — 작업 하나의 상태가 아니라 프로젝트의 자산이다.
+CREATE TABLE IF NOT EXISTS promotion (
+  key TEXT PRIMARY KEY, kind TEXT, decision TEXT, maturity TEXT,
+  note TEXT, loop_id TEXT, at TEXT, recheck_at TEXT);
 """
 
 EVENT_KINDS = {
@@ -85,6 +91,18 @@ EVENT_KINDS = {
     "bypass": "게이트 우회",
     "tool_fail": "도구 실패",
     "edit": "파일 편집",
+    "promote": "승격 결정",
+    "promote_declined": "승격 보류",
+    "promote_regressed": "승격 후 재발",
+}
+
+# 승격 결정의 종류. 'declined' 는 "안 한다 + 사유" — 결정이지 회피가 아니다.
+PROMOTE_AS = {
+    "hook": "훅/규칙으로 기계화 (stages.json 또는 플러그인)",
+    "rule": "LEARNED.md 한 줄로 승격 (항상 로드된다)",
+    "skill": "스킬/커맨드로 승격",
+    "structure": "구조를 바꿔 원인을 제거",
+    "declined": "승격하지 않는다 (사유 기록)",
 }
 
 
@@ -287,9 +305,176 @@ def acceptance_of(con, lid):
         (lid,))]
 
 
+# ------------------------------------------------------------------- promotion
+#
+# 기록만 하고 승격하지 않으면 복리가 아니라 일기다. 100개 레포를 조사한 연구에서
+# 가장 흔한 설정 냄새가 62% 의 "lint leakage" — 훅으로 막을 것을 산문으로 적어둔
+# 것이었다. 우리는 반복을 세고 있으니, 세는 데서 멈추지 않는다.
+#
+# ExpeL 의 중요도 투표와 CODESKILL 의 add/merge/drop 이 공통으로 말하는 것:
+# 저장소는 쌓이면 안 되고 수렴해야 하며, 살아남는 기준은 근거다.
+
+def promo_cfg(cfg):
+    return cfg.get("promotion") or {}
+
+
+def promo_key(kind, rule, target):
+    """승격 단위의 키. block 은 규칙이, tool_fail 은 정규화된 명령이 의미 있는 키다.
+
+    stats 의 묶음 기준과 같아야 한다 — 다르면 "3개 작업에서 반복"이라고 보여준
+    항목과 승격을 요구하는 항목이 어긋난다.
+    """
+    return "%s:%s" % (kind, (rule if kind == "block" else target) or "-")
+
+
+def repeated_items(con, cfg):
+    """여러 작업에서 반복된 항목. 한 작업 안의 반복은 우연일 수 있다."""
+    pc = promo_cfg(cfg)
+    kinds = pc.get("kinds") or ["block", "tool_fail"]
+    try:
+        min_loops = max(2, int(pc.get("min_loops", 3)))
+    except (TypeError, ValueError):
+        min_loops = 3
+    out = []
+    for kind in kinds:
+        key_col = "rule" if kind == "block" else "target"
+        for r in con.execute(
+                "SELECT IFNULL(%s,'-') k, COUNT(*) c, COUNT(DISTINCT loop_id) loops, "
+                "MAX(at) last FROM event WHERE kind=? GROUP BY k "
+                "HAVING loops >= ? ORDER BY loops DESC, c DESC" % key_col,
+                (kind, min_loops)):
+            out.append({"key": "%s:%s" % (kind, r["k"]), "kind": kind,
+                        "name": r["k"], "count": r["c"], "loops": r["loops"],
+                        "last": r["last"]})
+    out.sort(key=lambda d: (-d["loops"], -d["count"]))
+    return out
+
+
+def _events_since(con, item, since):
+    """승격 이후 같은 항목이 다시 걸렸는지. 승격이 통했는지의 유일한 객관 증거다."""
+    key_col = "rule" if item["kind"] == "block" else "target"
+    row = con.execute(
+        "SELECT COUNT(*) c, COUNT(DISTINCT loop_id) loops FROM event "
+        "WHERE kind=? AND IFNULL(%s,'-')=? AND at > ?" % key_col,
+        (item["kind"], item["name"], since or "")).fetchone()
+    return row["c"], row["loops"]
+
+
+def sync_promotions(con, cfg):
+    """성숙도를 재계산한다. 결정론적이다 — LLM 을 끼우면 등급이 표류한다.
+
+    established → proven: 승격 후 재발이 없고 그 사이 작업이 N개 지났다.
+    established → regressed: 승격 후에도 M개 작업에서 다시 걸렸다. 승격이
+    통하지 않았다는 뜻이므로 다시 결정 대상으로 돌린다.
+    """
+    pc = promo_cfg(cfg)
+    try:
+        proven_after = max(1, int(pc.get("proven_after_loops", 3)))
+        reopen_after = max(1, int(pc.get("reopen_after_loops", 2)))
+    except (TypeError, ValueError):
+        proven_after, reopen_after = 3, 2
+    changed = []
+    rows = con.execute("SELECT * FROM promotion").fetchall()
+    for p in rows:
+        if p["maturity"] == "regressed":
+            continue
+        item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
+        _, loops = _events_since(con, item, p["recheck_at"] or p["at"])
+        if loops >= reopen_after:
+            con.execute("UPDATE promotion SET maturity='regressed' WHERE key=?",
+                        (p["key"],))
+            changed.append((p["key"], "regressed"))
+            continue
+        if p["maturity"] == "proven" or p["decision"] == "declined":
+            continue
+        since = con.execute("SELECT COUNT(*) c FROM loop WHERE created_at > ?",
+                            (p["at"] or "",)).fetchone()["c"]
+        if loops == 0 and since >= proven_after:
+            con.execute("UPDATE promotion SET maturity='proven' WHERE key=?",
+                        (p["key"],))
+            changed.append((p["key"], "proven"))
+    return changed
+
+
+def pending_promotions(con, cfg, limit=None):
+    """결정이 필요한 항목. regressed 는 결정이 무효화됐으므로 다시 포함한다."""
+    decided = {r["key"]: r for r in con.execute("SELECT * FROM promotion")}
+    out = []
+    for item in repeated_items(con, cfg):
+        p = decided.get(item["key"])
+        if p is None:
+            out.append(item)
+        elif p["maturity"] == "regressed":
+            item = dict(item, regressed=p["decision"])
+            out.append(item)
+    if limit is None:
+        pc = promo_cfg(cfg)
+        try:
+            limit = max(1, int(pc.get("max_per_cycle", 3)))
+        except (TypeError, ValueError):
+            limit = 3
+    return out[:limit]
+
+
+def promotion_summary(con, cfg):
+    rows = con.execute("SELECT maturity, COUNT(*) c FROM promotion "
+                       "GROUP BY maturity").fetchall()
+    return {r["maturity"]: r["c"] for r in rows}
+
+
+def learned_lines(con):
+    """LEARNED.md 에 실릴 규칙 줄. rule 로 승격되고 살아 있는 것만."""
+    return con.execute(
+        "SELECT key, maturity, note FROM promotion WHERE decision='rule' "
+        "AND maturity != 'regressed' ORDER BY at", ()).fetchall()
+
+
+def learned_budget(cfg):
+    try:
+        return max(1, int(promo_cfg(cfg).get("learned_max_lines", 20)))
+    except (TypeError, ValueError):
+        return 20
+
+
+LEARNED_HEAD = """# 승격된 규칙
+
+반복된 실수에서 승격된 규칙이다. 하네스가 생성하므로 직접 편집하지 마라 —
+`harness promote` 로 올리고 `harness tidy` 로 내린다. 항상 로드되므로 예산이 있다
+(최대 %d줄). 예산이 찬 상태에서 새 규칙을 올리려면 먼저 한 줄을 비워야 한다.
+"""
+
+
+def refresh_learned(con, cfg, root):
+    """LEARNED.md 를 promotion 테이블에서 다시 생성한다.
+
+    손으로 고친 내용이 성숙도와 어긋나지 않게 하려면 생성이 유일한 경로여야 한다.
+    """
+    rows = learned_lines(con)
+    body = [LEARNED_HEAD % learned_budget(cfg)]
+    if rows:
+        for r in rows:
+            body.append("- [%s] %s <!-- %s -->"
+                        % (r["maturity"], (r["note"] or "").strip(), r["key"]))
+    else:
+        body.append("(아직 없다 — 반복된 실수가 승격되면 여기에 쌓인다.)")
+    return _write_if_changed(os.path.join(root, LEARNED_REL),
+                            "\n".join(body) + "\n")
+
+
 def exit_blockers(con, cfg, lid, sid):
     return [k for k in stage_obj(cfg, sid).get("exit_criteria", [])
-            if not has_evidence(con, lid, k)]
+            if not criterion_met(con, cfg, lid, k)]
+
+
+def criterion_met(con, cfg, lid, kind):
+    """종료 조건 충족 여부.
+
+    promotion_decided 는 evidence 행이 아니다 — 프로젝트 전체의 반복 항목에서
+    계산되므로, 루프에 증거를 심어두면 다음 회차에 새로 생긴 반복을 놓친다.
+    """
+    if kind == "promotion_decided":
+        return not pending_promotions(con, cfg)
+    return has_evidence(con, lid, kind)
 
 
 CRITERIA_HELP = {
@@ -302,6 +487,9 @@ CRITERIA_HELP = {
     "verification_evidence": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, "
                              "브라우저 확인, dry-run 중 하나를 수행하라",
     "retro_file": "회고를 .dev/retrospect/ 또는 .dev/learning/ 아래에 기록해야 한다",
+    "promotion_decided": "여러 작업에서 반복된 항목에 대한 승격 결정이 남았다 — "
+                         "`harness promote` 로 목록을 보고 하나씩 결정하라. "
+                         "승격하지 않기로 하는 것도 결정이다 (--decline --reason \"...\")",
 }
 
 
@@ -475,6 +663,14 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
         lines.append("이 루프의 스킵: "
                      + "; ".join("%s(%s, %s)" % (r["stage"], r["reason"],
                                                  r["authorized_by"]) for r in sk))
+    try:
+        pend = pending_promotions(con, cfg)
+    except Exception:
+        pend = []
+    if pend:
+        lines.append("승격 결정 대기 %d개 (%s) — Compounding 의 종료 조건이다. "
+                     "`harness promote` 로 결정하라."
+                     % (len(pend), ", ".join(it["key"] for it in pend)))
     emit({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                  "additionalContext": "\n".join(lines)}})
 
@@ -653,8 +849,77 @@ def hook_post_tool_use_failure(inp, con, cfg, root, lid, sid):
     target = norm_cmd(ti.get("command")) if tool == "Bash" else tool
     if tool in WRITE_TOOLS:
         target = "%s %s" % (tool, rel_to_root(root, ti.get(WRITE_TOOLS[tool])) or "")
+    target = target or tool
+
+    # 적립 **전에** 과거를 센다. 지금 실패를 넣고 세면 첫 실패가 2회로 보이고,
+    # '이전 오류'가 방금 그 오류가 되어 아무 정보도 주지 않는다.
+    prior = con.execute(
+        "SELECT COUNT(*) c, COUNT(DISTINCT loop_id) loops FROM event "
+        "WHERE kind='tool_fail' AND target=?", (target,)).fetchone()
+    prev = con.execute(
+        "SELECT detail FROM event WHERE kind='tool_fail' AND target=? "
+        "AND detail IS NOT NULL AND detail != '' ORDER BY id DESC LIMIT 1",
+        (target,)).fetchone()
     with con:
-        record_event(con, lid, sid, "tool_fail", tool, target or tool, err)
+        record_event(con, lid, sid, "tool_fail", tool, target, err)
+    if not prior["c"]:
+        return  # 첫 실패는 아직 배울 것이 없다
+
+    # 실패한 순간이 회수의 최적 시점이다 — 무엇을 물어볼지 이미 알기 때문이다.
+    # 여기서 알려주지 않으면 모델은 같은 벽을 다시 받는다.
+    emit_failure_recall(con, cfg, root, target, prior, prev)
+
+
+def emit_failure_recall(con, cfg, root, target, prior, prev):
+    n, loops = prior["c"] + 1, prior["loops"]
+    lines = ["[harness] '%s' 실패가 %d번째다%s."
+             % (target, n, " (작업 %d개에 걸쳐)" % loops if loops > 1 else "")]
+
+    p = con.execute("SELECT decision, maturity, note FROM promotion WHERE key=?",
+                    ("tool_fail:%s" % target,)).fetchone()
+    if p and p["decision"] == "declined":
+        lines.append("이 항목은 승격을 보류한 적이 있다: %s — 또 걸린다면 그 판단이 "
+                     "틀렸다는 증거다. 회고에 쓰라." % (p["note"] or "-"))
+    elif p:
+        lines.append("이 항목은 이미 %s(%s): %s — 승격이 통하지 않고 있다면 "
+                     "회고에 그 사실을 쓰라."
+                     % (PROMOTE_AS.get(p["decision"], p["decision"]),
+                        p["maturity"], (p["note"] or "-")))
+
+    if prev and prev["detail"]:
+        lines.append("이전 오류: %s" % " ".join(prev["detail"].split())[:160])
+
+    # 인덱스는 조건 없이 앞에 놓이므로, 그대로 쓰면 모든 실패에 같은 인덱스가 붙어
+    # 벽지가 된다. 키워드에 실제로 걸린 파일을 우선하고 인덱스는 대체 경로로만 준다.
+    indexes, files = _recall_files(root, [target], limit=4)
+    if files:
+        lines.append("관련 기록 — 같은 실수를 다시 하기 전에 읽어라: %s"
+                     % ", ".join(files[:3]))
+    elif indexes:
+        lines.append("이 실패를 직접 다룬 기록은 없다. 인덱스에서 찾아보라: %s"
+                     % ", ".join(indexes[:2]))
+    else:
+        lines.append("관련 기록이 없다. 이번에 해결하면 회고에 남겨라 "
+                     "(다음에 이 자리에서 제시된다).")
+
+    out = {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure",
+                                  "additionalContext": "\n".join(lines)}}
+    # 승격 임계에 닿으면 사용자에게도 보인다 — 모델이 같은 벽을 반복하는 것은
+    # 사용자가 알아야 할 사실이다. 단 이미 결정된 항목에는 결정을 요구한다고
+    # 말하지 않는다 — 결정이 있는데 또 요구하면 메시지가 거짓이 된다.
+    try:
+        thr = int(promo_cfg(cfg).get("min_loops", 3))
+    except (TypeError, ValueError):
+        thr = 3
+    undecided = p is None or p["maturity"] == "regressed"
+    if loops + 1 >= thr and undecided:
+        out["systemMessage"] = ("harness: '%s' 실패가 작업 %d개에서 반복된다 — "
+                               "Compounding 에서 승격 결정을 요구한다." % (target, loops))
+    elif loops + 1 >= thr:
+        out["systemMessage"] = ("harness: '%s' 실패가 작업 %d개에서 반복된다 "
+                               "(이미 %s 로 결정됨 — 재발이 이어지면 결정이 무효화된다)."
+                               % (target, loops, p["decision"]))
+    emit(out)
 
 
 def hook_stop(inp, con, cfg, root, lid, sid):
@@ -679,7 +944,7 @@ def hook_stop(inp, con, cfg, root, lid, sid):
                 "말머리는 [%s] 여야 한다. 단계 이름만 대괄호로 감싸 맨 앞에 붙여라 "
                 "(번호 병기 불가)." % stage["label"]))
     for key in stage.get("stop_requires", []):
-        if not has_evidence(con, lid, key):
+        if not criterion_met(con, cfg, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"
                              % (stage["label"], CRITERIA_HELP.get(key, key))))
     # 진행 유도 (opt-in, 기본 꺼짐). 남은 단계가 있으면 턴 종료를 막아 이어붙인다.
@@ -905,6 +1170,16 @@ def cli_status(con, cfg, root, lid, sid, argv):
     if auto_skip_on(con):
         print("  ⚠ 스킵 자동 승인 ON (%s) — 사유: %s. 끄려면 `harness auto-skip off`"
               % (auto_skip_scope_note(con), get_meta(con, "auto_skip_reason", "-")))
+    pend = pending_promotions(con, cfg)
+    if pend:
+        print("  승격 결정 대기 %d개 (Compounding 의 종료 조건): %s"
+              % (len(pend), ", ".join(it["key"] for it in pend)))
+    mat = promotion_summary(con, cfg)
+    if mat:
+        print("  승격됨: %s" % ", ".join("%s %d" % (k, v) for k, v in sorted(mat.items())))
+    head = tidy_headline(con, cfg, root)
+    if head:
+        print("  %s" % head)
     return 0
 
 
@@ -919,7 +1194,7 @@ def _enter(con, cfg, root, lid, dest_idx):
     return lid, sid, False
 
 
-def _hint_on_enter(con, cfg, lid, sid):
+def _hint_on_enter(con, cfg, root, lid, sid):
     """단계 진입 시의 안내.
 
     Context 는 **당겨가는** 단계다. 과거 기록을 밀어넣지 않는다 — 이번 task 와
@@ -930,6 +1205,12 @@ def _hint_on_enter(con, cfg, lid, sid):
     hint = stage_obj(cfg, sid).get("hint")
     if hint:
         print("\n%s" % hint)
+
+    # Scaffolding 은 '줄이는' 단계다. 권고만으로는 아무도 줄이지 않았으므로 목록을 준다.
+    if sid == "scaffolding":
+        head = tidy_headline(con, cfg, root)
+        if head:
+            print("\n%s" % head)
 
     # 완료 조건은 Verification·Compounding 에서 무조건 관련 있으므로 밀어준다.
     if sid in ("verification", "compounding"):
@@ -962,6 +1243,20 @@ def _hint_on_enter(con, cfg, lid, sid):
         print("\n재편집이 많은 파일 — 구조 문제일 수 있다:")
         for r in churn:
             print("  - %s ×%d" % (r["target"], r["c"]))
+
+    # 여러 작업에서 반복된 것은 이 단계의 종료 조건이다. 산문으로 적고 끝내면
+    # 다음 작업에서 같은 실수가 또 나오고, 그건 복리가 아니다.
+    pend = pending_promotions(con, cfg)
+    if pend:
+        print("\n여러 작업에서 반복된 항목 — 이 단계를 끝내려면 결정해야 한다 "
+              "(종료 조건 promotion_decided):")
+        for it in pend:
+            mark = "  ← %s 로 승격했는데 다시 걸렸다" % it["regressed"] \
+                if it.get("regressed") else ""
+            print("  - %s ×%d (작업 %d개)%s"
+                  % (it["key"], it["count"], it["loops"], mark))
+        print("  `harness promote` 로 목록과 결정 방법을 본다. "
+              "승격하지 않기로 하는 것도 결정이다.")
 
 
 def next_cycle(con, cfg, root, lid):
@@ -1044,7 +1339,7 @@ def cli_advance(con, cfg, root, lid, sid, argv):
             print("   파일명 접두사: %s" % file_prefix(con, nlid))
         print("→ 단계 %s" % label_of(cfg, nsid))
         print("   %s" % stage_obj(cfg, nsid)["summary"])
-    _hint_on_enter(con, cfg, nlid, nsid)
+    _hint_on_enter(con, cfg, root, nlid, nsid)
     return 0
 
 
@@ -1135,7 +1430,7 @@ def cli_skip(con, cfg, root, lid, sid, argv):
         print("작업 %s 종료 → 새 작업 %s, 단계 %s" % (lid, nlid, label_of(cfg, nsid)))
     else:
         print("→ 단계 %s" % label_of(cfg, nsid))
-        _hint_on_enter(con, cfg, nlid, nsid)
+        _hint_on_enter(con, cfg, root, nlid, nsid)
     return 0
 
 
@@ -1195,7 +1490,9 @@ def _expand_keywords(keywords):
     out = set()
     for kw in keywords:
         out.add(kw.lower())
-        for part in re.split(r"[/\\.\-_]", kw):
+        # 공백도 쪼갠다 — 실패 지점 주입은 'npm test' 같은 정규화된 명령을 키워드로
+        # 넘기는데, 회고 파일이 그 두 낱말을 붙여 쓴 경우는 드물다.
+        for part in re.split(r"[/\\.\-_\s]", kw):
             if len(part) >= 3:
                 out.add(part.lower())
     return out
@@ -1236,6 +1533,267 @@ def _recall_files(root, keywords, limit=6):
             if any(kw.lower() in hay for kw in keywords):
                 hits.append(rel)
     return indexes, hits[:max(0, limit - len(indexes))]
+
+
+def tidy_cfg(cfg):
+    return cfg.get("tidy") or {}
+
+
+def tidy_report(con, cfg, root):
+    """정리 후보. 판정은 전부 파일시스템 사실이고 LLM 이 끼지 않는다.
+
+    "정리하라"는 권고는 아무 일도 만들지 않았다. 무엇을 정리할지의 목록이라야
+    행동이 된다. 삭제·병합 자체는 여전히 자율이다 — 후보만 제시한다.
+    """
+    tc = tidy_cfg(cfg)
+    try:
+        thr = max(1, int(tc.get("dir_file_threshold", 12)))
+        age_days = max(1, int(tc.get("age_days", 30)))
+        group_min = max(2, int(tc.get("merge_group", 3)))
+    except (TypeError, ValueError):
+        thr, age_days, group_min = 12, 30, 3
+    cutoff = time.time() - age_days * 86400
+    open_loops = {r["id"] for r in
+                  con.execute("SELECT id FROM loop WHERE closed_at IS NULL")}
+
+    out = {"dirs": [], "stale": [], "groups": [], "learned": None, "regressed": []}
+    for sub in RECALL_DIRS:
+        d = os.path.join(root, ".dev", sub)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        files = [n for n in names
+                 if os.path.isfile(os.path.join(d, n)) and n not in INDEX_NAMES]
+        if not files:
+            continue
+        idx = os.path.join(d, "INDEX.md")
+        has_idx = os.path.isfile(idx)
+        newest = max((os.path.getmtime(os.path.join(d, n)) for n in files), default=0)
+        note = None
+        if len(files) >= thr and not has_idx:
+            note = "파일 %d개인데 INDEX.md 가 없다" % len(files)
+        elif has_idx and os.path.getmtime(idx) < newest:
+            note = "INDEX.md 가 최신 파일보다 낡았다 (파일 %d개)" % len(files)
+        if note:
+            out["dirs"].append((".dev/%s/" % sub, note))
+
+        groups = {}
+        for n in files:
+            path = os.path.join(d, n)
+            m = re.match(r"^(\d{6}-[0-9a-f]{6})-", n)
+            lid_of = m.group(1) if m else None
+            if lid_of:
+                groups.setdefault(lid_of, []).append(".dev/%s/%s" % (sub, n))
+            try:
+                mt = os.path.getmtime(path)
+            except OSError:
+                continue
+            # 열려 있는 작업의 파일은 후보가 아니다 — 아직 쓰이는 중이다.
+            if mt < cutoff and lid_of not in open_loops:
+                out["stale"].append((".dev/%s/%s" % (sub, n),
+                                     int((time.time() - mt) // 86400)))
+        for k, v in groups.items():
+            if len(v) >= group_min and k not in open_loops:
+                out["groups"].append((k, sorted(v)))
+
+    budget = learned_budget(cfg)
+    used = len(learned_lines(con))
+    if used:
+        out["learned"] = (used, budget)
+    out["regressed"] = con.execute(
+        "SELECT key, decision, note FROM promotion WHERE maturity='regressed'").fetchall()
+    out["stale"].sort(key=lambda t: -t[1])
+    return out
+
+
+def tidy_headline(con, cfg, root):
+    """Scaffolding 에서 한 줄로 보여줄 요약. 할 일이 없으면 None."""
+    try:
+        rep = tidy_report(con, cfg, root)
+    except Exception:
+        return None
+    bits = []
+    if rep["dirs"]:
+        bits.append("인덱스 %d곳" % len(rep["dirs"]))
+    if rep["stale"]:
+        bits.append("오래된 파일 %d개" % len(rep["stale"]))
+    if rep["groups"]:
+        bits.append("병합 후보 %d묶음" % len(rep["groups"]))
+    if rep["regressed"]:
+        bits.append("재발한 승격 %d개" % len(rep["regressed"]))
+    if rep["learned"] and rep["learned"][0] >= rep["learned"][1]:
+        bits.append("LEARNED.md 예산 소진 %d/%d" % rep["learned"])
+    if not bits:
+        return None
+    return "정리 후보: %s — `harness tidy` 로 목록을 본다" % ", ".join(bits)
+
+
+def cli_tidy(con, cfg, root, lid, sid, argv):
+    """줄이는 것도 일이다. 쌓이면 복잡해지는 시스템은 복리가 아니다."""
+    with con:
+        sync_promotions(con, cfg)
+    rep = tidy_report(con, cfg, root)
+    limit = 12
+
+    print("정리 후보 (Scaffolding 단계의 일이다. 삭제·병합 여부는 자율)")
+    if rep["dirs"]:
+        print("\n인덱스가 필요하거나 낡은 폴더")
+        for d, note in rep["dirs"]:
+            print("  %-26s %s" % (d, note))
+    if rep["groups"]:
+        print("\n한 작업이 여러 파일을 남겼다 — 하나로 병합할 후보")
+        for k, files in rep["groups"][:limit]:
+            print("  작업 %s — %d개" % (k, len(files)))
+            for f in files[:4]:
+                print("      %s" % f)
+            if len(files) > 4:
+                print("      ... +%d개" % (len(files) - 4))
+    if rep["stale"]:
+        print("\n닫힌 작업의 오래된 파일 — 인덱스에 요약하고 지울 후보")
+        for f, days in rep["stale"][:limit]:
+            print("  %-52s %d일" % (f[:52], days))
+        if len(rep["stale"]) > limit:
+            print("  ... +%d개" % (len(rep["stale"]) - limit))
+    if rep["regressed"]:
+        print("\n승격했는데 다시 걸린 항목 — 승격이 통하지 않았다")
+        for r in rep["regressed"]:
+            print("  %-30s %s: %s" % (r["key"][:30], r["decision"], r["note"] or "-"))
+        print("  Compounding 에서 다시 결정하게 된다 (`harness promote`).")
+    if rep["learned"]:
+        used, budget = rep["learned"]
+        print("\nLEARNED.md: %d/%d줄%s"
+              % (used, budget, " — 예산 소진. 새 규칙을 올리려면 먼저 비워라"
+                 if used >= budget else ""))
+        print("  내리기: `harness promote <key> --decline --reason \"...\"`")
+    if not any((rep["dirs"], rep["groups"], rep["stale"], rep["regressed"],
+                rep["learned"])):
+        print("  (없음 — 정리할 것이 없다)")
+    return 0
+
+
+def cli_promote(con, cfg, root, lid, sid, argv):
+    """반복된 항목을 승격하거나, 승격하지 않기로 결정한다.
+
+    승인 다이얼로그를 띄우지 않는다 — 이건 게이트 우회가 아니라 기록이기 때문이다.
+    대신 결정은 전부 event 에 남아 `stats` 에 드러나고, 승격 후에도 같은 항목이
+    다시 걸리면 결정이 무효화되어 다시 올라온다. 무성의한 보류는 되돌아온다.
+    """
+    with con:
+        changed = sync_promotions(con, cfg)
+    if changed:
+        # 20줄을 쏟으면 정작 결정해야 할 목록이 스크롤 밖으로 밀린다.
+        if len(changed) <= 3:
+            for key, mat in changed:
+                print("성숙도 갱신: %s → %s" % (key, mat))
+        else:
+            agg = {}
+            for _, mat in changed:
+                agg[mat] = agg.get(mat, 0) + 1
+            print("성숙도 갱신 %d건: %s"
+                  % (len(changed), ", ".join("%s %d" % kv for kv in sorted(agg.items()))))
+    pos = argv_positional(argv)
+    as_kind = argv_value(argv, "as")
+    decline = "--decline" in argv
+    note = argv_value(argv, "note") or argv_value(argv, "reason")
+
+    if not pos:
+        pend = pending_promotions(con, cfg)
+        print("승격 결정이 필요한 항목 (%d개)" % len(pend))
+        if not pend:
+            print("  (없음 — 여러 작업에서 반복된 항목이 아직 없다)")
+        for it in pend:
+            mark = ""
+            if it.get("regressed"):
+                mark = "  ← %s 로 승격했는데 다시 걸렸다" % it["regressed"]
+            print("  %-34s ×%d, 작업 %d개%s"
+                  % (it["key"][:34], it["count"], it["loops"], mark))
+        if pend:
+            print("\n결정 방법 (하나 고른다):")
+            for k, desc in PROMOTE_AS.items():
+                flag = "--decline --reason \"...\"" if k == "declined" \
+                    else "--as %s --note \"...\"" % k
+                print("  harness promote <key> %-32s %s" % (flag, desc))
+        done = con.execute("SELECT key, decision, maturity, note FROM promotion "
+                           "ORDER BY at DESC LIMIT 8").fetchall()
+        if done:
+            print("\n이미 결정된 항목")
+            for r in done:
+                print("  %-30s %-10s %-12s %s"
+                      % (r["key"][:30], r["decision"], r["maturity"],
+                         (r["note"] or "-")[:40]))
+        return 0
+
+    key = pos[0]
+    known = {it["key"] for it in repeated_items(con, cfg)}
+    if key not in known:
+        print("반복 항목이 아니다: %s" % key)
+        print("`harness promote` 로 목록을 확인하라 (키는 'block:<규칙>' 또는 "
+              "'tool_fail:<명령>' 형식이다).")
+        return 2
+    if decline:
+        as_kind = "declined"
+    if not as_kind:
+        print("무엇으로 승격할지 골라야 한다: --as %s, 또는 --decline."
+              % "|".join(k for k in PROMOTE_AS if k != "declined"))
+        return 2
+    if as_kind not in PROMOTE_AS:
+        print("알 수 없는 승격 종류: %s (가능: %s)"
+              % (as_kind, ", ".join(PROMOTE_AS)))
+        return 2
+    if not note:
+        print("사유/내용이 필요하다: %s"
+              % ("--reason \"왜 승격하지 않는가\"" if as_kind == "declined"
+                 else "--note \"무엇을 어떻게 바꿨는가\""))
+        return 2
+
+    if as_kind == "rule":
+        used = len(learned_lines(con))
+        existing = con.execute("SELECT decision FROM promotion WHERE key=?",
+                               (key,)).fetchone()
+        grows = not (existing and existing["decision"] == "rule")
+        if grows and used >= learned_budget(cfg):
+            print("LEARNED.md 예산이 찼다 (%d/%d줄). 항상 로드되는 문서라 상한이 있다."
+                  % (used, learned_budget(cfg)))
+            print("먼저 한 줄을 비워라: `harness promote <기존키> --decline "
+                  "--reason \"...\"` (`harness tidy` 로 목록 확인)")
+            return 1
+
+    kind = key.split(":", 1)[0]
+    # 보류의 성숙도는 'declined' 다. established 로 두면 "확립된 규칙"과 구분되지 않는다.
+    maturity = "declined" if as_kind == "declined" else "established"
+    with con:
+        con.execute(
+            "INSERT INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+            "decision=excluded.decision, maturity=excluded.maturity, "
+            "note=excluded.note, loop_id=excluded.loop_id, at=excluded.at, "
+            "recheck_at=excluded.recheck_at",
+            (key, kind, as_kind, maturity, note, lid, now(), now()))
+        record_event(con, lid, sid,
+                     "promote_declined" if as_kind == "declined" else "promote",
+                     as_kind, key, note)
+    wrote = refresh_learned(con, cfg, root)
+
+    print("%s: %s → %s" % ("보류 기록" if as_kind == "declined" else "승격 기록",
+                           key, PROMOTE_AS[as_kind]))
+    print("  %s" % note)
+    if wrote:
+        print("  %s 갱신 (%d/%d줄)"
+              % (LEARNED_REL.replace(os.sep, "/"), len(learned_lines(con)),
+                 learned_budget(cfg)))
+    if as_kind == "declined":
+        print("  보류도 결정이다. 이 항목이 앞으로 %s개 작업에서 다시 걸리면 "
+              "결정이 무효화되어 다시 올라온다."
+              % promo_cfg(cfg).get("reopen_after_loops", 2))
+    else:
+        print("  성숙도 established. 재발 없이 작업 %s개가 지나면 proven 이 된다."
+              % promo_cfg(cfg).get("proven_after_loops", 3))
+    left = pending_promotions(con, cfg)
+    print("남은 결정: %d개" % len(left))
+    return 0
 
 
 def cli_recall(con, cfg, root, lid, sid, argv):
@@ -1362,6 +1920,19 @@ def cli_stats(con, cfg, root, lid, sid, argv):
             if r["loops"] > 1:
                 bits += " ← %d개 작업에서 반복" % r["loops"]
             print("  %-24s %s" % (r["k"][:24], bits))
+    with con:
+        sync_promotions(con, cfg)
+    rows = con.execute("SELECT key, decision, maturity, note FROM promotion "
+                       "ORDER BY maturity, at").fetchall()
+    if rows:
+        print("\n승격 이력 — 반복을 기계화한 기록")
+        for r in rows:
+            print("  %-28s %-10s %-12s %s"
+                  % (r["key"][:28], r["decision"], r["maturity"],
+                     (r["note"] or "-")[:36]))
+    pend = pending_promotions(con, cfg)
+    if pend:
+        print("\n승격 결정 대기 %d개 — `harness promote`" % len(pend))
     print("\n상세 조회: `harness recall <키워드|경로>`")
     return 0
 
@@ -1501,6 +2072,8 @@ CLI = {
     "auto-skip": cli_auto_skip,
     "recall": cli_recall,
     "stats": cli_stats,
+    "promote": cli_promote,
+    "tidy": cli_tidy,
 }
 
 
@@ -1540,8 +2113,10 @@ def run_cli(argv):
 WRAPPER_CMD = ".claude/harness/bin/harness"
 # 읽기 전용·정상 진행 명령만 미리 허용한다. 동의가 필요한 명령
 # (skip / allow / approve-plan / auto-skip on / loop new|adopt) 은 의도적으로 제외한다.
-SAFE_PERMS = ["Bash(%s %s)" % (WRAPPER_CMD, c) for c in ("status", "advance", "loop", "help")] \
-    + ["Bash(%s %s:*)" % (WRAPPER_CMD, c) for c in ("recall", "stats", "loop intent")] \
+SAFE_PERMS = ["Bash(%s %s)" % (WRAPPER_CMD, c)
+              for c in ("status", "advance", "loop", "help", "tidy", "promote")] \
+    + ["Bash(%s %s:*)" % (WRAPPER_CMD, c)
+       for c in ("recall", "stats", "loop intent", "promote")] \
     + ["Bash(%s auto-skip status)" % WRAPPER_CMD]
 
 
@@ -1600,6 +2175,9 @@ def cli_init(argv):
         created.append("%s (loop %s)" % (DB_REL, lid))
     elif fresh:
         created.append(DB_REL)
+    # 앵커가 가리키는 파일이 없으면 CLAUDE.md 임포트가 깨진다. 빈 상태로라도 만든다.
+    if refresh_learned(con, cfg, root):
+        created.append(LEARNED_REL)
     con.close()
     refresh_wrapper(root)
 
@@ -1623,15 +2201,19 @@ def cli_init(argv):
             fh.write("\n".join(add) + "\n")
         created.append(".gitignore")
 
-    anchor = "@%s" % POLICY_REL.replace(os.sep, "/")
+    # 앵커는 두 줄이다. POLICY 는 사람이 정한 원칙, LEARNED 는 하네스가 승격한 규칙.
+    # 둘을 한 파일에 섞으면 생성 대상과 손으로 쓴 것이 구분되지 않는다.
     cm = os.path.join(root, "CLAUDE.md")
     body = open(cm, encoding="utf-8").read() if os.path.isfile(cm) else ""
-    if anchor not in body:
+    add_anchors = [a for a in ("@%s" % POLICY_REL.replace(os.sep, "/"),
+                               "@%s" % LEARNED_REL.replace(os.sep, "/"))
+                   if a not in body]
+    if add_anchors:
         with open(cm, "a", encoding="utf-8") as fh:
             if body and not body.endswith("\n"):
                 fh.write("\n")
-            fh.write("\n%s\n" % anchor)
-        created.append("CLAUDE.md (앵커 1줄)")
+            fh.write("\n" + "\n".join(add_anchors) + "\n")
+        created.append("CLAUDE.md (앵커 %d줄)" % len(add_anchors))
 
     print("하네스 설치 완료: %s" % root)
     for c in created:
@@ -1639,7 +2221,8 @@ def cli_init(argv):
     if not created:
         print("  (변경 없음 — 이미 설치되어 있다)")
     print("활성 작업: %s" % lid)
-    print("커밋 대상: .claude/harness/{POLICY.md,stages.json,rationale.md}, CLAUDE.md")
+    print("커밋 대상: .claude/harness/{POLICY.md,LEARNED.md,stages.json,rationale.md}, "
+          "CLAUDE.md")
     return 0
 
 
@@ -1659,6 +2242,17 @@ USAGE = """step-six-harness — 작업 하네스
                                과거 차단·실패·재편집 기록과 관련 회고 파일을 찾는다.
                                이번 task 와 관련된 것만 골라 읽어라 — 전부 읽지 마라
   stats [--loop]               누적 수치. 어떤 규칙에 몇 번 걸렸는지, 무엇이 반복되는지
+
+복리 (기록을 자산으로 바꾼다)
+  promote                      여러 작업에서 반복된 항목과 승격 결정 목록
+  promote <key> --as hook|rule|skill|structure --note "..."
+                               반복을 기계화했다고 기록. --as rule 은 LEARNED.md 에
+                               한 줄로 올라가 항상 로드된다 (예산 상한 있음)
+  promote <key> --decline --reason "..."
+                               승격하지 않기로 결정. 보류도 결정이므로 기록된다.
+                               이후 다시 반복되면 결정이 무효화되어 다시 올라온다
+  tidy                         정리 후보 — 낡은 인덱스, 오래된 파일, 병합 후보,
+                               재발한 승격, LEARNED.md 예산 (Scaffolding 에서 쓴다)
 
 단계 진행
   advance                      다음 단계로. 종료 조건이 남으면 거부하고 무엇이 남았는지 알려준다
@@ -1691,6 +2285,7 @@ USAGE = """step-six-harness — 작업 하네스
 
 명령을 외울 필요는 없다 — 차단당하면 훅이 실행할 명령을 그대로 알려준다.
 단계 정의·폴더 규칙: .claude/harness/stages.json
+승격된 규칙 (하네스가 생성): .claude/harness/LEARNED.md
 왜 이렇게 통제하는가: .claude/harness/rationale.md"""
 
 

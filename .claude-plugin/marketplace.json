@@ -10,9 +10,9 @@
     {
       "name": "step-six-harness",
       "source": "./plugins/step-six-harness",
-      "description": "작업 하네스 — Selection부터 Compounding까지 7단계를 훅으로 강제하고, 마지막에서 작업 종료와 다음 회차로 갈라진다. 완료 조건·폴더 규칙 가드, 스킵은 사유와 승인 필요, 검증 증거 없이 단계 종료 차단.",
+      "description": "작업 하네스 — Selection부터 Compounding까지 7단계를 훅으로 강제하고, 마지막에서 작업 종료와 다음 회차로 갈라진다. 반복된 실수는 승격을 결정해야 회차가 닫히고, 같은 실패를 다시 받으면 그 자리에서 과거 기록을 알려준다. 완료 조건·폴더 규칙 가드, 스킵은 사유와 승인 필요.",
       "category": "workflow",
-      "keywords": ["harness", "workflow", "guardrails", "hooks"]
+      "keywords": ["harness", "workflow", "guardrails", "hooks", "compounding", "memory"]
     }
   ]
 }

@@ -19,15 +19,16 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
 
    | 경로 | 커밋 | 내용 |
    | --- | --- | --- |
-   | `CLAUDE.md` | ✅ | `@.claude/harness/POLICY.md` 앵커 **1줄만** 추가 (기존 내용 보존) |
-   | `.claude/harness/POLICY.md` | ✅ | 작업 원칙 요약 — 매 세션 로드됨 |
+   | `CLAUDE.md` | ✅ | 앵커 **2줄만** 추가 — `@.claude/harness/POLICY.md`, `@.claude/harness/LEARNED.md` (기존 내용 보존) |
+   | `.claude/harness/POLICY.md` | ✅ | 작업 원칙 요약 — 매 세션 로드됨. **사람이 소유한다** |
+   | `.claude/harness/LEARNED.md` | ✅ | 승격된 규칙 — 매 세션 로드됨. **하네스가 생성한다** (`promote`/`tidy` 로만 바뀌고 쓰기 금지 경로다). 처음에는 비어 있다 |
    | `.claude/harness/rationale.md` | ✅ | 상세 근거 — 필요할 때만 읽힘 |
    | `.claude/harness/stages.json` | ✅ | 단계 정의·폴더 규칙의 단일 출처 |
    | `.claude/harness/harness.db` | ❌ | SQLite 런타임 상태 — 해시 발급 + 현재 단계. gitignore 등록됨 |
    | `.claude/harness/bin/harness` | ❌ | 래퍼 (세션마다 자동 갱신) |
-   | `.claude/settings.json` | ✅ | 조회 명령(`status`·`recall`·`stats`·`advance`·`loop intent`)을 권한 허용 목록에 추가. 동의가 필요한 명령(`skip`·`allow`·`approve-plan`·`auto-skip on`)은 **의도적으로 제외** |
+   | `.claude/settings.json` | ✅ | 조회 명령(`status`·`recall`·`stats`·`advance`·`loop intent`·`promote`·`tidy`)을 권한 허용 목록에 추가. 동의가 필요한 명령(`skip`·`allow`·`approve-plan`·`auto-skip on`)은 **의도적으로 제외** |
 
-3. `git diff` 로 CLAUDE.md 변경이 1줄인지 확인시킨다.
+3. `git diff` 로 CLAUDE.md 변경이 앵커 2줄뿐인지 확인시킨다.
 
 4. 규칙을 프로젝트에 맞게 조정할지 물어본다. `stages.json` 에서 조정할 수 있는 것:
    - `folder_rules.dev_subdirs` — `.dev/` 하위 허용 폴더
@@ -36,6 +37,9 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
    - `stop_block_limits` — 조건별 턴 종료 차단 상한 (소진 시 사용자에게 노출됨)
    - `folder_rules.loop_prefixed_dirs` — 파일명에 루프 해시를 강제할 `.dev/` 하위 폴더
    - `path_classes` — 경로 → 클래스 매핑 (예: `src/` 를 별도 클래스로 분리)
+   - `promotion.min_loops` — 몇 개 작업에서 반복되면 승격 결정을 요구할지 (기본 3)
+   - `promotion.learned_max_lines` — `LEARNED.md` 줄 수 상한 (기본 20). 항상 로드되므로 상한이 있다
+   - `tidy` — 정리 후보 판정 기준 (폴더 파일 수, 오래됨 기준 일수, 병합 후보 최소 개수)
 
 5. **설치한 세션에서는 하네스가 반쪽만 동작한다는 것을 반드시 알린다.**
 
