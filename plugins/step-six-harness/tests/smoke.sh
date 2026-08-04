@@ -57,7 +57,7 @@ check "CLAUDE.md 앵커 1줄" '^@\.claude/harness/POLICY\.md$' "$(cat "$WORK/CLA
 check "루프 해시 형식 YYMMDD-xxxxxx" '^[0-9]\{6\}-[0-9a-f]\{6\}$' "$LID"
 check "gitignore 에 db·wal·shm" 'harness\.db-wal' "$(cat "$WORK/.gitignore")"
 check "래퍼 생성" 'harness' "$(ls "$WORK/.claude/harness/bin/")"
-check "6단계 모두 등록" '^6$' "$(sql 'SELECT COUNT(*) FROM stage')"
+check "7단계 모두 등록" '^7$' "$(sql 'SELECT COUNT(*) FROM stage')"
 
 echo "== 사용법 안내"
 check "인자 없이 실행하면 명령 목록" 'auto-skip on' "$(python3 "$ENGINE")"
@@ -67,14 +67,14 @@ check "외울 필요 없다고 안내" '외울 필요는 없다' "$(python3 "$EN
 check "오타는 help 로 안내" 'harness help' "$(cli statuss 2>&1 || true)"
 check "하네스 밖에서도 help 동작" 'step-six-harness' "$(cd / && python3 "$ENGINE" help)"
 
-echo "== 작업 선정 (Scaffolding)"
-check "작업 미정을 알린다" '작업: (미정)' "$(cli status)"
-check "작업을 기록하지 않으면 Scaffolding 을 끝낼 수 없다" 'intent_set' \
+echo "== 작업 선정 (Selection)"
+check "작업 미정을 알린다" '작업 내용: (미정)' "$(cli status)"
+check "작업을 기록하지 않으면 Selection 을 끝낼 수 없다" 'intent_set' \
   "$(cli advance || true)"
 check "거부 시 방법을 알려준다" 'harness loop intent' "$(cli advance || true)"
 check "작업을 기록한다" 'src/auth.ts 토큰 갱신' \
   "$(cli loop intent 'src/auth.ts 토큰 갱신 수정')"
-check "status 에 작업이 보인다" '작업: src/auth.ts' "$(cli status)"
+check "status 에 작업이 보인다" '작업 내용: src/auth.ts' "$(cli status)"
 check "사유 없는 intent 는 사용법 안내" '사용법' "$(cli loop intent || true)"
 check "조회 명령이 미리 허용된다" 'harness recall' \
   "$(python3 -c "import json;print(json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'])")"
@@ -82,21 +82,26 @@ check "동의 필요 명령은 허용하지 않는다" '^0$' \
   "$(python3 -c "import json;a=json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'];print(sum(1 for x in a if 'harness skip' in x or 'auto-skip on' in x))")"
 check "작업을 기록하면 종료 조건이 충족된다" '충족 intent_set' "$(cli status)"
 
+echo "== Selection 은 .dev 만 쓸 수 있다"
+check "Selection 에서 소스 쓰기 차단" 'Selection' "$(hook "$(W src/a.py)")"
+check_empty "Selection 에서 .dev 쓰기 허용" "$(hook "$(W ".dev/plan/$LID-1-cands.md")")"
+
 echo "== 폴더 가드"
+setstage scaffolding
 check "docs/ 쓰기 차단" '"permissionDecision": "deny"' "$(hook "$(W docs/spec/001-a.md)")"
 check_empty "Scaffolding 에서 신규 최상위 폴더 허용" "$(hook "$(W src/a.py)")"
 check ".dev 하위 폴더 규칙 위반 차단" '규칙 위반' "$(hook "$(W .dev/nope/a.md)")"
 
 echo "== 루프 해시 파일명 강제"
-check "해시 접두사 없으면 차단" '루프 해시로 시작' "$(hook "$(W .dev/plan/my-plan.md)")"
-check "차단 시 올바른 이름 제시" "$LID-my-plan.md" "$(hook "$(W .dev/plan/my-plan.md)")"
-check_empty "해시 접두사 있으면 허용" "$(hook "$(W ".dev/plan/$LID-my-plan.md")")"
+check "해시 접두사 없으면 차단" '회차>-. 로 시작' "$(hook "$(W .dev/plan/my-plan.md)")"
+check "차단 시 올바른 이름 제시" "$LID-1-my-plan.md" "$(hook "$(W .dev/plan/my-plan.md)")"
+check_empty "해시 접두사 있으면 허용" "$(hook "$(W ".dev/plan/$LID-1-my-plan.md")")"
 check_empty "scratch 는 해시 강제 안 함" "$(hook "$(W .dev/scratch/tmp.txt)")"
 
 echo "== 단계 게이트"
 setstage planning
 check "Planning 에서 소스 쓰기 차단" 'Planning' "$(hook "$(W src/a.py)")"
-check_empty "Planning 에서 .dev 쓰기 허용" "$(hook "$(W ".dev/plan/$LID-b.md")")"
+check_empty "Planning 에서 .dev 쓰기 허용" "$(hook "$(W ".dev/plan/$LID-1-b.md")")"
 setstage execution
 mkdir -p "$WORK/src"
 check_empty "Execution 에서 기존 소스 폴더 허용" "$(hook "$(W src/a.py)")"
@@ -132,18 +137,38 @@ check "단계가 유지된다" 'Planning' "$(cli status | head -1)"
 
 echo "== 루프 중단 패턴: skip until:compounding → 회고 → 새 루프"
 ABORT="$(cli skip until:compounding --reason 'Planning에서 구조 선행 필요를 발견')"
-check "Compounding 까지 이동" '6/6 Compounding' "$ABORT"
+check "Compounding 까지 이동" '7/7 Compounding' "$ABORT"
 check "Compounding 자신은 스킵되지 않는다" '^pending$\|^active$' \
   "$(sql "SELECT status FROM stage WHERE stage='compounding'")"
-check "회고 없이는 루프를 닫을 수 없다" 'retro_file' "$(cli advance || true)"
+check "Compounding 은 맨손 advance 를 거부하고 두 갈래를 제시" 'advance --done' \
+  "$(cli advance || true)"
+check "회고 없이는 작업을 닫을 수 없다" 'retro_file' "$(cli advance --done || true)"
 ALID="$(loopid)"
 mkdir -p "$WORK/.dev/retrospect"
-hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-abort.md"}}' "$WORK" "$ALID")" >/dev/null
-NEWOUT="$(cli advance)"
-check "회고 후 루프가 닫히고 새 루프가 시작된다" '새 루프' "$NEWOUT"
-check "새 루프는 Scaffolding 부터" '1/6 Scaffolding' "$NEWOUT"
-check "중단한 루프의 스킵 사유가 event 에 남는다" '구조 선행 필요' \
+hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-1-abort.md"}}' "$WORK" "$ALID")" >/dev/null
+NEWOUT="$(cli advance --done)"
+check "회고 후 작업이 닫히고 새 작업이 시작된다" '새 작업' "$NEWOUT"
+check "새 작업은 Selection 부터" '1/7 Selection' "$NEWOUT"
+check "중단한 작업의 스킵 사유가 event 에 남는다" '구조 선행 필요' \
   "$(sql "SELECT detail FROM event WHERE kind='skip' AND loop_id='$ALID' LIMIT 1")"
+
+echo "== 회차 반복: advance --cycle"
+cli loop intent '회차 테스트' >/dev/null
+cli advance >/dev/null; setstage compounding
+CLID="$(loopid)"
+hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-1-r.md"}}' "$WORK" "$CLID")" >/dev/null
+CYC="$(cli advance --cycle)"
+check "같은 작업을 유지한다" "$CLID" "$CYC"
+check "회차가 올라간다" '회차 2' "$CYC"
+check "Scaffolding 으로 돌아간다" '2/7 Scaffolding' "$CYC"
+check "파일명 접두사에 회차가 반영된다" "$CLID-2-" "$(cli status)"
+check "회차가 바뀌면 계획 증거가 초기화된다" '^0$' \
+  "$(sql "SELECT COUNT(*) FROM evidence WHERE loop_id='$CLID' AND kind='plan_file'")"
+check "작업 선정 기록은 유지된다" '^1$' \
+  "$(sql "SELECT COUNT(*) FROM evidence WHERE loop_id='$CLID' AND kind='intent_set'")"
+check "Selection 은 done 으로 남는다" '^done$' \
+  "$(sql "SELECT status FROM stage WHERE loop_id='$CLID' AND stage='selection'")"
+check "--done/--cycle 은 마지막 단계에서만" '마지막 단계' "$(cli advance --done || true)"
 
 echo "== 결함 B 회귀: 턴 중 단계 전이 시 이전 말머리 허용"
 setstage scaffolding
@@ -231,11 +256,11 @@ check "만료 후 다시 동의를 요구" '"permissionDecision": "ask"' \
 
 echo "== 자동 승인 루프 범위 만료 (--scope loop)"
 cli auto-skip on --reason "이번 루프만" --scope loop >/dev/null
-check "루프 범위 표시" '루프 .* 범위' "$(cli auto-skip status)"
-check "같은 루프에서는 활성" '"permissionDecision": "defer"' \
+check "작업 범위 표시" '작업 .* 범위' "$(cli auto-skip status)"
+check "같은 작업에서는 활성" '"permissionDecision": "defer"' \
   "$(hook "$(B "$SKIPCMD" default)")"
 cli loop new >/dev/null
-check "루프가 바뀌면 만료" '루프가 바뀌어' "$(cli auto-skip status)"
+check "작업이 바뀌면 만료" '작업이 바뀌어' "$(cli auto-skip status)"
 setstage context
 check "만료 후 다시 동의를 요구" '"permissionDecision": "ask"' \
   "$(hook "$(B "$SKIPCMD" default)")"
@@ -247,13 +272,13 @@ check "거부되면 켜지지 않는다" 'OFF' "$(cli auto-skip status)"
 
 echo "== 루프 종료 시 행을 버린다"
 LID="$(loopid)"
-setstage compounding
+cli advance >/dev/null; setstage compounding
 mkdir -p "$WORK/.dev/retrospect"
 hook "$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":".dev/retrospect/%s-r.md"}}' "$WORK" "$LID")" >/dev/null
-OUT="$(cli advance)"
-check "루프 종료 후 새 루프 시작" '새 루프' "$OUT"
-check "이전 루프 stage 행 삭제" '^0$' "$(sql "SELECT COUNT(*) FROM stage WHERE loop_id='$LID'")"
-check "이전 루프 evidence 행 삭제" '^0$' "$(sql "SELECT COUNT(*) FROM evidence WHERE loop_id='$LID'")"
+OUT="$(cli advance --done)"
+check "작업 종료 후 새 작업 시작" '새 작업' "$OUT"
+check "이전 작업 stage 행 삭제" '^0$' "$(sql "SELECT COUNT(*) FROM stage WHERE loop_id='$LID'")"
+check "이전 작업 evidence 행 삭제" '^0$' "$(sql "SELECT COUNT(*) FROM evidence WHERE loop_id='$LID'")"
 if [ "$(loopid)" != "$LID" ]; then
   PASS=$((PASS + 1)); echo "  ok   새 해시가 발급된다"
 else
@@ -305,7 +330,7 @@ check "명령 키워드로 실패 기록을 찾는다" 'npm test' "$(cli recall 
 check "무관한 기록은 걸러진다" '^0$' \
   "$(cli recall npm | sed -n '/과거 관측/,/^$/p' | grep -c docs_readonly || true)"
 check "키워드가 아무것도 안 맞으면 비어 있다" '(없음)' "$(cli recall zzz존재하지않음)"
-check "여러 루프 반복을 표시한다" '여러 루프에서 반복' "$(cli recall docs)"
+check "여러 루프 반복을 표시한다" '여러 작업에서 반복' "$(cli recall docs)"
 check "--kind 로 종류를 좁힌다" 'tool_fail' "$(cli recall --kind tool_fail)"
 check "작업 미정이면 전체 + 기록 안내" '작업이 정해졌으면' "$(cli recall)"
 cli loop intent 'npm test 실패 조사' >/dev/null
@@ -315,13 +340,13 @@ cli loop intent 'src/auth.ts 토큰 갱신 로직 수정' >/dev/null
 check "저정보 단어(src·로직·수정)는 키워드에서 제외" '추출: auth.ts 토큰 갱신)' "$(cli recall | head -1)"
 
 echo "== stats (누적 수치)"
-check "루프 수를 센다" '루프: ' "$(cli stats)"
+check "작업 수를 센다" '작업: ' "$(cli stats)"
 check "이벤트 종류별 집계" '규칙 차단' "$(cli stats)"
 check "차단된 규칙 상위 표시" 'docs_readonly' "$(cli stats)"
 check "규칙 단위로 묶어 대상 종수를 센다" '대상 ' "$(cli stats)"
 check "실패한 도구 상위 표시" 'npm test' "$(cli stats)"
-check "반복을 명시한다" '루프에서 반복' "$(cli stats)"
-check "--loop 는 현재 루프만" "현재 루프 $NEW" "$(cli stats --loop)"
+check "반복을 명시한다" '작업에서 반복' "$(cli stats)"
+check "--loop 는 현재 루프만" "현재 작업 $NEW" "$(cli stats --loop)"
 check "recall 로 안내한다" 'harness recall' "$(cli stats)"
 
 echo "== 단계별 안내 (hint)"

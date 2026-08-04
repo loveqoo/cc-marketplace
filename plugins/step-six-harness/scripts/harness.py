@@ -55,7 +55,8 @@ EVIDENCE_STAGES = ("execution", "verification")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS loop (
-  id TEXT PRIMARY KEY, intent TEXT, branch TEXT, created_at TEXT, closed_at TEXT);
+  id TEXT PRIMARY KEY, intent TEXT, branch TEXT, created_at TEXT, closed_at TEXT,
+  cycle INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS stage (
   loop_id TEXT, stage TEXT, status TEXT,
   entered_at TEXT, left_at TEXT, reason TEXT, authorized_by TEXT,
@@ -191,6 +192,20 @@ def head_loop(con):
     return get_meta(con, "head")
 
 
+def cycle_of(con, lid):
+    """이 작업의 현재 회차. Compounding → Scaffolding 으로 돌 때마다 늘어난다."""
+    row = con.execute("SELECT cycle FROM loop WHERE id=?", (lid,)).fetchone()
+    try:
+        return int(row["cycle"]) if row and row["cycle"] else 1
+    except (TypeError, ValueError, IndexError):
+        return 1
+
+
+def file_prefix(con, lid):
+    """`.dev/` 산출물 파일명 접두사. 앞단 해시로 grep 하면 한 작업이 모인다."""
+    return "%s-%d-" % (lid, cycle_of(con, lid))
+
+
 def create_loop(con, cfg, root, intent=None, loop_id=None):
     lid = loop_id or new_loop_id()
     con.execute("INSERT OR IGNORE INTO loop(id,intent,branch,created_at) VALUES(?,?,?,?)",
@@ -270,8 +285,8 @@ def exit_blockers(con, cfg, lid, sid):
 
 
 CRITERIA_HELP = {
-    "intent_set": "이번 루프에서 할 작업을 `harness loop intent \"<작업>\"` 으로 "
-                  "기록해야 한다 (Context 의 recall 이 이것을 기준으로 조회한다)",
+    "intent_set": "이번에 할 작업을 `harness loop intent \"<작업>\"` 으로 기록해야 한다 "
+                  "(Context 의 recall 이 이것을 기준으로 조회한다)",
     "plan_file": "계획 파일을 .dev/plan/ 아래에 남겨야 한다",
     "plan_approved": "계획에 대한 사람의 승인이 필요하다 (harness approve-plan <file>)",
     "verification_evidence": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, "
@@ -374,11 +389,12 @@ def check_write(con, cfg, root, lid, sid, rel):
                         ".dev/ 하위는 %s 만 허용한다. '%s' 는 규칙 위반이다."
                         % ("/".join(allowed), parts[1]))
         if len(parts) >= 3 and parts[1] in rules.get("loop_prefixed_dirs", []):
-            if not parts[-1].startswith(lid + "-"):
+            pre = file_prefix(con, lid)
+            if not parts[-1].startswith(pre):
                 return deny("loop_prefix", (
-                    "이 루프의 산출물은 파일명이 루프 해시로 시작해야 한다. "
-                    "'%s' 대신 '%s-%s' 로 써라. 해시가 시퀀스이자 워크트리 간 "
-                    "충돌 방지 장치다." % (parts[-1], lid, parts[-1])))
+                    "이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. "
+                    "'%s' 대신 '%s%s' 로 써라. 앞단 해시(%s)로 grep 하면 한 작업의 "
+                    "산출물이 회차와 무관하게 모인다." % (parts[-1], pre, parts[-1], lid)))
 
     # 5. docs 하위 번호 명명 규칙 (grant 로 쓰기가 허용된 경우에만 도달)
     if cls == "docs" and len(parts) >= 3 and parts[1] in rules.get("docs_subdirs", []):
@@ -413,12 +429,13 @@ def hook_session_start(inp, con, cfg, root, lid, sid):
     refresh_wrapper(root)
     stage = stage_obj(cfg, sid)
     lines = [
-        "[harness] loop %s · 단계 %s — %s" % (lid, label_of(cfg, sid), stage["summary"]),
+        "[harness] 작업 %s · 회차 %d · 단계 %s — %s"
+        % (lid, cycle_of(con, lid), label_of(cfg, sid), stage["summary"]),
         "제어: `.claude/harness/bin/harness` {status | advance | skip <대상> --reason \"...\"} "
         "· 나머지 명령은 `harness help`",
-        "이 단계 쓰기 허용: %s. `.dev/` 산출물 파일명은 `%s-` 로 시작해야 한다. "
+        "이 단계 쓰기 허용: %s. `.dev/` 산출물 파일명은 `%s` 로 시작해야 한다. "
         "근거 문서: `.claude/harness/rationale.md`"
-        % (", ".join(stage.get("write", [])) or "(없음)", lid),
+        % (", ".join(stage.get("write", [])) or "(없음)", file_prefix(con, lid)),
         "모든 답변 말머리에 [%s] 를 붙여라." % stage["label"],
     ]
     if stage.get("hint"):
@@ -442,7 +459,7 @@ def auto_skip_state(con):
         return False, None
     scope = get_meta(con, "auto_skip_loop")
     if scope and scope != head_loop(con):
-        return False, "루프 %s 범위였고 루프가 바뀌어 만료됐다" % scope
+        return False, "작업 %s 범위였고 작업이 바뀌어 만료됐다" % scope
     uses = get_meta(con, "auto_skip_uses")
     if uses:
         try:
@@ -481,7 +498,7 @@ def auto_skip_scope_note(con):
     bits = []
     scope = get_meta(con, "auto_skip_loop")
     if scope:
-        bits.append("루프 %s 범위" % scope)
+        bits.append("작업 %s 범위" % scope)
     left = auto_skip_uses_left(con)
     if left is not None:
         bits.append("남은 %d회" % left)
@@ -772,16 +789,18 @@ def refresh_wrapper(root):
 
 
 def cli_status(con, cfg, root, lid, sid, argv):
-    print("loop %s · 단계 %s" % (lid, label_of(cfg, sid)))
+    print("작업 %s · 회차 %d · 단계 %s"
+          % (lid, cycle_of(con, lid), label_of(cfg, sid)))
     row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
     if row and row["intent"]:
-        print("  작업: %s" % row["intent"])
+        print("  작업 내용: %s" % row["intent"])
     else:
-        print("  작업: (미정) — Scaffolding 에서 정하고 "
-              "`harness loop intent \"...\"` 로 기록하라")
+        print("  작업 내용: (미정) — %s 단계에서 정하고 "
+              "`harness loop intent \"...\"` 로 기록하라"
+              % stage_obj(cfg, cfg["stages"][0]["id"])["label"])
     print("  요약: %s" % stage_obj(cfg, sid)["summary"])
     print("  쓰기 허용: %s" % (", ".join(stage_obj(cfg, sid).get("write", [])) or "(없음)"))
-    print("  .dev/ 산출물 파일명 접두사: %s-" % lid)
+    print("  .dev/ 산출물 파일명 접두사: %s" % file_prefix(con, lid))
     rows = stage_rows(con, lid)
     print("  단계: " + " → ".join(
         "%s(%s)" % (s["label"], rows[s["id"]]["status"] if s["id"] in rows else "?")
@@ -854,26 +873,84 @@ def _hint_on_enter(con, cfg, lid, sid):
             print("  - %s ×%d" % (r["target"], r["c"]))
 
 
+def next_cycle(con, cfg, root, lid):
+    """같은 작업의 다음 회차. Selection 은 유지하고 나머지 단계를 초기화한다.
+
+    증거를 초기화하지 않으면 2회차 Planning 이 1회차 계획서로 통과한다.
+    intent_set 만 남긴다 — 작업은 그대로이므로 다시 선정할 필요가 없다.
+    이전 회차의 계획·회고 파일은 파일로 남고, 파일명의 회차로 구분된다.
+    """
+    ids = stage_ids(cfg)
+    con.execute("DELETE FROM evidence WHERE loop_id=? AND kind != 'intent_set'", (lid,))
+    con.execute("DELETE FROM wgrant WHERE loop_id=?", (lid,))
+    con.execute("UPDATE stage SET status='pending', entered_at=NULL, left_at=NULL, "
+                "reason=NULL, authorized_by=NULL WHERE loop_id=? AND stage != ?",
+                (lid, ids[0]))
+    con.execute("UPDATE loop SET cycle=cycle+1 WHERE id=?", (lid,))
+    con.execute("UPDATE stage SET status='active', entered_at=? "
+                "WHERE loop_id=? AND stage=?", (now(), lid, ids[1]))
+    return ids[1]
+
+
 def cli_advance(con, cfg, root, lid, sid, argv):
+    last = cfg["stages"][-1]["id"]
+    want_done = "--done" in argv
+    want_cycle = "--cycle" in argv
+
+    if sid != last and (want_done or want_cycle):
+        print("--done / --cycle 은 마지막 단계(%s)에서만 쓴다."
+              % stage_obj(cfg, last)["label"])
+        return 2
+    if sid == last:
+        if want_done and want_cycle:
+            print("--done 과 --cycle 은 함께 쓸 수 없다.")
+            return 2
+        if not (want_done or want_cycle):
+            print("%s 단계에서는 두 갈래 중 하나를 골라야 한다. 스스로 판단하라:"
+                  % stage_obj(cfg, last)["label"])
+            print("  harness advance --done    작업이 끝났다 → %s (새 작업 선정)"
+                  % stage_obj(cfg, cfg["stages"][0]["id"])["label"])
+            print("  harness advance --cycle   후속 회차가 남았다 → %s (같은 작업 유지)"
+                  % stage_obj(cfg, cfg["stages"][1]["id"])["label"])
+            return 1
+
     missing = exit_blockers(con, cfg, lid, sid)
     if missing:
         print("advance 거부 — %s 단계의 종료 조건이 남았다:" % stage_obj(cfg, sid)["label"])
         for k in missing:
             print("  - %s: %s" % (k, CRITERIA_HELP.get(k, k)))
-        print("정당한 사유가 있으면 `harness skip %s --reason \"...\"` 로 "
-              "사람의 승인을 받아라." % sid)
+        if stage_obj(cfg, sid).get("skippable") is False:
+            print("이 단계는 건너뛸 수 없다. 조건을 채워야 한다.")
+        else:
+            print("정당한 사유가 있으면 `harness skip %s --reason \"...\"` 로 "
+                  "사람의 승인을 받아라." % sid)
         return 1
+
     with con:
         con.execute("UPDATE stage SET status='done', left_at=? "
                     "WHERE loop_id=? AND stage=?", (now(), lid, sid))
-        nlid, nsid, cycled = _enter(con, cfg, root, lid, stage_index(cfg, sid) + 1)
-    if cycled:
-        print("루프 %s 종료 — 기록은 각 폴더의 파일에 남아 있다." % lid)
-        print("새 루프 %s 시작 → 단계 %s" % (nlid, label_of(cfg, nsid)))
+        if sid == last and want_done:
+            close_loop(con, lid)
+            nlid = create_loop(con, cfg, root)
+            nsid = cfg["stages"][0]["id"]
+            done_task = True
+        elif sid == last:
+            nlid, nsid, done_task = lid, next_cycle(con, cfg, root, lid), False
+        else:
+            nlid, nsid, _ = _enter(con, cfg, root, lid, stage_index(cfg, sid) + 1)
+            done_task = False
+
+    if done_task:
+        print("작업 %s 종료 — 기록은 각 폴더의 파일에 남아 있다." % lid)
+        print("새 작업 %s → 단계 %s" % (nlid, label_of(cfg, nsid)))
     else:
+        if sid == last:
+            print("작업 %s 회차 %d 시작 (같은 작업 유지)"
+                  % (nlid, cycle_of(con, nlid)))
+            print("   파일명 접두사: %s" % file_prefix(con, nlid))
         print("→ 단계 %s" % label_of(cfg, nsid))
         print("   %s" % stage_obj(cfg, nsid)["summary"])
-        _hint_on_enter(con, cfg, nlid, nsid)
+    _hint_on_enter(con, cfg, nlid, nsid)
     return 0
 
 
@@ -913,7 +990,7 @@ def cli_skip(con, cfg, root, lid, sid, argv):
               if cfg["stages"][i].get("skippable") is False]
     if locked:
         print("%s 단계는 건너뛸 수 없다." % ", ".join(stage_obj(cfg, s)["label"] for s in locked))
-        print("루프를 중단하려면 `harness skip until:%s --reason \"...\"` 로 그 단계까지 "
+        print("이 회차를 중단하려면 `harness skip until:%s --reason \"...\"` 로 그 단계까지 "
               "이동한 뒤, 중단 사유를 회고로 남기고 `harness advance` 로 루프를 닫아라."
               % locked[0])
         return 1
@@ -948,7 +1025,7 @@ def cli_skip(con, cfg, root, lid, sid, argv):
     if by == "auto" and left is not None:
         print("자동 승인 남은 횟수: %d%s" % (left, " — 소진되어 OFF 로 돌아갔다" if left == 0 else ""))
     if cycled:
-        print("루프 %s 종료 → 새 루프 %s, 단계 %s" % (lid, nlid, label_of(cfg, nsid)))
+        print("작업 %s 종료 → 새 작업 %s, 단계 %s" % (lid, nlid, label_of(cfg, nsid)))
     else:
         print("→ 단계 %s" % label_of(cfg, nsid))
         _hint_on_enter(con, cfg, nlid, nsid)
@@ -1099,8 +1176,8 @@ def cli_recall(con, cfg, root, lid, sid, argv):
     if not rows:
         print("  (없음)")
     for r in rows:
-        mark = "  ← 여러 루프에서 반복" if r["loops"] > 1 else ""
-        print("  %-10s %-16s %-34s ×%d (루프 %d)%s"
+        mark = "  ← 여러 작업에서 반복" if r["loops"] > 1 else ""
+        print("  %-10s %-16s %-34s ×%d (작업 %d)%s"
               % (r["kind"], r["rule"] or "-", (r["target"] or "")[:34],
                  r["c"], r["loops"], mark))
 
@@ -1115,7 +1192,7 @@ def cli_recall(con, cfg, root, lid, sid, argv):
         if matched:
             print("\n재편집이 많은 파일")
             for r in matched:
-                print("  %-40s ×%d (루프 %d)" % (r["target"][:40], r["c"], r["loops"]))
+                print("  %-40s ×%d (작업 %d)" % (r["target"][:40], r["c"], r["loops"]))
 
     files = _recall_files(root, keywords)
     print("\n관련 회고·학습 파일 (필요하면 읽어라)")
@@ -1127,14 +1204,14 @@ def cli_recall(con, cfg, root, lid, sid, argv):
 
 
 def cli_stats(con, cfg, root, lid, sid, argv):
-    """누적 수치. --loop 를 주면 현재 루프만."""
+    """누적 수치. --loop 를 주면 현재 작업만."""
     only = "--loop" in argv
     cond, params = ("WHERE loop_id = ?", [lid]) if only else ("", [])
-    print("범위: %s" % ("현재 루프 %s" % lid if only else "전체 누적"))
+    print("범위: %s" % ("현재 작업 %s" % lid if only else "전체 누적"))
 
     lc = con.execute("SELECT COUNT(*) c, SUM(closed_at IS NOT NULL) closed "
                      "FROM loop").fetchone()
-    print("루프: %d개 (완료 %d)" % (lc["c"], lc["closed"] or 0))
+    print("작업: %d개 (완료 %d)" % (lc["c"], lc["closed"] or 0))
 
     rows = con.execute("SELECT kind, COUNT(*) c FROM event %s GROUP BY kind "
                        "ORDER BY c DESC" % cond, params).fetchall()
@@ -1162,7 +1239,7 @@ def cli_stats(con, cfg, root, lid, sid, argv):
             if key == "rule" and r["targets"] > 1:
                 bits += ", 대상 %d종" % r["targets"]
             if r["loops"] > 1:
-                bits += " ← %d개 루프에서 반복" % r["loops"]
+                bits += " ← %d개 작업에서 반복" % r["loops"]
             print("  %-24s %s" % (r["k"][:24], bits))
     print("\n상세 조회: `harness recall <키워드|경로>`")
     return 0
@@ -1238,7 +1315,7 @@ def cli_loop(con, cfg, root, lid, sid, argv):
             nlid = create_loop(con, cfg, root, intent)
             if intent:
                 record_evidence(con, nlid, cfg["stages"][0]["id"], "intent_set", intent)
-        print("루프 %s 종료 → 새 루프 %s, 단계 %s"
+        print("작업 %s 종료 → 새 작업 %s, 단계 %s"
               % (lid, nlid, label_of(cfg, cfg["stages"][0]["id"])))
         return 0
     if sub == "intent":
@@ -1250,7 +1327,7 @@ def cli_loop(con, cfg, root, lid, sid, argv):
             con.execute("UPDATE loop SET intent=? WHERE id=?", (text, lid))
             # Scaffolding 의 종료 조건. 작업을 기록하지 않으면 단계를 넘어갈 수 없다.
             record_evidence(con, lid, sid, "intent_set", text)
-        print("루프 %s 의 작업: %s" % (lid, text))
+        print("작업 %s 의 내용: %s" % (lid, text))
         print("Context 단계의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다.")
         return 0
     if sub == "adopt":
@@ -1261,7 +1338,7 @@ def cli_loop(con, cfg, root, lid, sid, argv):
         with con:
             close_loop(con, lid)
             create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
-        print("루프 %s 재연결(사용자 승인). 단계는 1단계부터 다시 추적한다." % want)
+        print("작업 %s 재연결(사용자 승인). 단계는 1단계부터 다시 추적한다." % want)
         return 0
     row = con.execute("SELECT * FROM loop WHERE id=?", (lid,)).fetchone()
     print("loop %s · branch %s · created %s"
@@ -1418,17 +1495,21 @@ def cli_init(argv):
         print("  + %s" % c)
     if not created:
         print("  (변경 없음 — 이미 설치되어 있다)")
-    print("활성 루프: %s" % lid)
+    print("활성 작업: %s" % lid)
     print("커밋 대상: .claude/harness/{POLICY.md,stages.json,rationale.md}, CLAUDE.md")
     return 0
 
 
-USAGE = """step-six-harness — 6단계 작업 하네스 (Scaffolding → Context → Planning →
-                                Execution → Verification → Compounding)
+USAGE = """step-six-harness — 작업 하네스
+
+  0 Selection → 1 Scaffolding → 2 Context → 3 Planning
+              → 4 Execution → 5 Verification → 6 Compounding
+                                   ├─ 작업 끝    → 0 Selection
+                                   └─ 회차 계속  → 1 Scaffolding
 
 현재 상태
-  status                       현재 루프·단계·종료 조건·증거·스킵 기록·예외
-  loop                         루프 해시(= .dev/ 파일명 접두사)와 브랜치
+  status                       현재 작업·회차·단계·종료 조건·증거·스킵 기록·예외
+  loop                         작업 해시와 브랜치 (.dev/ 파일명 접두사는 해시-회차)
 
 과거 기록 조회 (Context 단계에서 쓴다)
   recall [키워드|경로 ...] [--kind K] [--rule R]
@@ -1438,6 +1519,8 @@ USAGE = """step-six-harness — 6단계 작업 하네스 (Scaffolding → Contex
 
 단계 진행
   advance                      다음 단계로. 종료 조건이 남으면 거부하고 무엇이 남았는지 알려준다
+  advance --done               (Compounding 에서만) 작업 종료 → Selection 으로
+  advance --cycle              (Compounding 에서만) 다음 회차 → Scaffolding 으로, 같은 작업 유지
   skip <대상> --reason "..."    단계 건너뛰기 ✋
                                대상: <stage-id> | +N (N단계 전진) | until:<stage-id>
   approve-plan <file>          계획에 대한 사람의 승인 기록 ✋

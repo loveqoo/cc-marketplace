@@ -1,10 +1,10 @@
 ---
-description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md에 앵커 1줄을 추가하고 .claude/harness/ 에 원칙·규칙·상태 파일을 만든다. "하네스 설치", "6단계 원칙 적용", "harness init" 요청 시 사용.
+description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md에 앵커 1줄을 추가하고 .claude/harness/ 에 원칙·규칙·상태 파일을 만든다. "하네스 설치", "작업 원칙 적용", "6단계 원칙 적용", "harness init" 요청 시 사용.
 ---
 
 # 하네스 설치
 
-이 프로젝트에 6단계 작업 원칙 하네스를 설치한다.
+이 프로젝트에 작업 원칙 하네스(0 Selection → 1~6 → 두 갈래)를 설치한다.
 
 ## 절차
 
@@ -20,7 +20,7 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
    | 경로 | 커밋 | 내용 |
    | --- | --- | --- |
    | `CLAUDE.md` | ✅ | `@.claude/harness/POLICY.md` 앵커 **1줄만** 추가 (기존 내용 보존) |
-   | `.claude/harness/POLICY.md` | ✅ | 6단계 원칙 요약 — 매 세션 로드됨 |
+   | `.claude/harness/POLICY.md` | ✅ | 작업 원칙 요약 — 매 세션 로드됨 |
    | `.claude/harness/rationale.md` | ✅ | 상세 근거 — 필요할 때만 읽힘 |
    | `.claude/harness/stages.json` | ✅ | 단계 정의·폴더 규칙의 단일 출처 |
    | `.claude/harness/harness.db` | ❌ | SQLite 런타임 상태 — 해시 발급 + 현재 단계. gitignore 등록됨 |
@@ -43,20 +43,20 @@ description: 현재 프로젝트에 step-six-harness를 설치한다. CLAUDE.md�
    | --- | --- | --- |
    | PreToolUse·Stop 훅 (차단) | ✅ `/reload-plugins` 후 동작 | ✅ |
    | SessionStart 주입 (현재 단계·제어 명령) | ❌ 이미 지난 이벤트 | ✅ |
-   | `CLAUDE.md` → `POLICY.md` (6단계 원칙) | ❌ **로드되지 않음** | ✅ |
+   | `CLAUDE.md` → `POLICY.md` (작업 원칙) | ❌ **로드되지 않음** | ✅ |
 
    `CLAUDE.md` 는 세션 시작 시점에 로드된다. 설치 중에 추가한 앵커는 그 세션에서
    읽히지 않고, **`/reload-plugins` 는 플러그인만 다시 읽고 CLAUDE.md 는 다시 읽지 않는다.**
-   그 상태로 작업하면 차단은 걸리는데 모델이 이유(6단계 원칙)를 모르는 최악의 조합이 된다.
+   그 상태로 작업하면 차단은 걸리는데 모델이 이유(작업 원칙)를 모르는 최악의 조합이 된다.
 
    그래서 안내는 이렇게 한다:
 
    > 설치가 끝났다. **새 세션을 시작해야 원칙 문서가 로드된다.** 지금 세션에서 계속하면
-   > 차단은 걸리지만 모델이 6단계 원칙을 알지 못한다.
+   > 차단은 걸리지만 모델이 작업 원칙을 알지 못한다.
 
 6. 새 세션에서 다음을 확인하라고 안내한다.
-   - `.claude/harness/bin/harness status` — 루프 해시·단계·작업이 보이는가
-   - 응답 말머리에 `[Scaffolding]` 이 자동으로 붙는가 (붙으면 SessionStart 주입이 들어온 것)
+   - `.claude/harness/bin/harness status` — 작업 해시·회차·단계가 보이는가
+   - 응답 말머리에 `[Selection]` 이 자동으로 붙는가 (붙으면 SessionStart 주입이 들어온 것)
    - `/context` 의 Memory files 에 `CLAUDE.md` 가 있는가 (앵커가 로드된 것)
 
 ## 주의

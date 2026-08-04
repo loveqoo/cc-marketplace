@@ -1,6 +1,5 @@
 {
-  "version": 1,
-  "prefix_format": "[{index}/6 {label}]",
+  "version": 2,
   "path_classes": {
     "docs": ["docs/**"],
     "dev": [".dev/**"],
@@ -36,19 +35,29 @@
   },
   "stages": [
     {
+      "id": "selection",
+      "label": "Selection",
+      "skippable": false,
+      "summary": "이번에 할 작업을 정한다. 필요하면 작업 후보를 나열해 사용자와 합의한다(선택).",
+      "hint": "작업이 불분명하면 후보를 나열해 사용자와 합의하라(선택 — 이미 명확하면 건너뛴다). 정해지면 `harness loop intent \"<작업>\"` 으로 기록하라. 기록하지 않으면 이 단계를 끝낼 수 없고, Context 의 `harness recall` 도 무엇을 당겨올지 알 수 없다. 후보 목록을 남기려면 `.dev/plan/` 에 쓴다.",
+      "write": ["dev"],
+      "exit_criteria": ["intent_set"],
+      "stop_requires": []
+    },
+    {
       "id": "scaffolding",
       "label": "Scaffolding",
-      "summary": "① 이번에 할 작업을 정해 기록한다(필수). ② 그 작업에 맞는 구조인지 확인하고, 어긋나면 지금 바꾼다(조건부 — 신규 최상위 폴더는 이 단계에서만 만들 수 있다).",
-      "hint": "먼저 작업을 정한다. 이전 작업이 끝났다면 새 작업을 할당하고, 무엇을 할지 불분명하면 후보를 나열해 사용자와 합의한다(선택). 정해지면 `harness loop intent \"<작업>\"` 으로 기록하라 — 이걸 기록하지 않으면 이 단계를 끝낼 수 없고, Context 의 `harness recall` 도 무엇을 당겨올지 알 수 없다. 그 다음 구조를 점검한다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다.",
+      "summary": "이 작업에 맞는 구조인지 확인하고, 어긋나면 지금 바꾼다. 역할별 폴더링. 신규 최상위 폴더는 이 단계에서만 만들 수 있다.",
+      "hint": "대부분의 회차에서는 바꿀 것이 없고, 그게 정상이다. 반복되는 실수를 구조나 훅으로 막을지는 `harness stats` 로 판단한다.",
       "write": ["source", "tests", "context", "dev"],
-      "exit_criteria": ["intent_set"],
+      "exit_criteria": [],
       "stop_requires": []
     },
     {
       "id": "context",
       "label": "Context",
       "summary": "유저/프로젝트/폴더 스코프로 계층 기록. 전부 싣지 말고 '이럴 때 이걸 봐라'로 유도.",
-      "hint": "과거 실수·회고 조회: `harness recall <키워드|경로>`. Scaffolding 에서 정한 task 와 관련된 것만 골라 읽어라 — 무관한 과거 실수까지 읽지 마라.",
+      "hint": "과거 실수·회고 조회: `harness recall <키워드|경로>`. Selection 에서 정한 작업과 관련된 것만 골라 읽어라 — 무관한 과거 실수까지 읽지 마라.",
       "write": ["context", "dev"],
       "exit_criteria": [],
       "stop_requires": []
@@ -57,6 +66,7 @@
       "id": "planning",
       "label": "Planning",
       "summary": "모호한 지점을 질문으로 끌어내고 계획을 파일로 떨군다. 인간 검토·승인 후 실행.",
+      "hint": "계획을 다른 모델이나 서브에이전트에게 적대적으로 검토받는 것을 고려하라(권고 — 강제하지 않는다). 이 환경에 codex·antigravity 플러그인과 서브에이전트가 있다. 사용자가 원하면 여러 모델에 돌린다.",
       "write": ["dev", "context"],
       "exit_criteria": ["plan_file", "plan_approved"],
       "stop_requires": []
@@ -73,6 +83,7 @@
       "id": "verification",
       "label": "Verification",
       "summary": "완료 조건 대조. 자기검증 회피 — 서브에이전트/타 모델/브라우저/dry-run.",
+      "hint": "검증 결과도 적대적으로 재검토받는 것을 고려하라(권고). 사용자가 원하면 여러 모델에 돌린다.",
       "write": ["tests", "dev"],
       "exit_criteria": ["verification_evidence"],
       "stop_requires": ["verification_evidence"]
@@ -81,8 +92,8 @@
       "id": "compounding",
       "label": "Compounding",
       "skippable": false,
-      "summary": "회고를 기록. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
-      "hint": "여러 루프에서 반복된 항목은 `harness stats` 로 확인하고, 스킬·훅 승격이나 stages.json 수정을 논의하라. 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
+      "summary": "회고를 기록하고, 작업이 끝났는지 스스로 판단한다. 반복되면 스킬/커맨드로, 같은 실수면 훅으로 승격 논의.",
+      "hint": "회고를 쓴 뒤 두 갈래 중 하나를 고른다. 작업이 끝났으면 `harness advance --done` (Selection 으로 돌아가 새 작업을 정한다). 후속 회차가 남았으면 `harness advance --cycle` (Scaffolding 부터 다시, 같은 작업 유지). 판단은 자율이다. 반복 항목은 `harness stats` 로 확인하라 — 기록만 하고 승격하지 않으면 복리가 아니라 일기다.",
       "write": ["dev", "context", "tests"],
       "exit_criteria": ["retro_file"],
       "stop_requires": ["retro_file"]
