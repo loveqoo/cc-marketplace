@@ -108,6 +108,29 @@ claude
 > /reload-plugins
 ```
 
+> ⚠️ **로컬 디렉터리로 등록한 마켓플레이스는 개발 중에만 쓰십시오.**
+> `directory` 소스는 플러그인 코드(훅 포함)를 그 로컬 경로에서 직접 읽으므로,
+> 그 디렉터리를 Claude Code 가 신뢰하지 않으면 **새 세션에서 플러그인이 미설치로
+> 보입니다.** 사용자 스코프로 설치해도 마찬가지입니다 — 스코프는 "어디서 쓸 수
+> 있나"를 정할 뿐 "코드를 어디서 읽나"를 바꾸지 않습니다.
+>
+> 실제로 이 저장소에서 겪은 문제이고, 원인을 찾는 데 오래 걸렸습니다.
+> 테스트가 끝나면 되돌리십시오.
+>
+> ```bash
+> /plugin marketplace remove <name>
+> /plugin marketplace add <owner>/<repo>     # git 소스
+> ```
+>
+> 등록 형태는 이렇게 확인합니다 — `"source": "git"` 이어야 합니다.
+>
+> ```bash
+> python3 -c "
+> import json,os
+> d=json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json')))
+> print({k:(v.get('source') or {}).get('source') for k,v in d.items()})"
+> ```
+
 ---
 
 MIT · [loveqoo](https://github.com/loveqoo)
