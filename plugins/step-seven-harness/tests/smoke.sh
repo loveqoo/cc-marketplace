@@ -1757,6 +1757,117 @@ check "사용자 패턴이 기본값을 대체한다 (병합이 아니다)" '검
   "$(ow verify -- make check 2>&1)"
 rm -rf "$VW" "$VW2" "$PW" "$OW"
 
+echo "== 어휘를 설정으로 옮기면 오타가 새로운 실패 방식이 된다"
+# 어휘화가 넓힌 표면이다. 이 실패들은 전부 **조용했다** — 직접 돌려 확인했다.
+#   satisfied_by 오타  → 파일 검사가 말없이 꺼짐
+#   panels 오타        → 아무것도 안 함
+#   없는 조건 참조      → 채울 방법이 없는 단계
+# 막지는 않는다. 설정이 조금 틀렸다고 세션을 벽돌로 만들면 그게 더 나쁘다. 말한다.
+CW="$(mktemp -d)"
+(cd "$CW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+cw() { (cd "$CW" && python3 "$ENGINE" "$@"); }
+cwed() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$CW/.claude/harness/stages.json" "$1"; }
+
+check_empty "정상 설정에는 아무 말도 하지 않는다" \
+  "$(cw status 2>&1 | grep '무시되는 설정' || true)"
+cwed 'cfg["criteria"]["plan_file"]["satisfied_by"] = "fille"'
+check "satisfied_by 오타를 지적한다" "satisfied_by='fille'" "$(cw status 2>&1)"
+check "무슨 값이 가능한지 알려준다" 'no_pending_promotions' "$(cw status 2>&1)"
+check "무엇이 일어나는지 알려준다" 'cli 로 떨어진다' "$(cw status 2>&1)"
+check "맨 위에 말한다 (묻히면 안 읽는다)" '^⚠' "$(cw status 2>&1 | head -1)"
+cwed 'cfg["criteria"]["plan_file"]["satisfied_by"] = "file"; cfg["criteria"]["plan_file"].pop("write_glob")'
+check "file 인데 write_glob 이 없으면 지적한다" '어떤 파일도 이 조건을 채우지 못한다' \
+  "$(cw status 2>&1)"
+cwed 'cfg["stages"][0]["panels"] = ["work_candidatez"]'
+check "패널 오타를 지적한다" "'work_candidatez' 는 모르는 패널" "$(cw status 2>&1)"
+check "가능한 패널을 알려준다" 'work_candidates' "$(cw status 2>&1)"
+cwed 'cfg["stages"][1]["exit_criteria"] = ["nonexistent_thing"]'
+check "criteria 에 없는 조건을 지적한다" '채울 방법이 없어' "$(cw status 2>&1)"
+check "--json 에도 실린다" 'config_problems' "$(cw status --json 2>&1)"
+check "세션 시작에서 사람에게 알린다" '무시되는 설정' \
+  "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$CW" \
+     | CLAUDE_PROJECT_DIR="$CW" python3 "$ENGINE" hook)"
+
+echo "== 어휘 안에서 덜어낸 것은 되살리지 않는다"
+# "마찰이 크면 stages.json 에서 덜어낸다"가 이 하네스의 작업 방식이다. 템플릿 채움이
+# 항목 단위로 병합하면 지운 것이 되살아나 그 자유를 빼앗는다. 영역이 통째로 없을 때만 채운다.
+RW="$(mktemp -d)"
+(cd "$RW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+rw() { (cd "$RW" && python3 "$ENGINE" "$@"); }
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+del cfg['criteria']['plan_approved']          # 사람 승인 단계를 안 쓰겠다
+for st in cfg['stages']:
+    if st['id'] == 'planning':
+        st['exit_criteria'] = [x for x in st['exit_criteria'] if x != 'plan_approved']
+        st['stop_requires'] = [x for x in st['stop_requires'] if x != 'plan_approved']
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$RW/.claude/harness/stages.json"
+check_empty "덜어낸 것을 문제라고 하지 않는다" \
+  "$(rw status 2>&1 | grep '무시되는 설정' || true)"
+rw init >/dev/null 2>&1
+check "다시 init 해도 지운 항목이 부활하지 않는다" '^False$' \
+  "$(python3 -c "
+import json, sys
+c = json.load(open(sys.argv[1], encoding='utf-8'))
+print('plan_approved' in c['criteria'])" "$RW/.claude/harness/stages.json")"
+rw loop intent "덜어낸 어휘" >/dev/null
+rw loop done-when "끝" >/dev/null
+rw advance >/dev/null; rw advance >/dev/null; rw advance >/dev/null
+RPRE="$(rw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$RW/.dev/plan"; printf '#\n' > "$RW/.dev/plan/${RPRE}p.md"
+check "승인 조건을 덜어냈으면 계획 파일만으로 닫힌다" 'Execution' "$(rw advance 2>&1)"
+rm -rf "$RW"
+
+echo "== 손상된 stages.json 은 템플릿으로 갈아치우지 않는다"
+# 갈아치우면 사용자가 **덜어낸 규칙이 말없이 되살아나고** 이유 모를 차단만 남는다.
+# 없는 것(설치 전)과 깨진 것은 다르다.
+BW="$(mktemp -d)"
+(cd "$BW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+echo 'not json at all {' > "$BW/.claude/harness/stages.json"
+# set -e 아래에서는 `cmd; RC=$?` 가 통하지 않는다 — 실패한 순간 스크립트가 죽는다.
+(cd "$BW" && python3 "$ENGINE" status >/dev/null 2>&1) && BRC=0 || BRC=$?
+check "CLI 는 크게 실패한다 (exit 1)" '^1$' "$BRC"
+check "무엇이 깨졌는지 말한다" '손상' "$( (cd "$BW" && python3 "$ENGINE" status 2>&1) )"
+BH="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$BW" "$BW" | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook 2>&1)"
+check_empty "훅은 차단하지 않는다 (세션을 벽돌로 만들지 않는다)" "$BH"
+printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$BW" "$BW" \
+  | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook >/dev/null 2>&1 && BRC2=0 || BRC2=$?
+check "훅 종료 코드도 0" '^0$' "$BRC2"
+# 조용히 꺼지지도 않아야 한다 — 게이트가 사라진 것을 모르면 그게 최악이다
+check "세션 시작에서 비활성 사실을 알린다" '비활성 상태' \
+  "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$BW" \
+     | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook)"
+check "되돌리는 방법을 준다" 'git checkout' \
+  "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$BW" \
+     | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook)"
+
+echo "== skip 도 advance 와 같은 판정을 쓴다"
+# 0.30.0 에서 파일 판정을 넣을 때 skip 경로를 안 맞췄다. 그래서 계획 파일이 디스크에
+# 있는데도 "계획 파일을 남겨야 한다"고 거부했다 — 이미 한 일을 하라는 말이고
+# 빠져나갈 길이 없다. 직접 돌려 확인한 함정이다.
+KW="$(mktemp -d)"
+(cd "$KW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+kw() { (cd "$KW" && python3 "$ENGINE" "$@"); }
+kw loop intent "스킵 대조" >/dev/null
+kw loop done-when "끝" >/dev/null
+kw advance >/dev/null; kw advance >/dev/null; kw advance >/dev/null
+check "계획 파일이 없으면 skip 도 거부한다" '기록은 남겨야 한다' \
+  "$(kw skip planning --reason '구조 선행' 2>&1)"
+KPRE="$(kw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$KW/.dev/plan"; printf '# 계획\n' > "$KW/.dev/plan/${KPRE}plan.md"
+check "관측 없이 파일만 있으면 skip 이 통과한다" '스킵(사용자 승인)' \
+  "$(kw skip planning --reason '구조 선행' 2>&1)"
+rm -rf "$CW" "$BW" "$KW"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

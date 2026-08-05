@@ -270,7 +270,13 @@ def load_config(root, plugin_root_dir=None):
     지운 것이 되살아나 그 자유를 빼앗는다. 그래서 영역이 통째로 없을 때만 채우고,
     비워 둔 것(`[]`, `{}`)은 비운 대로 존중한다.
     """
-    cfg = jload(os.path.join(root, CONFIG_REL))
+    path = os.path.join(root, CONFIG_REL)
+    cfg = jload(path)
+    # **있는데 못 읽는 것과 없는 것은 다르다.** 손상된 문서를 템플릿으로 갈아치우면
+    # 사용자가 덜어낸 규칙이 말없이 되살아나고, 그 사람은 이유 모를 차단만 본다.
+    # 없으면(설치 전) 템플릿을 쓰고, 깨졌으면 그대로 알린다.
+    if cfg is None and os.path.exists(path):
+        return None
     tpl_dir = plugin_root_dir or plugin_root()
     tpl = jload(os.path.join(tpl_dir, "templates", "stages.json"))
     if cfg is None:
@@ -305,6 +311,56 @@ def _adopt_evidence_signals(cfg):
         target = crit.setdefault(kind, {"satisfied_by": "cli"})
         if isinstance(target, dict):
             target.update(sig)
+
+
+SATISFIED_BY = ("cli", "file", "observed", "no_pending_promotions")
+
+
+def config_problems(cfg):
+    """설정의 **오타**를 찾는다. 규칙 위반이 아니라 어휘 오류만 본다.
+
+    왜 필요한가: 어휘를 설정으로 옮기면 오타가 새로운 실패 방식이 된다. 그리고 그
+    실패는 조용하다 — `satisfied_by: "fille"` 은 파일 검사를 말없이 끄고,
+    `panels: ["work_candidatez"]` 는 아무것도 하지 않는다. 사용자는 자기가 설정한
+    것이 동작한다고 믿는다. 게이트가 조용히 어긋나는 것은 이 하네스가 반복해서
+    잡아온 부류이고, 어휘화로 그 표면을 넓혔으니 함께 막아야 한다.
+
+    막지는 않는다 — 설정이 조금 틀렸다고 세션을 벽돌로 만들면 그게 더 나쁘다.
+    무엇이 무시되고 있는지 **말한다.**
+    """
+    out = []
+    crit = cfg.obj("criteria")
+    for name, spec in sorted(crit.items()):
+        if not isinstance(spec, dict):
+            out.append("criteria.%s 가 객체가 아니다 — 이 조건은 무시된다" % name)
+            continue
+        how = spec.get("satisfied_by")
+        if how is None:
+            out.append("criteria.%s 에 satisfied_by 가 없다 — cli 로 간주한다" % name)
+        elif how not in SATISFIED_BY:
+            out.append("criteria.%s.satisfied_by='%s' 는 모르는 값이다 (%s 중 하나) "
+                       "— 판정이 cli 로 떨어진다"
+                       % (name, how, "/".join(SATISFIED_BY)))
+        if how == "file" and not spec.get("write_glob"):
+            out.append("criteria.%s 는 satisfied_by=file 인데 write_glob 이 없다 "
+                       "— 어떤 파일도 이 조건을 채우지 못한다" % name)
+    known = set(crit)
+    for st in cfg.get("stages") or []:
+        if not isinstance(st, dict):
+            continue
+        sid = st.get("id", "?")
+        for field in ("exit_criteria", "stop_requires", "skip_requires"):
+            for k in st.get(field) or []:
+                if k not in known:
+                    out.append("stages[%s].%s 의 '%s' 가 criteria 에 없다 "
+                               "— 채울 방법이 없어 이 단계를 끝낼 수 없다"
+                               % (sid, field, k))
+        for p in st.get("panels") or []:
+            if p not in PANELS:
+                out.append("stages[%s].panels 의 '%s' 는 모르는 패널이다 (%s 중 하나) "
+                           "— 조용히 무시된다"
+                           % (sid, p, "/".join(sorted(PANELS))))
+    return out
 
 
 def stage_ids(cfg):
@@ -1303,8 +1359,15 @@ def hook_session_start(inp, ctx):
         lines.append("승격 결정 대기 %d개 (%s) — Compounding 의 종료 조건이다. "
                      "`harness promote` 로 결정하라."
                      % (len(pend), ", ".join(it["key"] for it in pend)))
-    emit({"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                 "additionalContext": "\n".join(lines)}})
+    out = {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                  "additionalContext": "\n".join(lines)}}
+    # 설정 오타는 **사람에게** 알린다. 모델에게 컨텍스트로 주면 모델이 고치려 들고,
+    # stages.json 은 사람의 문서다. 조용히 무시되는 설정이 있다는 사실 자체가 정보다.
+    probs = config_problems(cfg)
+    if probs:
+        out["systemMessage"] = ("harness: stages.json 에서 무시되는 설정이 %d건 있다\n  - %s"
+                                % (len(probs), "\n  - ".join(probs[:5])))
+    emit(out)
 
 
 def auto_skip_state(con):
@@ -1979,7 +2042,18 @@ def run_hook():
             return 0
         cfg = load_config(root, plugin_root())
         if not isinstance(cfg, dict) or not cfg.get("stages"):
-            return 0  # 설정이 깨졌으면 차단하지 않는다
+            # 차단하지는 않는다. 다만 **조용히 꺼지지도 않는다** — 설정이 깨진 채로
+            # 하네스가 없는 것처럼 동작하면 사용자는 게이트가 사라진 것을 모른다.
+            # 손상된 문서를 템플릿으로 갈아치우는 것도 답이 아니다(덜어낸 규칙이
+            # 되살아난다). 그래서 끄고, 끈 사실을 세션 시작에 말한다.
+            if inp.get("hook_event_name") == "SessionStart":
+                emit({"systemMessage":
+                      "harness: `%s` 를 읽을 수 없어 하네스가 비활성 상태다. "
+                      "JSON 문법을 확인하라 — 고치기 전까지 어떤 게이트도 동작하지 "
+                      "않는다. 되돌리려면 `git checkout -- %s` 또는 그 파일을 지우고 "
+                      "`.claude/harness/bin/harness init`."
+                      % (CONFIG_REL, CONFIG_REL)})
+            return 0
         lid = head_loop(con)
         sid = active_stage(con, lid) if lid else None
         if not lid or not sid:
@@ -2149,6 +2223,12 @@ def status_report(ctx):
 
 
 def render_status(d, cfg):
+    # 무시되는 설정이 있으면 **맨 위**에 말한다. 아래에 묻으면 안 읽는다.
+    if d.get("config_problems"):
+        print("⚠ stages.json 에서 무시되는 설정 %d건:" % len(d["config_problems"]))
+        for p in d["config_problems"]:
+            print("  - %s" % p)
+        print()
     print("작업 %s · 회차 %d · 단계 %s" % (d["loop"], d["cycle"], d["stage_label"]))
     if d["intent"]:
         print("  작업 내용: %s" % d["intent"])
@@ -2193,6 +2273,9 @@ def render_status(d, cfg):
 
 def cli_status(ctx, argv):
     data = status_report(ctx)
+    probs = config_problems(ctx.cfg)
+    if probs:
+        data["config_problems"] = probs
     dump_json(data) if "--json" in argv else render_status(data, ctx.cfg)
     return 0
 
@@ -2468,7 +2551,10 @@ def cli_skip(ctx, argv):
     for i in range(cur, dest + 1):
         st = cfg["stages"][i]
         for key in st.get("skip_requires", []):
-            if not has_evidence(con, lid, key):
+            # advance 와 **같은 판정**을 써야 한다. has_evidence 만 보면 계획 파일이
+            # 디스크에 있는데도 "계획 파일을 남겨야 한다"고 거부한다 — 이미 한 일을
+            # 하라는 말이고, 사용자는 빠져나갈 길이 없다. 실제로 그렇게 막혔다.
+            if not criterion_met(con, cfg, root, lid, key):
                 print("%s 를 건너뛰더라도 기록은 남겨야 한다: %s"
                       % (st["label"], criterion_help(cfg, key)))
                 print("먼저 그 기록을 남긴 뒤 다시 시도하라. 승인만 면제된다.")
