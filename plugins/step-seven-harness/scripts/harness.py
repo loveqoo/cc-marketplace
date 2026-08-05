@@ -3430,7 +3430,19 @@ def cli_init(argv):
 
     created += install_gitignore(root)
     created += install_anchors(root)
-    render_init(root, created, lid)
+    label = None
+    try:
+        con2 = connect(root)
+        if con2 is not None:
+            try:
+                sid2 = active_stage(con2, lid)
+                if sid2:
+                    label = label_of(load_config(root, pr), sid2)
+            finally:
+                con2.close()
+    except Exception:
+        pass
+    render_init(root, created, lid, label)
     return 0
 
 
@@ -3476,13 +3488,16 @@ def render_promote(d):
                      (r["note"] or "-")[:40]))
 
 
-def render_init(root, created, lid):
+def render_init(root, created, lid, stage_label=None):
     print("하네스 설치 완료: %s" % root)
     for c in created:
         print("  + %s" % c)
     if not created:
         print("  (변경 없음 — 이미 설치되어 있다)")
-    print("활성 작업: %s" % lid)
+    # 단계를 **여기서** 말한다. 문서에 적어두면 단계 구성이 바뀔 때 뒤처지고,
+    # 모델은 그 낡은 문장을 정확히 따라 틀린 말을 한다 — 실제로 그렇게 됐다
+    # (0.10.0 에서 Selection 을 신설한 뒤에도 스킬 문서가 `1/6 Scaffolding` 이었다).
+    print("활성 작업: %s%s" % (lid, " · 단계 %s" % stage_label if stage_label else ""))
     print("커밋 대상: .claude/harness/{POLICY.md,LEARNED.md,stages.json,rationale.md}, "
           "CLAUDE.md")
 

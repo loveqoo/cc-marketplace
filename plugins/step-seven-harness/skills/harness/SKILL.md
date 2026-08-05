@@ -229,7 +229,7 @@ Scaffolding 이 불완전했다는 증거**다. 자식 루프로 감싸면 그 �
 
 - 모든 답변 말머리에 현재 단계 이름을 붙인다 — `[Selection]` `[Scaffolding]` `[Context]`
   `[Planning]` `[Execution]` `[Verification]` `[Compounding]`. 없으면 턴 종료가 차단된다.
-  대소문자는 무시된다(`[compounding]` 도 통과). **번호는 붙이지 않는다** — `[6/7 Compounding]`
+  대소문자는 무시된다(`[compounding]` 도 통과). **번호는 붙이지 않는다** — `[7/7 Compounding]`
   은 차단된다. 번호는 이름에서 도출되는 중복 정보다.
 - `.dev/` 산출물 파일명은 `<작업해시>-<회차>-` 로 시작해야 한다: `.dev/plan/260804-a3f9c1-1-이름.md`.
   `scratch/` 만 예외다. 접두사는 `status` 로 확인한다.
