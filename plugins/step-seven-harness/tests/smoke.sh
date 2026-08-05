@@ -1508,6 +1508,12 @@ PYP
 )"
 check "_bucket n=0..40 라벨·분할·연속성" '실패: 없음' "$POUT"
 
+echo "== settings.json 안전 쓰기 (남의 설정을 덮지 않는다)"
+SOUT="$(python3 "$(dirname "$0")/settings_check.py" "$MC" 2>&1)"; SRC2=$?
+check "남의 설정을 덮지 않는다" '^0$' "$SRC2"
+check "경쟁 쓰기 검사가 실제로 돌았다" '경쟁 쓰기가 있어도' "$SOUT"
+if [ "$SRC2" != 0 ]; then printf '%s\n' "$SOUT" | grep FAIL | sed 's/^/     /'; fi
+
 echo "== 문서 구조 (중복·링크)"
 DOUT="$(python3 "$(dirname "$0")/doc_check.py" "$MC" 2>&1)"; DRC=$?
 check "문서에 산문 중복·깨진 링크가 없다" '^0$' "$DRC"

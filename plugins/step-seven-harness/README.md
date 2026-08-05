@@ -239,6 +239,7 @@ sh tests/smoke.sh             # 매번 돌립니다 (문서 검사 포함)
 python3 tests/math_check.py   # 측정 산술을 손계산과 대조
 python3 tests/doc_check.py    # 문서의 산문 중복·깨진 링크
 python3 tests/ctx_check.py    # ctx 를 풀지 않고 쓰는 함수 (조용히 죽는 부류)
+python3 tests/settings_check.py  # .claude/settings.json 을 안전하게 쓰는지
 sh tests/init_diff.sh         # 설치 동작이 리팩터 전과 같은지 차등 실행
 ```
 

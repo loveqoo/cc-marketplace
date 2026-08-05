@@ -3255,40 +3255,72 @@ SAFE_PERMS = ["Bash(%s %s)" % (WRAPPER_CMD, c)
     + ["Bash(%s auto-skip status)" % WRAPPER_CMD]
 
 
-def ensure_permissions(root):
+def ensure_permissions(root, tries=3):
     """하네스 조회 명령을 프로젝트 설정에 미리 허용한다.
 
     매번 권한 프롬프트를 요구하면 모델이 조회를 포기하고 파일을 직접 읽는
-    우회로 간다 — 실제 세션에서 관측된 문제다. 반환값은 추가한 규칙 수.
+    우회로 간다 — 실제 세션에서 관측된 문제다.
+
+    **비교-교환으로 쓴다.** 이 파일은 Claude Code 도 쓴다(`enabledPlugins` 등).
+    읽고-고치고-쓰는 사이에 저쪽이 쓰면 우리가 그걸 덮어 없앤다 — 플러그인
+    활성화가 통째로 사라지는 방향이다. 쓰기 직전에 다시 읽어 우리가 읽었던 것과
+    같은지 확인하고, 다르면 새 내용으로 다시 병합한다.
+
+    반환값: 추가한 규칙 수 / 0 = 더할 것 없음 / -1 = 손상되어 건드리지 않음
+            / -2 = 다른 쪽이 계속 쓰고 있어 포기
     """
     path = os.path.join(root, ".claude", "settings.json")
-    data = {}
-    if os.path.isfile(path):
-        data = jload(path)
-        if not isinstance(data, dict):
-            return -1  # 손상된 설정은 건드리지 않는다
-    # 최상위가 dict 인 것만 확인하고 setdefault 를 연달아 호출하면, permissions 가
-    # list/문자열인 정상 JSON 에서 AttributeError 로 init 이 중간에 죽어
-    # 부분 설치 상태를 남긴다. 모양을 단계마다 확인한다.
-    perms = data.get("permissions")
-    if perms is None:
-        perms = data["permissions"] = {}
-    if not isinstance(perms, dict):
-        return -1
-    allow = perms.get("allow")
-    if allow is None:
-        allow = perms["allow"] = []
-    if not isinstance(allow, list):
-        return -1
-    added = [p for p in SAFE_PERMS if p not in allow]
-    if not added:
-        return 0
-    allow.extend(added)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    return len(added)
+
+    def read_raw():
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return False          # 읽을 수 없음 (None 과 구분한다)
+
+    for _ in range(max(1, tries)):
+        raw = read_raw()
+        if raw is False:
+            return -1
+        if raw is None:
+            data = {}
+        else:
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                return -1         # 손상된 설정은 건드리지 않는다
+            if not isinstance(data, dict):
+                return -1
+
+        # 최상위가 dict 인 것만 확인하고 setdefault 를 연달아 호출하면, permissions 가
+        # list/문자열인 정상 JSON 에서 AttributeError 로 init 이 중간에 죽어
+        # 부분 설치 상태를 남긴다. 모양을 단계마다 확인한다.
+        perms = data.get("permissions")
+        if perms is None:
+            perms = data["permissions"] = {}
+        if not isinstance(perms, dict):
+            return -1
+        allow = perms.get("allow")
+        if allow is None:
+            allow = perms["allow"] = []
+        if not isinstance(allow, list):
+            return -1
+        added = [p for p in SAFE_PERMS if p not in allow]
+        if not added:
+            return 0
+        allow.extend(added)
+
+        # 쓰기 직전에 다시 읽는다. 우리가 읽은 뒤 누가 바꿨으면 그 내용으로 다시 한다.
+        if read_raw() != raw:
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        return len(added)
+    return -2
 
 
 # 설치는 여섯 가지 서로 다른 일이다. 한 함수에 154줄로 뭉쳐 있으면 하나가
@@ -3388,6 +3420,10 @@ def cli_init(argv):
     nperm = ensure_permissions(root)
     if nperm > 0:
         created.append(".claude/settings.json (조회 명령 %d개 허용)" % nperm)
+    elif nperm == -2:
+        print("주의: .claude/settings.json 을 다른 쪽이 동시에 쓰고 있어 권한 허용을 "
+              "건너뛰었다. 남의 변경을 덮지 않으려고 포기한 것이다 — `harness init` 을 "
+              "다시 실행하면 된다.", file=sys.stderr)
     elif nperm < 0:
         print("주의: .claude/settings.json 을 읽을 수 없어 권한 허용을 건너뛰었다.",
               file=sys.stderr)
