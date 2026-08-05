@@ -1387,7 +1387,7 @@ import sys; sys.path.insert(0, sys.argv[2])
 import harness as h
 root = sys.argv[1]; con = h.connect(root)
 cfg = h.load_config(root, None)
-print(",".join(h.exit_blockers(con, cfg, h.head_loop(con), "planning")))
+print(",".join(h.exit_blockers(con, cfg, root, h.head_loop(con), "planning")))
 PYE
 )"
 check "관측만으로 게이트가 열리지 않는다" '^0$' \
@@ -1520,6 +1520,123 @@ check "문서에 산문 중복·깨진 링크가 없다" '^0$' "$DRC"
 check "검사가 실제로 문서를 읽었다" '산문' "$DOUT"
 if [ "$DRC" != 0 ]; then printf '%s\n' "$DOUT" | tail -6 | sed 's/^/     /'; fi
 
+
+echo "== 훅 없이도 게이트가 맞는다 (다른 에이전트 도구·사람이 직접 쓴 경우)"
+# 왜: 증거를 PostToolUse 관측에만 의존하면 훅이 없는 환경에서 종료 조건이
+# 영원히 안 채워진다. Codex 는 셸만 가로채고, opencode 는 subagent 를 놓친다.
+# 파일 존재는 관측 없이도 아는 사실이므로 관측을 기다리지 않고 본다.
+FW="$(mktemp -d)"
+(cd "$FW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+fw() { (cd "$FW" && python3 "$ENGINE" "$@"); }
+fmiss() { fw status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))'; }
+fw loop intent "훅 없는 환경" >/dev/null
+fw loop done-when "끝" >/dev/null
+fw advance >/dev/null; fw advance >/dev/null; fw advance >/dev/null
+FPRE="$(fw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$FW/.dev/plan"
+check "계획 파일이 없으면 막는다" 'plan_file' "$(fmiss)"
+# 훅을 거치지 않고 파일만 만든다
+printf '# 계획\n' > "$FW/.dev/plan/${FPRE}plan.md"
+check "관측 없이 파일만 있어도 plan_file 이 선다" '^plan_approved$' "$(fmiss)"
+check "관측된 증거 행은 여전히 0개다" '^0$' \
+  "$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT COUNT(*) FROM evidence WHERE kind='plan_file'\").fetchone()[0])" \
+  "$FW/.claude/harness/harness.db")"
+# 반증 둘. 이 둘이 통과하면 게이트가 사람 없이 열린다.
+rm -f "$FW/.dev/plan/${FPRE}plan.md"
+printf '# 남의 계획\n' > "$FW/.dev/plan/250101-aaaaaa-1-plan.md"
+check "다른 작업·회차의 파일로는 열리지 않는다" 'plan_file' "$(fmiss)"
+rm -f "$FW/.dev/plan/"*.md
+printf '# INDEX\n' > "$FW/.dev/plan/INDEX.md"
+check "누적 인덱스로는 열리지 않는다" 'plan_file' "$(fmiss)"
+rm -f "$FW/.dev/plan/INDEX.md"
+printf '# 계획\n' > "$FW/.dev/plan/${FPRE}plan.md"
+fw approve-plan ".dev/plan/${FPRE}plan.md" >/dev/null
+check_empty "승인은 여전히 사람이 한다" "$(fmiss)"
+
+echo "  -- 회고 파일도 같다"
+fw advance >/dev/null; fw advance >/dev/null       # Execution → Verification
+
+echo "== 실패한 검증은 증거가 아니다"
+# 이것이 왜 버그였나: bash_pattern 은 **명령 문자열만** 봤다. pytest 를 돌려
+# 3개가 깨져도 verification_evidence 가 적립되고 게이트가 열렸다. 실제로 확인했다.
+pfail() { printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"s1","tool_name":"Bash","tool_input":{"command":"pytest tests/"},"tool_response":%s}' "$FW" "$1" \
+  | CLAUDE_PROJECT_DIR="$FW" python3 "$ENGINE" hook; }
+pfail '{"stdout":"3 failed","isError":true}' >/dev/null
+check "isError 면 증거로 세지 않는다" 'verification_evidence' "$(fmiss)"
+pfail '{"stdout":"x","exit_code":1}' >/dev/null
+check "exit_code 가 0 이 아니면 세지 않는다" 'verification_evidence' "$(fmiss)"
+pfail '{"stdout":"x","interrupted":true}' >/dev/null
+check "중단된 명령도 세지 않는다" 'verification_evidence' "$(fmiss)"
+# 정상 경로가 죽지 않았는지가 더 중요하다 — 막기만 하는 검사는 쓸모가 없다
+pfail '{"stdout":"3 passed","isError":false}' >/dev/null
+check_empty "통과한 명령은 여전히 증거가 된다" "$(fmiss)"
+
+echo "== verify: 하네스가 직접 돌려 종료 코드로 판정한다"
+FW2="$(mktemp -d)"
+(cd "$FW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+f2() { (cd "$FW2" && python3 "$ENGINE" "$@"); }
+f2miss() { f2 status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))'; }
+f2 loop intent "verify" >/dev/null
+f2 loop done-when "끝" >/dev/null
+for _ in 1 2 3; do f2 advance >/dev/null 2>&1; done
+F2PRE="$(f2 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$FW2/.dev/plan"; printf '#\n' > "$FW2/.dev/plan/${F2PRE}p.md"
+f2 approve-plan ".dev/plan/${F2PRE}p.md" >/dev/null
+f2 advance >/dev/null; f2 advance >/dev/null
+check "Verification 에 와 있다" 'Verification' \
+  "$(f2 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["stage_label"])')"
+# 임의 명령을 돌리는 셸이 되면 PreToolUse 전체가 무의미해진다
+check "검증 명령이 아니면 거부한다" '검증 명령으로 보이지 않는다' \
+  "$(f2 verify -- rm -rf .claude 2>&1)"
+check "셸 메타문자를 거부한다" '셸 메타문자' \
+  "$(f2 verify -- 'pytest; rm -rf /' 2>&1)"
+check "거부한 뒤에도 증거는 없다" 'verification_evidence' "$(f2miss)"
+# 실패하는 검증
+printf 'check:\n\t@exit 1\n' > "$FW2/Makefile"
+check "실패하면 증거로 기록하지 않는다" '증거로 기록하지 않았다' "$(f2 verify -- make check 2>&1)"
+check "실패 뒤에도 게이트는 닫혀 있다" 'verification_evidence' "$(f2miss)"
+check "실패는 tool_fail 로 적립된다" 'verify' \
+  "$(python3 -c "
+import sqlite3,sys
+r=sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='tool_fail' AND rule='verify'\").fetchone()
+print(r[0] if r else '')" "$FW2/.claude/harness/harness.db")"
+# 통과하는 검증
+printf 'check:\n\t@true\n' > "$FW2/Makefile"
+check "통과하면 증거가 된다" '검증 통과' "$(f2 verify -- make check 2>&1)"
+check_empty "게이트가 열린다" "$(f2miss)"
+check "advance 가 통과한다" 'Compounding' "$(f2 advance 2>&1)"
+rm -rf "$FW" "$FW2"
+
+echo "== AGENTS.md: 훅이 없는 도구도 규칙을 읽는다"
+# AGENTS.md 는 `@import` 를 모른다 — 그건 Claude Code 기능이다. Codex·Cursor·
+# Copilot·Gemini CLI·Aider 는 이 파일을 그냥 마크다운으로 읽으므로, 앵커 한 줄이
+# 아니라 읽고 바로 쓸 수 있는 문장이어야 한다.
+AW="$(mktemp -d)"
+(cd "$AW" && git init -q . && printf '# 내 프로젝트\n\n손으로 쓴 것.\n' > AGENTS.md \
+  && python3 "$ENGINE" init >/dev/null)
+AB="$(cat "$AW/AGENTS.md")"
+check "AGENTS.md 에 절차 안내가 들어간다" 'step-seven-harness -->' "$AB"
+check "원칙 파일을 가리킨다" 'POLICY.md' "$AB"
+check "승격 규칙 파일을 가리킨다" 'LEARNED.md' "$AB"
+check "상태 확인 명령을 준다" 'harness status' "$AB"
+check "진행 명령을 준다" 'harness advance' "$AB"
+check "검증 명령을 준다" 'harness verify' "$AB"
+check "@import 를 쓰지 않는다 (다른 툴은 모른다)" '^0$' \
+  "$(printf '%s' "$AB" | grep -c '^@\.claude')"
+check "사람이 쓴 내용을 보존한다" '손으로 쓴 것' "$AB"
+check "설치 보고에 나온다" 'AGENTS.md' \
+  "$( (cd "$AW" && python3 "$ENGINE" init) )"
+# 두 번 붙으면 다른 툴이 같은 지시를 두 번 읽는다
+(cd "$AW" && python3 "$ENGINE" init >/dev/null)
+check "다시 설치해도 한 번만 붙는다" '^1$' \
+  "$(grep -c 'step-seven-harness -->' "$AW/AGENTS.md")"
+check "커밋 대상으로 안내한다" 'AGENTS.md' \
+  "$( (cd "$AW" && python3 "$ENGINE" init) | grep '커밋 대상')"
+rm -rf "$AW"
 
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"

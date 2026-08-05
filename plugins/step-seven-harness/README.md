@@ -167,6 +167,7 @@ Claude에게 이렇게 말하면 됩니다.
 | 경로 | 누가 쓰나 | 커밋하나 |
 | --- | --- | --- |
 | `CLAUDE.md` | 앵커 2줄만 추가 | ✅ |
+| `AGENTS.md` | 절차 안내 한 블록 추가 — **다른 도구가 읽습니다** | ✅ |
 | `.claude/harness/POLICY.md` | **사람이 정한 원칙.** 고쳐도 됩니다 | ✅ |
 | `.claude/harness/stages.json` | **규칙의 단일 출처.** 마찰이 크면 여기서 덜어냅니다 | ✅ |
 | `.claude/harness/LEARNED.md` | **하네스가 생성합니다.** 손으로 고치지 마십시오 | ✅ |
@@ -178,6 +179,26 @@ Claude에게 이렇게 말하면 됩니다.
 `.dev/` 파일명은 `<작업해시>-<회차>-이름.md` 입니다. 앞단 해시로 `grep` 하면 한 작업의
 산출물이 회차와 무관하게 한자리에 모입니다. `001, 002` 같은 증가 번호를 쓰지 않는 이유는
 워크트리로 병행 작업할 때 서로를 볼 수 없어 충돌하기 때문입니다.
+
+## 다른 도구에서도 쓸 수 있나
+
+절반은 됩니다. 정확히 어느 절반인지 적어 둡니다.
+
+`Claude Code` 의 훅이 없어도 **절차 강제와 증거 판정은 그대로 동작합니다.** `advance` 는
+CLI 명령이라 누가 실행해도 종료 조건이 남아 있으면 거부하고, 계획서·회고 파일은 쓰기를
+관측하지 않고 **디스크를 보고** 확인하며, 검증은 `harness verify -- <명령>` 으로 하네스가
+직접 돌려 종료 코드로 판정합니다. 그래서 Codex·opencode 처럼 파일 쓰기를 가로챌 수 없는
+도구에서도 일곱 단계를 끝까지 돌 수 있습니다. 설치 시 `AGENTS.md` 에 붙는 안내 블록이 그
+도구들에게 이 명령들을 알려줍니다.
+
+되지 않는 것은 **즉시 차단**입니다. 폴더·파일명 규칙과 하네스 자기 잠금은 쓰기 직전에
+막아야 의미가 있고 그건 `PreToolUse` 훅이 필요합니다. 말머리와 턴 이어붙임도 Claude
+전용입니다.
+
+> 왜 더 내려가지 않았나: 쓰기 차단을 `git pre-commit` 이나 OS 샌드박스로 옮기면 도구와
+> 무관해집니다. 대신 차단 시점이 쓰기에서 커밋으로 밀리거나 별도 인프라가 필요해집니다.
+> 그 값을 치를 이유가 생기기 전까지는 옮기지 않았습니다. 근거 문서의
+> **어느 층이 강제하나** 절에 층별 표가 있습니다.
 
 ## 막혔을 때
 
@@ -226,6 +247,7 @@ Claude에게 이렇게 말하면 됩니다.
 ```bash
 .claude/harness/bin/harness status     # 지금 어느 단계이고 무엇이 남았나
 .claude/harness/bin/harness advance    # 다음 단계로
+.claude/harness/bin/harness verify -- pytest   # 검증을 하네스가 직접 돌립니다
 .claude/harness/bin/harness recall     # 이번 작업과 관련된 과거 기록
 .claude/harness/bin/harness metrics    # 복리가 실제로 생기고 있나
 .claude/harness/bin/harness help       # 전체 사용법
@@ -244,7 +266,7 @@ python3 tests/math_check.py   # 측정 산술을 손계산과 대조
 python3 tests/doc_check.py    # 문서의 산문 중복·깨진 링크
 python3 tests/ctx_check.py    # ctx 를 풀지 않고 쓰는 함수 (조용히 죽는 부류)
 python3 tests/settings_check.py  # .claude/settings.json 을 안전하게 쓰는지
-sh tests/init_diff.sh         # 설치 동작이 리팩터 전과 같은지 차등 실행
+sh tests/init_diff.sh         # 설치가 옛 엔진이 만든 것을 잃지 않았는지
 ```
 
 `smoke.sh` 는 출력을 파일로 받아 **종료 코드를 확인하십시오.** 파이프로 넘기면 종료 상태가

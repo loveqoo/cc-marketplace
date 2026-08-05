@@ -860,20 +860,58 @@ def refresh_learned(con, cfg, root):
                             "\n".join(body) + "\n")
 
 
-def exit_blockers(con, cfg, lid, sid):
+def fs_evidence(cfg, root, prefix, kind):
+    """그 산출물이 **디스크에 실제로 있나**. 있으면 상대 경로, 없으면 None.
+
+    증거를 PostToolUse 관측에만 의존하면 훅이 없는 환경에서 조건이 영원히 안
+    채워진다. 훅이 없는 환경은 예외가 아니라 다수다 — 다른 에이전트 도구
+    (Codex 는 셸만 가로챈다), 사람이 직접 쓴 파일, 훅이 실패한 세션.
+    파일 존재는 관측 없이도 알 수 있는 사실이므로 관측을 기다리지 않고 본다.
+
+    이 회차의 접두사를 **요구한다**. 요구하지 않으면 지난 회차의 계획서가
+    이번 회차의 게이트를 열고, 그건 사람 없이 게이트가 열리는 것이다.
+    접두사가 면제된 누적 문서(INDEX.md)도 이 요구에 걸려 제외된다 — 맞다,
+    인덱스는 이번 회차가 무엇을 했다는 증거가 아니다.
+    """
+    if not prefix:
+        return None
+    for pat in cfg.seq("evidence_signals.%s.write_glob" % kind):
+        # 글롭의 앞쪽 리터럴만 떼어 그 디렉터리부터 걷는다. 저장소 전체를 걷지 않는다.
+        base = pat.split("*")[0].rstrip("/")
+        d = os.path.join(root, base)
+        if not os.path.isdir(d):
+            continue
+        for dirpath, _, names in os.walk(d):
+            for n in sorted(names):
+                if not n.startswith(prefix):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, n), root).replace(os.sep, "/")
+                if glob_match(rel, pat):
+                    return rel
+    return None
+
+
+def exit_blockers(con, cfg, root, lid, sid):
     return [k for k in stage_obj(cfg, sid).get("exit_criteria", [])
-            if not criterion_met(con, cfg, lid, k)]
+            if not criterion_met(con, cfg, root, lid, k)]
 
 
-def criterion_met(con, cfg, lid, kind):
+def criterion_met(con, cfg, root, lid, kind):
     """종료 조건 충족 여부.
 
     promotion_decided 는 evidence 행이 아니다 — 프로젝트 전체의 반복 항목에서
     계산되므로, 루프에 증거를 심어두면 다음 회차에 새로 생긴 반복을 놓친다.
+
+    관측된 증거가 없으면 디스크를 본다. 게이트는 **아무도 아무것도 미리
+    실행하지 않아도** 맞아야 한다 — is_regressed 에서 세운 것과 같은 원칙이다.
+    여기서 evidence 행을 새로 쓰지는 않는다. 판정 경로가 쓰기를 하면 훅의
+    트랜잭션 상태에 얹혀 실패할 수 있고, 판정은 매번 다시 하면 되는 계산이다.
     """
     if kind == "promotion_decided":
         return not pending_promotions(con, cfg)
-    return has_evidence(con, lid, kind)
+    if has_evidence(con, lid, kind):
+        return True
+    return fs_evidence(cfg, root, file_prefix(con, lid), kind) is not None
 
 
 CRITERIA_HELP = {
@@ -884,7 +922,9 @@ CRITERIA_HELP = {
     "plan_file": "계획 파일을 .dev/plan/ 아래에 남겨야 한다",
     "plan_approved": "계획에 대한 사람의 승인이 필요하다 (harness approve-plan <file>)",
     "verification_evidence": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, "
-                             "브라우저 확인, dry-run 중 하나를 수행하라",
+                             "브라우저 확인, dry-run 중 하나를 수행하라. 관측이 "
+                             "안 잡히면 `harness verify -- <명령>` 으로 하네스가 "
+                             "직접 돌리게 하라 (통과해야 증거가 된다)",
     "retro_file": "회고를 .dev/retrospect/ 또는 .dev/learning/ 아래에 기록해야 한다",
     "promotion_decided": "여러 작업에서 반복된 항목에 대한 승격 결정이 남았다 — "
                          "`harness promote` 로 목록을 보고 하나씩 결정하라. "
@@ -1563,7 +1603,7 @@ def hook_post_tool_use(inp, ctx):
                         if glob_match(rel, pat):
                             record_evidence(con, lid, sid, kind, rel)
                             break
-        if sid in EVIDENCE_STAGES:
+        if sid in EVIDENCE_STAGES and not tool_failed(inp):
             sig = signals.get("verification_evidence", {})
             if tool == "Bash":
                 pat = sig.get("bash_pattern")
@@ -1576,6 +1616,34 @@ def hook_post_tool_use(inp, ctx):
             tp = sig.get("tool_pattern")
             if tp and re.search(tp, tool):
                 record_evidence(con, lid, sid, "verification_evidence", "tool:" + tool)
+
+
+def tool_failed(inp):
+    """이 도구 호출이 실패했나. 판단이 안 되면 False (실패라고 단정하지 않는다).
+
+    왜 필요한가: `bash_pattern` 은 **명령 문자열만** 봤다. 그래서 `pytest` 를
+    돌려 3개가 깨져도 verification_evidence 가 적립되고 Verification 게이트가
+    열렸다. 실제로 그렇게 통과하는 것을 확인했다. 테스트를 돌린 것과 통과한
+    것은 다른 사실인데 같은 것으로 세고 있었다.
+
+    실패가 PostToolUse 로 오는지 PostToolUseFailure 로만 오는지는 문서에 없다.
+    어느 쪽이든 안전하게 두 곳 다 이 검사를 통과해야 적립된다 — 실패가 저쪽으로
+    간다면 이 검사는 한 번도 걸리지 않을 뿐이고, 이쪽으로 온다면 구멍이 닫힌다.
+    """
+    resp = inp.get("tool_response")
+    if isinstance(resp, dict):
+        if resp.get("isError") or resp.get("interrupted") or resp.get("is_error"):
+            return True
+        code = resp.get("exit_code", resp.get("exitCode"))
+        if isinstance(code, int) and code != 0:
+            return True
+    for key in ("tool_error", "error"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            return True
+        if v is True:
+            return True
+    return False
 
 
 def hook_post_tool_use_failure(inp, ctx):
@@ -1698,7 +1766,7 @@ def hook_stop(inp, ctx):
                 "말머리는 [%s] 여야 한다. 단계 이름만 대괄호로 감싸 맨 앞에 붙여라 "
                 "(번호 병기 불가)." % stage["label"]))
     for key in stage.get("stop_requires", []):
-        if not criterion_met(con, cfg, lid, key):
+        if not criterion_met(con, cfg, root, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"
                              % (stage["label"], CRITERIA_HELP.get(key, key))))
     if not problems:
@@ -1786,7 +1854,8 @@ def continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id):
     # 사람만 채울 수 있는 조건이 남았으면 **밀지 않는다.** 여기서 밀면 모델이
     # 만들 수 없는 것을 만들려 애쓰고, 그 시도가 매번 승인 다이얼로그가 된다.
     # Selection 에 작업이 없는 것은 교착이 아니라 **사람을 기다리는 상태**다.
-    waiting = [k for k in exit_blockers(con, cfg, lid, sid) if k in HUMAN_CRITERIA]
+    waiting = [k for k in exit_blockers(con, cfg, root, lid, sid)
+               if k in HUMAN_CRITERIA]
     if waiting:
         note = ""
         if "intent_set" in waiting:
@@ -1823,7 +1892,7 @@ def continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id):
 
     with con:
         record_event(con, lid, sid, "stop_continue", str(used + 1), prompt_id, fp)
-    missing = exit_blockers(con, cfg, lid, sid)
+    missing = exit_blockers(con, cfg, root, lid, sid)
     todo = ("이 단계의 남은 종료 조건: %s" % ", ".join(missing) if missing
             else "이 단계의 종료 조건은 채웠다 — `harness advance` 로 넘어가라")
     return emit({"decision": "block", "reason": (
@@ -1993,7 +2062,7 @@ def status_report(ctx):
     row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
     rows = stage_rows(con, lid)
     stage = stage_obj(cfg, sid)
-    missing = exit_blockers(con, cfg, lid, sid)
+    missing = exit_blockers(con, cfg, root, lid, sid)
     crit = stage.get("exit_criteria") or []
     return {
         "loop": lid,
@@ -2222,7 +2291,7 @@ def cli_advance(ctx, argv):
                   % stage_obj(cfg, cfg["stages"][1]["id"])["label"])
             return 1
 
-    missing = exit_blockers(con, cfg, lid, sid)
+    missing = exit_blockers(con, cfg, root, lid, sid)
     if missing:
         print("advance 거부 — %s 단계의 종료 조건이 남았다:" % stage_obj(cfg, sid)["label"])
         for k in missing:
@@ -2299,7 +2368,7 @@ def cli_advance(ctx, argv):
 
 def cli_skip(ctx, argv):
     """PreToolUse 가 사람의 승인을 받은 뒤에만 여기까지 온다."""
-    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     pos = argv_positional(argv)
     target = pos[0] if pos else None
     reason = argv_value(argv, "reason")
@@ -2339,7 +2408,7 @@ def cli_skip(ctx, argv):
     skipped = []
     with con:
         # 현재 단계: 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다
-        if dest == cur or exit_blockers(con, cfg, lid, sid):
+        if dest == cur or exit_blockers(con, cfg, root, lid, sid):
             con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
                         "authorized_by=? WHERE loop_id=? AND stage=?",
                         (now(), reason, by, lid, sid))
@@ -2367,6 +2436,65 @@ def cli_skip(ctx, argv):
     else:
         print("→ 단계 %s" % label_of(cfg, nsid))
         _hint_on_enter(ctx, nlid, nsid)
+    return 0
+
+
+SHELL_META = set(";|&<>$`(){}\n")
+
+
+def cli_verify(ctx, argv):
+    """검증을 **하네스가 직접 돌리고 종료 코드로** 판정한다.
+
+      harness verify -- pytest tests/
+
+    왜 있나: verification_evidence 는 PostToolUse 관측으로만 채워졌다. 훅이
+    없는 환경 — 다른 에이전트 도구, 사람이 직접 돌릴 때, 훅이 실패한 세션 —
+    에서는 `skip` 밖에 길이 없었고, 그건 '검증했다'가 아니라 '검증을 건너뛰었다'로
+    기록된다. 정직한 기록을 남길 방법이 없으면 사람은 부정직한 기록을 남긴다.
+
+    자기 보고는 받지 않는다. "테스트 돌렸습니다"를 증거로 받으면 그 순간 이
+    게이트는 장식이 된다 — 하네스가 실행하고 결과를 본다.
+
+    돌릴 수 있는 명령을 검증 패턴으로 **제한한다.** 제한하지 않으면 이 명령이
+    PreToolUse 를 우회하는 셸이 된다. 셸 메타문자도 거부한다 —
+    `pytest; rm -rf /` 는 패턴에 걸리지만 앞부분만 검증 명령이다.
+    """
+    import shlex
+    import subprocess
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
+    cmd = " ".join(argv[argv.index("--") + 1:]).strip() if "--" in argv else ""
+    if not cmd:
+        print("사용법: harness verify -- <검증 명령>")
+        print("  예: harness verify -- pytest tests/")
+        return 2
+    if sid not in EVIDENCE_STAGES:
+        print("verify 는 %s 단계에서 쓴다 (현재 %s)."
+              % (", ".join(EVIDENCE_STAGES), label_of(cfg, sid)))
+        return 2
+    if set(cmd) & SHELL_META:
+        print("셸 메타문자가 있는 명령은 거부한다 — 검증 명령 하나만 넘겨라.")
+        return 2
+    pat = cfg.at("evidence_signals.verification_evidence.bash_pattern")
+    if pat and not re.search(pat, cmd):
+        print("검증 명령으로 보이지 않는다: %s" % cmd)
+        print("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다.")
+        return 2
+    try:
+        rc = subprocess.call(shlex.split(cmd), cwd=root)
+    except OSError as e:
+        print("실행할 수 없다: %s" % e)
+        return 2
+    if rc != 0:
+        # 실패도 사실이므로 적립한다. 증거로는 세지 않는다.
+        with con:
+            record_event(con, lid, sid, "tool_fail", "verify", norm_cmd(cmd),
+                         "exit %d" % rc)
+        print("\n검증 실패 (exit %d) — 증거로 기록하지 않았다. 고치고 다시 돌려라." % rc)
+        return 1
+    with con:
+        record_evidence(con, lid, sid, "verification_evidence",
+                        ("verify: " + cmd)[:120])
+    print("\n검증 통과 — 증거로 기록했다: %s" % cmd)
     return 0
 
 
@@ -3189,6 +3317,7 @@ CLI = {
     "status": cli_status,
     "advance": cli_advance,
     "skip": cli_skip,
+    "verify": cli_verify,
     "allow": cli_allow,
     "approve-plan": cli_approve_plan,
     "loop": cli_loop,
@@ -3389,6 +3518,55 @@ def install_gitignore(root):
     return [".gitignore"]
 
 
+AGENTS_MARK = "<!-- step-seven-harness -->"
+AGENTS_BLOCK = """%s
+## 작업 절차 — 이 저장소는 하네스로 절차를 강제한다
+
+먼저 읽어라. 이 둘이 이 저장소의 규칙이다.
+
+- `%s` — 사람이 정한 원칙
+- `%s` — 반복된 실수에서 승격된 규칙
+
+일을 시작하기 전에 현재 단계를 확인하고, **단계를 건너뛰지 마라.**
+
+```
+%s status              # 현재 단계, 남은 종료 조건, 이번 작업의 완료 조건
+%s advance             # 종료 조건을 채웠으면 다음 단계로
+%s verify -- <검증 명령>  # 검증은 하네스가 직접 돌리고 종료 코드로 판정한다
+```
+
+`advance` 는 종료 조건이 남아 있으면 **거부하고** 무엇이 남았는지 말한다.
+"검증했습니다" 같은 자기 보고는 증거가 아니다 — `verify` 로 실제로 돌려라.
+산출물은 `.dev/` 아래에 `<작업해시>-<회차>-` 로 시작하는 이름으로 쓴다.
+
+이 게이트는 훅 없이 CLI 만으로 동작하므로 어떤 에이전트 도구에서도 같다.
+""" % (AGENTS_MARK, POLICY_REL.replace(os.sep, "/"), LEARNED_REL.replace(os.sep, "/"),
+       WRAPPER_CMD, WRAPPER_CMD, WRAPPER_CMD)
+
+
+def install_agents_md(root):
+    """AGENTS.md 에 절차 안내를 한 번 붙인다.
+
+    왜 CLAUDE.md 와 따로 다루나: AGENTS.md 는 `@import` 를 모른다. 그건 Claude
+    Code 의 기능이고, Codex·Cursor·Copilot·Gemini CLI·Aider·Windsurf·Zed 는
+    이 파일을 **그냥 마크다운으로 읽는다.** 그러니 앵커 한 줄이 아니라 읽으면
+    바로 쓸 수 있는 문장이어야 한다.
+
+    이미 표시가 있으면 **아무것도 하지 않는다.** 다시 써서 갱신하는 편이
+    깔끔하겠지만, 사용자가 이 블록 안을 고쳤을 때 그것을 지운다. 남의 글을
+    잃는 것은 낡은 안내보다 나쁘다 — CLAUDE.md 앵커와 같은 규칙이다.
+    """
+    p = os.path.join(root, "AGENTS.md")
+    body = open(p, encoding="utf-8").read() if os.path.isfile(p) else ""
+    if AGENTS_MARK in body:
+        return []
+    with open(p, "a", encoding="utf-8") as fh:
+        if body and not body.endswith("\n"):
+            fh.write("\n")
+        fh.write(("\n" if body else "") + AGENTS_BLOCK)
+    return ["AGENTS.md (%s)" % ("절차 안내 추가" if body else "새로 만듦")]
+
+
 def install_anchors(root):
     """CLAUDE.md 에 앵커 두 줄. POLICY 는 사람이 정한 원칙, LEARNED 는 하네스가
     승격한 규칙 — 한 파일에 섞으면 생성 대상과 손으로 쓴 것이 구분되지 않는다."""
@@ -3430,6 +3608,7 @@ def cli_init(argv):
 
     created += install_gitignore(root)
     created += install_anchors(root)
+    created += install_agents_md(root)
     label = None
     try:
         con2 = connect(root)
@@ -3499,7 +3678,7 @@ def render_init(root, created, lid, stage_label=None):
     # (0.10.0 에서 Selection 을 신설한 뒤에도 스킬 문서가 `1/6 Scaffolding` 이었다).
     print("활성 작업: %s%s" % (lid, " · 단계 %s" % stage_label if stage_label else ""))
     print("커밋 대상: .claude/harness/{POLICY.md,LEARNED.md,stages.json,rationale.md}, "
-          "CLAUDE.md")
+          "CLAUDE.md, AGENTS.md")
 
 
 def dump_json(data):
@@ -3547,6 +3726,8 @@ USAGE = """step-seven-harness — 작업 하네스
   skip <대상> --reason "..."    단계 건너뛰기 ✋
                                대상: <stage-id> | +N (N단계 전진) | until:<stage-id>
   approve-plan <file>          계획에 대한 사람의 승인 기록 ✋
+  verify -- <검증 명령>        하네스가 직접 돌려 종료 코드로 판정한다. 통과해야
+                               증거가 된다. 훅이 없는 도구에서도 이 길은 열려 있다
 
 예외
   allow <glob> --reason "..." [--uses N]

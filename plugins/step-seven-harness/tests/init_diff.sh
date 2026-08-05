@@ -1,9 +1,19 @@
 #!/bin/sh
-# cli_init 분해가 동작을 보존했는지 차등 실행으로 확인한다.
+# init 이 **무엇을 잃지 않았는지** 차등 실행으로 확인한다.
 #   usage: sh init_diff.sh [repo-root]
 # 스모크 스위트에 넣지 않는다 — git 히스토리를 필요로 하고 8개 픽스처에
-# 엔진을 16번 돌려 느리다. 리팩터를 건드릴 때 손으로 돌린다.
-# 리팩터 직전(0.18.0 = 77d6065)과 현재를 같은 픽스처에 돌려 출력과 파일트리를 비교한다.
+# 엔진을 16번 돌려 느리다. 설치 경로를 건드릴 때 손으로 돌린다.
+#
+# 원래는 0.18.0(77d6065) 과 출력이 **똑같은지** 봤다. 그 등식은 유지될 수 없었다 —
+# 그 뒤로 단계 표시와 AGENTS.md 안내가 의도적으로 늘었고, 검사는 영구히 빨간불이
+# 되었다. 항상 실패하는 검사는 아무도 보지 않으므로 없는 것보다 나쁘다.
+#
+# 그래서 불변식을 한 방향으로 바꿨다: **옛 엔진이 만든 것을 새 엔진이 잃지 않는다.**
+#   - 파일 트리: 옛 것 ⊆ 새 것 (추가는 허용하고 보고만 한다)
+#   - 사용자 파일 내용(CLAUDE.md/.gitignore/settings.json): 완전히 같아야 한다
+#     — 남의 글을 덮는 것이 이 검사가 잡아야 할 진짜 사고다
+#   - 종료 코드: 같아야 한다
+# 출력 문구 차이는 보고하되 실패로 세지 않는다.
 REPO=${1:-$(cd "$(dirname "$0")/../../.." && pwd)}
 NEW=$REPO/plugins/step-seven-harness/scripts/harness.py
 BASE=$(mktemp -d)
@@ -57,18 +67,21 @@ for c in empty claude_md gitignore settings_dict settings_empty all anchor_in_pr
   # 재실행 멱등성도 같은 픽스처에서 확인
   OA2=$( (cd "$A" && python3 "$OLD" init) 2>&1 | norm )
   OB2=$( (cd "$B" && python3 "$NEWI" init) 2>&1 | norm )
-  if [ "$OA" = "$OB" ] && [ "$OA2" = "$OB2" ] && [ "$(tree "$A")" = "$(tree "$B")" ] \
-     && [ "$(bodies "$A")" = "$(bodies "$B")" ] && [ "$RA" = "$RB" ]; then
-    echo "  동일   $c"
+  T=$(mktemp -d)
+  tree "$A" > "$T/ta"; tree "$B" > "$T/tb"
+  # 옛 엔진이 만들었는데 새 엔진이 만들지 않은 파일. 이것만 실패다.
+  LOST=$(comm -23 "$T/ta" "$T/tb")
+  GAIN=$(comm -13 "$T/ta" "$T/tb")
+  if [ -z "$LOST" ] && [ "$(bodies "$A")" = "$(bodies "$B")" ] && [ "$RA" = "$RB" ]; then
+    echo "  보존   $c$([ -n "$GAIN" ] && printf ' (추가: %s)' "$(echo $GAIN)")"
     SAME=$((SAME+1))
+    rm -rf "$T"
   else
-    echo "  차이   $c   (exit $RA vs $RB)"
+    echo "  퇴행   $c   (exit $RA vs $RB)"
     DIFF=$((DIFF+1))
-    # process substitution 은 bash 전용이다. sh 로도 돌도록 임시 파일을 쓴다.
-    T=$(mktemp -d)
+    [ -n "$LOST" ] && printf '         잃음 %s\n' "$(echo $LOST)"
     printf '%s\n' "$OA" > "$T/oa"; printf '%s\n' "$OB" > "$T/ob"
     bodies "$A" > "$T/ba"; bodies "$B" > "$T/bb"
-    tree "$A" > "$T/ta"; tree "$B" > "$T/tb"
     diff "$T/oa" "$T/ob" | head -8 | sed 's/^/         출력 /'
     diff "$T/ba" "$T/bb" | head -10 | sed 's/^/         파일 /'
     diff "$T/ta" "$T/tb" | head -6 | sed 's/^/         트리 /'
@@ -76,5 +89,5 @@ for c in empty claude_md gitignore settings_dict settings_empty all anchor_in_pr
   fi
 done
 echo
-echo "동일 $SAME / 차이 $DIFF"
+echo "보존 $SAME / 퇴행 $DIFF"
 [ "$DIFF" -eq 0 ]

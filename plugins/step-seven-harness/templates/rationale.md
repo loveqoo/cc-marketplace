@@ -624,7 +624,7 @@ context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻
 | `.dev/` 하위 폴더명, `docs/**/NNN-name.md` | 차단 |
 | `.dev/` 파일명에 `<작업해시>-<회차>-` 접두사 없음 | 차단 |
 | 계획 파일 + 사람의 승인 없이 Planning 종료 | `advance` 거부 |
-| 검증 증거 없이 Verification 종료 | 턴 종료 차단 |
+| 검증 증거 없이 Verification 종료 | 턴 종료 차단 · `advance` 거부 |
 | 회고 기록 없이 Compounding 종료 | 턴 종료 차단 |
 | 사유 없는 스킵 | 차단 · 사유 있으면 사용자 승인 다이얼로그 |
 | 말머리에 단계 미표시 | 턴 종료 차단 |
@@ -639,6 +639,62 @@ context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻
 스킵 사유가 합리적인지, 구조 변경이 지금 옳은지. 훅은 "합리적인 이유"를 판정할 수 없다.
 그래서 사유의 **기록**만 강제하고, 판정은 사람에게 넘긴다. 이게 훅으로 가능한 최대치이고
 동시에 감사 가능한 형태다.
+
+## 어느 층이 강제하나 (훅이 없으면 무엇이 남는가)
+
+이 하네스는 Claude Code 훅으로 시작했다. 그러면 "다른 도구에서도 쓸 수 있나"라는 질문이
+따라온다. 조사해 보니 **훅 층만 보고 판단하면 틀린다.**
+
+정면으로 도전한 사례들은 층을 내려간다.
+[Agent Control Plane](https://agenticcontrolplane.com/integrations/codex) 은 Codex 훅이 셸만
+가로챈다는 것을 인정하고 파일 조작을 MCP 커넥터로 흘려보낸다.
+[Cupcake](https://cupcake.eqtylab.io/reference/harnesses/opencode/) 은 정책 엔진 하나에
+도구별 어댑터를 붙인다.
+[NVIDIA OpenShell](https://www.vietanh.dev/blog/2026-03-17-nvidia-openshell-agent-sandboxes) 은
+훅을 아예 쓰지 않고 컨테이너와 eBPF/seccomp 로 커널이 강제하게 한다 — 에이전트가 프롬프트
+인젝션으로 오염돼도 자기 가드레일을 끄지 못한다.
+
+그래서 이 하네스의 게이트를 층으로 다시 갈랐다.
+
+| 게이트 | 강제하는 층 | 훅이 없어도 되나 |
+| --- | --- | --- |
+| 단계 진행 (`advance` 거부) | CLI | 된다 — 어느 도구가 실행해도 거부한다 |
+| 완료 조건·의도 기록 | CLI | 된다 |
+| 계획 파일·회고 파일 존재 | 파일시스템 | 된다 — 관측 없이 디스크를 본다 |
+| 검증 통과 (`verify`) | CLI 가 직접 실행 | 된다 — 종료 코드로 판정한다 |
+| 승격 결정 | 이벤트 집계 | 된다 |
+| 사람의 계획 승인 | CLI | 된다 (다이얼로그는 Claude 에서만) |
+| 폴더·파일명 규칙 (쓰기 차단) | PreToolUse | **안 된다** |
+| 하네스 자기 잠금 | PreToolUse | **안 된다** |
+| 말머리, 턴 이어붙임 | Stop | **안 된다** |
+
+즉 절차 강제와 증거 판정은 CLI·파일시스템에 있고, **즉시 차단과 말머리만 Claude 전용**이다.
+"불가능에 가깝다"가 아니라 "층을 내려가면 즉시성을 잃는다"가 맞는 말이다. 쓰기 차단을 더
+내려보낼 수는 있다 — git pre-commit 이나 OS 샌드박스 — 대신 차단 시점이 쓰기에서 커밋으로,
+또는 별도 인프라로 옮겨간다. 그 값을 치를 이유가 생기기 전까지는 내려보내지 않는다.
+
+`AGENTS.md` 에 절차 안내를 한 번 붙이는 것은 그 값이 0이라서 넣었다. `@import` 는 쓰지 않는다
+— 그건 Claude Code 기능이고, 이 파일을 읽는 다른 도구들은 그냥 마크다운으로 읽는다.
+
+## 증거는 관측이 아니라 사실이어야 한다
+
+두 가지를 고쳤고, 둘 다 실제로 새고 있었다.
+
+**첫째, 파일 존재는 관측을 기다릴 필요가 없다.** `plan_file` 과 `retro_file` 은 PostToolUse 로
+쓰기를 관측해서만 적립됐다. 훅이 없는 세션·다른 도구·사람이 직접 쓴 파일에서는 조건이 영원히
+채워지지 않고, 남는 길은 `skip` 뿐이다. 그건 "했다"가 아니라 "건너뛰었다"로 기록된다.
+**정직한 기록을 남길 방법이 없으면 사람은 부정직한 기록을 남긴다.** 그래서 관측된 증거가
+없으면 디스크를 본다. 단, 이번 회차 접두사(`<작업해시>-<회차>-`)를 **요구한다** — 지난 회차의
+계획서가 이번 회차의 게이트를 열면 그건 사람 없이 게이트가 열리는 것이다. 누적 인덱스도
+같은 이유로 제외된다.
+
+**둘째, 테스트를 돌린 것과 통과한 것은 다른 사실이다.** `verification_evidence` 는 명령
+**문자열만** 봤다. 그래서 `pytest` 를 돌려 3개가 깨져도 증거가 적립되고 Verification 게이트가
+열렸다. 실제로 그렇게 통과하는 것을 확인했다. 이제 실패한 도구 호출은 증거로 세지 않고,
+훅이 없는 자리에는 `harness verify -- <명령>` 이 있다 — 하네스가 직접 돌리고 종료 코드로
+판정한다. "검증했습니다"라는 자기 보고는 받지 않는다. 받는 순간 이 게이트는 장식이 된다.
+`verify` 가 돌릴 수 있는 명령은 검증 패턴으로 제한하고 셸 메타문자를 거부한다 — 제한하지
+않으면 이것이 PreToolUse 를 우회하는 셸이 된다.
 
 ## 참고한 사례
 
@@ -658,6 +714,19 @@ context bloat 42%(216~1477줄까지 부풀었고, 커지면 초반 지시가 묻
 - [The AGENTS.md Bloat Problem](https://codex.danielvaughan.com/2026/03/27/agents-md-bloat-problem/)
   — 규칙을 더하기만 하면 초반 지시가 묻힌다
 - [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026) — 배경
+
+도구 간 이식성은 아래를 조사했다.
+
+- [Agent Control Plane](https://agenticcontrolplane.com/integrations/codex) — 훅이 못 보는
+  도구는 MCP 로 흘려보낸다
+- [Cupcake](https://cupcake.eqtylab.io/reference/harnesses/opencode/) — 정책 엔진 하나 +
+  도구별 어댑터 (Claude Code·Cursor·OpenCode·Factory AI)
+- [NVIDIA OpenShell](https://www.vietanh.dev/blog/2026-03-17-nvidia-openshell-agent-sandboxes)
+  — 훅 대신 커널이 강제한다. 에이전트를 고치지 않고 감싼다
+- [Context Files 가 지배적이다](https://arxiv.org/abs/2602.14690) — 대부분의 저장소는 컨텍스트
+  파일이 유일한 수단이다. Skills·Subagents 를 쓰는 곳은 드물다
+- [ZORO: active rules](https://arxiv.org/abs/2604.15625) — 규칙 파일은 수동적이다. 단계마다
+  걸고 준수의 증명을 요구해야 한다 (이 하네스의 종료 조건과 같은 결론)
 
 ## 막혔을 때
 

@@ -21,6 +21,9 @@ AI와 함께 일할 때 **복리가 쌓이도록** 작업 절차를 훅으로 �
 승격을 결정해야 회차가 닫힙니다. 승격된 규칙 문서에는 줄 수 상한이 있어 무한히
 자라지 않습니다.
 
+절차 강제와 증거 판정은 CLI·파일시스템 층에 있어 **훅이 없는 도구(Codex, opencode)에서도
+동작합니다.** 즉시 차단과 말머리만 Claude Code 전용입니다.
+
 ```bash
 /plugin install step-seven-harness@cc-marketplace
 ```
