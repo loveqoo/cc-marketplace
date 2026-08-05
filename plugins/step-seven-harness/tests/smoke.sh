@@ -1638,6 +1638,125 @@ check "커밋 대상으로 안내한다" 'AGENTS.md' \
   "$( (cd "$AW" && python3 "$ENGINE" init) | grep '커밋 대상')"
 rm -rf "$AW"
 
+echo "== 종료 조건이 어휘가 됐다 (파이썬을 고치지 않고 바꿀 수 있어야 한다)"
+# 이것이 어휘화 작업의 목표다. 예전에는 EVIDENCE_STAGES·HUMAN_CRITERIA·CRITERIA_HELP·
+# promotion_decided 특수분기가 파이썬에 있었고, 조건을 더하거나 이름을 바꾸려면 엔진을
+# 고쳐야 했다. 엔진이 알아야 하는 것은 **판정 방식**이지 조건 이름이 아니다.
+# 그래서 검사도 설정만 바꾸고 동작이 따라오는지 보는 형태여야 한다.
+VW="$(mktemp -d)"
+(cd "$VW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+vw() { (cd "$VW" && python3 "$ENGINE" "$@"); }
+VCFG="$VW/.claude/harness/stages.json"
+edcfg() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$1" "$2"; }
+
+check "criteria 어휘가 설치된다" 'satisfied_by' "$(cat "$VCFG")"
+check "도움말이 코드가 아니라 데이터다" 'harness loop intent' "$(cat "$VCFG")"
+
+echo "  -- 도움말을 설정에서 바꾸면 엔진이 그것을 말한다"
+edcfg "$VCFG" 'cfg["criteria"]["intent_set"]["help"] = "내가 정한 안내 문구"'
+check "거부 메시지가 설정을 따른다" '내가 정한 안내 문구' "$(vw advance 2>&1)"
+
+echo "  -- 사람만 채울 수 있는 조건도 설정이 정한다 (HUMAN_CRITERIA 가 코드에 없다)"
+vstop() { printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"%s","last_assistant_message":"[Selection] 했습니다"}' "$VW" "$1" \
+  | CLAUDE_PROJECT_DIR="$VW" python3 "$ENGINE" hook; }
+check "human 이면 턴을 밀지 않는다" '사람의 입력을 기다린다' "$(vstop vh1)"
+edcfg "$VCFG" 'cfg["criteria"]["intent_set"].pop("human", None)'
+check "human 을 떼면 이어서 진행하라고 한다" '이어서 진행하라' "$(vstop vh2)"
+
+echo "  -- 없던 조건을 새로 정의해도 게이트가 된다 (엔진은 이름을 모른다)"
+VW2="$(mktemp -d)"
+(cd "$VW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+vw2() { (cd "$VW2" && python3 "$ENGINE" "$@"); }
+edcfg "$VW2/.claude/harness/stages.json" '
+cfg["criteria"]["design_doc"] = {
+    "satisfied_by": "file",
+    "write_glob": [".dev/design/**/*.md"],
+    "help": "설계 문서를 .dev/design/ 아래에 남겨야 한다",
+}
+for st in cfg["stages"]:
+    if st["id"] == "planning":
+        st["exit_criteria"] = ["design_doc"]
+        st["stop_requires"] = ["design_doc"]
+cfg["folder_rules"]["dev_subdirs"].append("design")
+cfg["folder_rules"]["loop_prefixed_dirs"].append("design")
+'
+vw2 loop intent "새 조건" >/dev/null
+vw2 loop done-when "끝" >/dev/null
+vw2 advance >/dev/null; vw2 advance >/dev/null; vw2 advance >/dev/null
+check "새로 정의한 조건이 게이트가 된다" 'design_doc' "$(vw2 advance 2>&1)"
+check "설정에 쓴 도움말을 그대로 낸다" '설계 문서를 .dev/design' "$(vw2 advance 2>&1)"
+V2PRE="$(vw2 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$VW2/.dev/design"
+printf '# 설계\n' > "$VW2/.dev/design/${V2PRE}d.md"
+check "파일을 놓으면 열린다 (satisfied_by=file)" 'Execution' "$(vw2 advance 2>&1)"
+
+echo "  -- 관측 단계도 설정이 정한다 (EVIDENCE_STAGES 가 코드에 없다)"
+edcfg "$VCFG" 'cfg["criteria"]["verification_evidence"]["stages"] = ["verification"]'
+check "verify 가 설정된 단계만 허용한다" 'verification 단계에서 쓴다' \
+  "$(vw verify -- pytest 2>&1)"
+
+echo "== 패널이 선언형이다 (단계 id 가 코드에 없다)"
+# 예전에는 `if sid == "scaffolding"` 이 코드에 있었다. 0.10.0 에서 Selection 을
+# 신설했을 때 이 부류가 낡았고, 모델은 낡은 문장을 정확히 따라 틀린 말을 했다.
+PW="$(mktemp -d)"
+(cd "$PW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+pw2() { (cd "$PW" && python3 "$ENGINE" "$@"); }
+# 완료 조건 패널을 Context 로 옮긴다. 원래는 Verification·Compounding 에만 있다.
+edcfg "$PW/.claude/harness/stages.json" '
+for st in cfg["stages"]:
+    st["panels"] = ["acceptance"] if st["id"] == "context" else []
+'
+pw2 loop intent "패널 이동" >/dev/null
+pw2 loop done-when "조건 하나" >/dev/null
+check "옮긴 단계에서 패널이 나온다" '이 작업의 완료 조건' \
+  "$(pw2 advance >/dev/null 2>&1; pw2 advance 2>&1)"
+check "패널을 비우면 아무것도 안 나온다" '^0$' \
+  "$(pw2 advance 2>&1 | grep -c '이 작업의 완료 조건' || true)"
+
+echo "== 기존 설치가 새 어휘를 받는다 (init 은 stages.json 을 덮지 않는다)"
+# 이것이 없으면 어휘를 설정으로 옮긴 순간 기존 설치의 게이트가 조용히 어긋난다.
+OW="$(mktemp -d)"
+(cd "$OW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ow() { (cd "$OW" && python3 "$ENGINE" "$@"); }
+# 어휘화 이전 모양으로 되돌린다. bash_pattern 은 사용자가 고쳐 둔 상태를 흉내낸다.
+edcfg "$OW/.claude/harness/stages.json" '
+crit = cfg.pop("criteria")
+cfg["evidence_signals"] = {
+    "plan_file": {"write_glob": crit["plan_file"]["write_glob"]},
+    "retro_file": {"write_glob": crit["retro_file"]["write_glob"]},
+    "verification_evidence": {"bash_pattern": "\\bmake\\s+smoke\\b"},
+}
+for st in cfg["stages"]:
+    st.pop("panels", None)
+'
+check "옛 문서로도 동작한다" 'Selection' "$(ow status 2>&1)"
+check "새 어휘가 채워진다" 'intent_set' "$(ow advance 2>&1)"
+ow loop intent "옛 설치" >/dev/null
+ow loop done-when "끝" >/dev/null
+ow advance >/dev/null; ow advance >/dev/null; ow advance >/dev/null
+OPRE="$(ow status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$OW/.dev/plan"; printf '#\n' > "$OW/.dev/plan/${OPRE}p.md"
+check "옛 write_glob 이 이어진다 (plan_file 이 선다)" '^plan_approved$' \
+  "$(ow status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))')"
+ow approve-plan ".dev/plan/${OPRE}p.md" >/dev/null
+ow advance >/dev/null; ow advance >/dev/null
+printf 'smoke:\n\t@true\n' > "$OW/Makefile"
+# `make smoke` 는 기본 패턴(`make (test|check|lint)`)에 없다. 고쳐 둔 패턴이 사라지면
+# "검증 명령으로 보이지 않는다"로 거부된다 — 사용자는 자기 설정이 사라진 걸 모른 채
+# 게이트가 안 열리는 것만 본다. 조용한 회귀다.
+check "사용자가 고친 bash_pattern 이 이어진다" '검증 통과' "$(ow verify -- make smoke 2>&1)"
+# 사용자가 패턴을 갈아끼웠으면 기본 패턴은 더 이상 쓰이지 않는다. `make check` 는
+# 기본 패턴에는 있고 사용자 패턴에는 없으므로 거부돼야 한다 — 병합이 아니라 대체다.
+check "사용자 패턴이 기본값을 대체한다 (병합이 아니다)" '검증 명령으로 보이지 않는다' \
+  "$(ow verify -- make check 2>&1)"
+rm -rf "$VW" "$VW2" "$PW" "$OW"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

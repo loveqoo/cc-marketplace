@@ -65,8 +65,6 @@ CTRL_HEAD = {
     "loop adopt": "기존 루프 해시 재연결 요청",
     "auto-skip": "스킵 자동 승인 활성화 요청 — 이후 스킵은 다이얼로그 없이 통과한다",
 }
-EVIDENCE_STAGES = ("execution", "verification")
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS loop (
@@ -260,10 +258,53 @@ class Ctx(object):
 
 
 def load_config(root, plugin_root_dir=None):
+    """프로젝트의 stages.json. 없는 **최상위 영역만** 템플릿에서 채운다.
+
+    왜 채우나: `install_templates` 는 기존 stages.json 을 덮지 않는다 — 사용자가
+    고친 문서이기 때문이다. 그래서 새 설정 영역을 추가하면 **기존 설치는 영원히
+    받지 못한다.** 규칙이 코드에 있을 때는 티가 안 났지만, 어휘를 설정으로 옮기는
+    순간 그건 게이트가 조용히 어긋나는 것이다.
+
+    왜 최상위 영역만인가: 사용자의 작업 방식이 "마찰이 크면 stages.json 에서
+    덜어낸다"이고, 그건 영역 **안의 항목**을 지우는 일이다. 항목 단위로 병합하면
+    지운 것이 되살아나 그 자유를 빼앗는다. 그래서 영역이 통째로 없을 때만 채우고,
+    비워 둔 것(`[]`, `{}`)은 비운 대로 존중한다.
+    """
     cfg = jload(os.path.join(root, CONFIG_REL))
-    if cfg is None and plugin_root_dir:
-        cfg = jload(os.path.join(plugin_root_dir, "templates", "stages.json"))
+    tpl_dir = plugin_root_dir or plugin_root()
+    tpl = jload(os.path.join(tpl_dir, "templates", "stages.json"))
+    if cfg is None:
+        cfg = tpl
+    elif isinstance(cfg, dict) and isinstance(tpl, dict):
+        had_criteria = "criteria" in cfg
+        for k, v in tpl.items():
+            cfg.setdefault(k, v)
+        if not had_criteria:
+            _adopt_evidence_signals(cfg)
     return Cfg(cfg) if isinstance(cfg, dict) else cfg
+
+
+def _adopt_evidence_signals(cfg):
+    """`evidence_signals` 를 커스터마이즈한 문서의 그 값을 `criteria` 로 옮긴다.
+
+    0.31.0 에서 `evidence_signals` 가 `criteria` 로 흡수됐다. 템플릿 채움만 하면
+    `criteria` 는 들어오지만 **사용자가 고쳐 둔 옛 값은 조용히 무시된다** —
+    `bash_pattern` 에 자기 빌드 명령을 넣어 둔 사람은 그게 사라진 것을 모른 채
+    검증 게이트가 안 열리는 것만 보게 된다. 이름을 바꿨으면 옮겨주는 것이 맞다.
+
+    새 어휘 필드(`satisfied_by`, `help` 등)는 템플릿 값을 유지한다. 사용자가
+    고친 것은 신호 필드뿐이므로 그것만 덮는다.
+    """
+    old = cfg.get("evidence_signals")
+    crit = cfg.get("criteria")
+    if not isinstance(old, dict) or not isinstance(crit, dict):
+        return
+    for kind, sig in old.items():
+        if not isinstance(sig, dict):
+            continue
+        target = crit.setdefault(kind, {"satisfied_by": "cli"})
+        if isinstance(target, dict):
+            target.update(sig)
 
 
 def stage_ids(cfg):
@@ -875,7 +916,7 @@ def fs_evidence(cfg, root, prefix, kind):
     """
     if not prefix:
         return None
-    for pat in cfg.seq("evidence_signals.%s.write_glob" % kind):
+    for pat in cfg.seq("criteria.%s.write_glob" % kind):
         # 글롭의 앞쪽 리터럴만 떼어 그 디렉터리부터 걷는다. 저장소 전체를 걷지 않는다.
         base = pat.split("*")[0].rstrip("/")
         d = os.path.join(root, base)
@@ -897,39 +938,49 @@ def exit_blockers(con, cfg, root, lid, sid):
 
 
 def criterion_met(con, cfg, root, lid, kind):
-    """종료 조건 충족 여부.
+    """종료 조건 충족 여부. **어떻게 판정하는지는 어휘가 정한다.**
 
-    promotion_decided 는 evidence 행이 아니다 — 프로젝트 전체의 반복 항목에서
-    계산되므로, 루프에 증거를 심어두면 다음 회차에 새로 생긴 반복을 놓친다.
+    `criteria.<이름>.satisfied_by` 가 판정 방식을 고른다. 예전에는 이 함수가
+    조건 이름을 알고 있었고(`promotion_decided` 특수 분기), 그래서 조건을 더하거나
+    이름을 바꾸려면 파이썬을 고쳐야 했다. 엔진이 알아야 하는 것은 **방식**이지
+    이름이 아니다.
 
-    관측된 증거가 없으면 디스크를 본다. 게이트는 **아무도 아무것도 미리
-    실행하지 않아도** 맞아야 한다 — is_regressed 에서 세운 것과 같은 원칙이다.
-    여기서 evidence 행을 새로 쓰지는 않는다. 판정 경로가 쓰기를 하면 훅의
-    트랜잭션 상태에 얹혀 실패할 수 있고, 판정은 매번 다시 하면 되는 계산이다.
+      cli                    사람·모델이 명령으로 기록한다 (evidence 행)
+      file                   산출물이 디스크에 있으면 충족 (관측 불필요)
+      observed               도구 사용을 관측해 적립한다 (실패한 실행은 제외)
+      no_pending_promotions  프로젝트 전체의 미결 승격이 없으면 충족
+
+    file·observed 도 evidence 행이 있으면 먼저 인정한다 — 관측이 잡혔다면 그게
+    가장 이른 사실이다. 게이트는 **아무도 아무것도 미리 실행하지 않아도** 맞아야
+    한다(is_regressed 와 같은 원칙). 여기서 evidence 행을 새로 쓰지는 않는다.
+    판정 경로가 쓰기를 하면 훅의 트랜잭션 상태에 얹혀 실패할 수 있고, 판정은
+    매번 다시 하면 되는 계산이다.
     """
-    if kind == "promotion_decided":
+    how = cfg.at("criteria.%s.satisfied_by" % kind, "cli")
+    if how == "no_pending_promotions":
+        # evidence 행으로 심어두면 안 된다 — 다음 회차에 새로 생긴 반복을 놓친다.
         return not pending_promotions(con, cfg)
     if has_evidence(con, lid, kind):
         return True
-    return fs_evidence(cfg, root, file_prefix(con, lid), kind) is not None
+    if how == "file":
+        return fs_evidence(cfg, root, file_prefix(con, lid), kind) is not None
+    return False
 
 
-CRITERIA_HELP = {
-    "intent_set": "이번에 할 작업을 `harness loop intent \"<작업>\"` 으로 기록해야 한다 "
-                  "(Context 의 recall 이 이것을 기준으로 조회한다)",
-    "acceptance": "무엇이 '끝'인지를 `harness loop done-when \"<조건>\" ...` 으로 "
-                  "기록해야 한다 (Verification 이 대조할 기준이다)",
-    "plan_file": "계획 파일을 .dev/plan/ 아래에 남겨야 한다",
-    "plan_approved": "계획에 대한 사람의 승인이 필요하다 (harness approve-plan <file>)",
-    "verification_evidence": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, "
-                             "브라우저 확인, dry-run 중 하나를 수행하라. 관측이 "
-                             "안 잡히면 `harness verify -- <명령>` 으로 하네스가 "
-                             "직접 돌리게 하라 (통과해야 증거가 된다)",
-    "retro_file": "회고를 .dev/retrospect/ 또는 .dev/learning/ 아래에 기록해야 한다",
-    "promotion_decided": "여러 작업에서 반복된 항목에 대한 승격 결정이 남았다 — "
-                         "`harness promote` 로 목록을 보고 하나씩 결정하라. "
-                         "승격하지 않기로 하는 것도 결정이다 (--decline --reason \"...\")",
-}
+def criterion_help(cfg, kind):
+    return cfg.at("criteria.%s.help" % kind, kind)
+
+
+def human_criteria(cfg):
+    """사람만 채울 수 있는 조건. 이것이 남았으면 턴을 밀지 않는다 —
+    밀면 모델이 만들 수 없는 것을 만들려 애쓰고, 그 시도가 매번 다이얼로그가 된다."""
+    return tuple(k for k, v in (cfg.obj("criteria") or {}).items()
+                 if isinstance(v, dict) and v.get("human"))
+
+
+def evidence_stages(cfg, kind="verification_evidence"):
+    """그 증거를 관측해 적립하는 단계들."""
+    return tuple(cfg.seq("criteria.%s.stages" % kind))
 
 
 # ------------------------------------------------------------------- path logic
@@ -1308,9 +1359,6 @@ def auto_skip_scope_note(con):
     return ", ".join(bits) or "무제한"
 
 
-HUMAN_CRITERIA = ("intent_set", "plan_approved")
-
-
 def skip_block_reason(cfg, sid, target):
     """skip 이 **불가능한** 이유. 가능하면 None.
 
@@ -1589,7 +1637,7 @@ def hook_post_tool_use(inp, ctx):
         return
 
     ti = inp.get("tool_input") or {}
-    signals = cfg.get("evidence_signals", {})
+    signals = cfg.obj("criteria")
 
     with con:
         field = WRITE_TOOLS.get(tool)
@@ -1598,13 +1646,16 @@ def hook_post_tool_use(inp, ctx):
             if rel:
                 # 편집 이력. 한 루프에서 같은 파일을 몇 번 고쳤는지가 구조 냄새다.
                 record_event(con, lid, sid, "edit", None, rel)
+                # write_glob 이 없는 조건(cli·observed·no_pending)은 그냥 지나간다.
                 for kind, sig in signals.items():
-                    for pat in sig.get("write_glob", []):
+                    for pat in (sig.get("write_glob") or []) if isinstance(sig, dict) else []:
                         if glob_match(rel, pat):
                             record_evidence(con, lid, sid, kind, rel)
                             break
-        if sid in EVIDENCE_STAGES and not tool_failed(inp):
-            sig = signals.get("verification_evidence", {})
+        if sid in evidence_stages(cfg) and not tool_failed(inp):
+            sig = signals.get("verification_evidence") or {}
+            if not isinstance(sig, dict):
+                sig = {}
             if tool == "Bash":
                 pat = sig.get("bash_pattern")
                 cmd = ti.get("command") or ""
@@ -1768,7 +1819,7 @@ def hook_stop(inp, ctx):
     for key in stage.get("stop_requires", []):
         if not criterion_met(con, cfg, root, lid, key):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"
-                             % (stage["label"], CRITERIA_HELP.get(key, key))))
+                             % (stage["label"], criterion_help(cfg, key))))
     if not problems:
         return continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id)
 
@@ -1855,7 +1906,7 @@ def continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id):
     # 만들 수 없는 것을 만들려 애쓰고, 그 시도가 매번 승인 다이얼로그가 된다.
     # Selection 에 작업이 없는 것은 교착이 아니라 **사람을 기다리는 상태**다.
     waiting = [k for k in exit_blockers(con, cfg, root, lid, sid)
-               if k in HUMAN_CRITERIA]
+               if k in human_criteria(cfg)]
     if waiting:
         note = ""
         if "intent_set" in waiting:
@@ -2158,41 +2209,62 @@ def _enter(ctx, dest_idx):
     return lid, sid, False
 
 
-def _hint_on_enter(ctx, lid, sid):
-    """단계 진입 시의 안내.
+def _panel_work_candidates(ctx, lid):
+    """작업이 정해지지 않았으면 하네스가 아는 할 일을 후보로 내놓는다.
+    무인 실행에는 물을 사람이 없으므로, 고를 것을 주지 않으면 거기서 멈춘다."""
+    row = ctx.con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+    if not (row and row["intent"]):
+        render_work_candidates(work_candidates(ctx.con, ctx.cfg, ctx.root))
 
-    Context 는 **당겨가는** 단계다. 과거 기록을 밀어넣지 않는다 — 이번 task 와
-    무관한 실수까지 컨텍스트를 먹기 때문이다. 조회 방법만 알려주고 무엇이
-    관련 있는지는 모델이 판단한다.
+
+def _panel_tidy(ctx, lid):
+    """'줄이는' 것도 일이다. 권고만으로는 아무도 줄이지 않았으므로 목록을 준다."""
+    head = tidy_headline(ctx.con, ctx.cfg, ctx.root)
+    if head:
+        print("\n%s" % head)
+
+
+def _panel_acceptance(ctx, lid):
+    """완료 조건. 대조해야 하는 자리에서는 찾아오게 하지 않고 밀어준다."""
+    acc = acceptance_of(ctx.con, lid)
+    if acc:
+        print("\n이 작업의 완료 조건 (%d개):" % len(acc))
+        for i, t in enumerate(acc, 1):
+            print("  %d. %s" % (i, t))
+
+
+PANELS = {
+    "work_candidates": _panel_work_candidates,
+    "tidy": _panel_tidy,
+    "acceptance": _panel_acceptance,
+    "retro": None,   # 분량이 커서 _hint_on_enter 안에 남긴다
+}
+
+
+def _hint_on_enter(ctx, lid, sid):
+    """단계 진입 시의 안내. **무엇을 보여줄지는 단계가 선언한다.**
+
+    예전에는 이 함수가 단계 id 를 알고 있었다(`if sid == "scaffolding"`). 그래서
+    단계를 더하거나 이름을 바꾸면 파이썬을 고쳐야 했고, 실제로 0.10.0 에서
+    Selection 을 신설했을 때 이 부류가 낡았다. 엔진이 알아야 하는 것은 **패널의
+    종류**이지 어느 단계가 그것을 쓰는지가 아니다 — 그건 `stages[].panels` 가 정한다.
+
+    Context 는 **당겨가는** 단계라 패널이 없다. 과거 기록을 밀어넣으면 이번 task 와
+    무관한 실수까지 컨텍스트를 먹는다. 조회 방법만 알려주고 판단은 모델이 한다.
     Compounding 은 반대다. 막 끝낸 루프 자신의 기록은 무조건 관련 있으니 밀어준다.
     """
-    con, cfg, root = ctx.con, ctx.cfg, ctx.root
+    con, cfg = ctx.con, ctx.cfg
     hint = stage_obj(cfg, sid).get("hint")
     if hint:
         print("\n%s" % hint)
 
-    # Selection 에 작업이 정해지지 않았으면 하네스가 아는 할 일을 후보로 내놓는다.
-    # 무인 실행에는 물을 사람이 없으므로, 고를 것을 주지 않으면 거기서 멈춘다.
-    if sid == cfg["stages"][0]["id"]:
-        row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
-        if not (row and row["intent"]):
-            render_work_candidates(work_candidates(con, cfg, root))
+    panels = stage_obj(cfg, sid).get("panels") or []
+    for name in panels:
+        fn = PANELS.get(name)
+        if fn:
+            fn(ctx, lid)
 
-    # Scaffolding 은 '줄이는' 단계다. 권고만으로는 아무도 줄이지 않았으므로 목록을 준다.
-    if sid == "scaffolding":
-        head = tidy_headline(con, cfg, root)
-        if head:
-            print("\n%s" % head)
-
-    # 완료 조건은 Verification·Compounding 에서 무조건 관련 있으므로 밀어준다.
-    if sid in ("verification", "compounding"):
-        acc = acceptance_of(con, lid)
-        if acc:
-            print("\n이 작업의 완료 조건 (%d개):" % len(acc))
-            for i, t in enumerate(acc, 1):
-                print("  %d. %s" % (i, t))
-
-    if sid != "compounding":
+    if "retro" not in panels:
         return
 
     # 무엇을 물을지가 회고의 값을 정한다. 관측을 나열하기 **전에** 질문을 둔다 —
@@ -2295,7 +2367,7 @@ def cli_advance(ctx, argv):
     if missing:
         print("advance 거부 — %s 단계의 종료 조건이 남았다:" % stage_obj(cfg, sid)["label"])
         for k in missing:
-            print("  - %s: %s" % (k, CRITERIA_HELP.get(k, k)))
+            print("  - %s: %s" % (k, criterion_help(cfg, k)))
         if stage_obj(cfg, sid).get("skippable") is False:
             print("이 단계는 건너뛸 수 없다. 조건을 채워야 한다.")
         else:
@@ -2398,7 +2470,7 @@ def cli_skip(ctx, argv):
         for key in st.get("skip_requires", []):
             if not has_evidence(con, lid, key):
                 print("%s 를 건너뛰더라도 기록은 남겨야 한다: %s"
-                      % (st["label"], CRITERIA_HELP.get(key, key)))
+                      % (st["label"], criterion_help(cfg, key)))
                 print("먼저 그 기록을 남긴 뒤 다시 시도하라. 승인만 면제된다.")
                 return 1
 
@@ -2467,14 +2539,15 @@ def cli_verify(ctx, argv):
         print("사용법: harness verify -- <검증 명령>")
         print("  예: harness verify -- pytest tests/")
         return 2
-    if sid not in EVIDENCE_STAGES:
+    stages = evidence_stages(cfg)
+    if sid not in stages:
         print("verify 는 %s 단계에서 쓴다 (현재 %s)."
-              % (", ".join(EVIDENCE_STAGES), label_of(cfg, sid)))
+              % (", ".join(stages), label_of(cfg, sid)))
         return 2
     if set(cmd) & SHELL_META:
         print("셸 메타문자가 있는 명령은 거부한다 — 검증 명령 하나만 넘겨라.")
         return 2
-    pat = cfg.at("evidence_signals.verification_evidence.bash_pattern")
+    pat = cfg.at("criteria.verification_evidence.bash_pattern")
     if pat and not re.search(pat, cmd):
         print("검증 명령으로 보이지 않는다: %s" % cmd)
         print("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다.")

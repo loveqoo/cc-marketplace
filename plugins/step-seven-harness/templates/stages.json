@@ -128,6 +128,9 @@
         "intent_set",
         "acceptance"
       ],
+      "panels": [
+        "work_candidates"
+      ],
       "stop_requires": []
     },
     {
@@ -142,6 +145,9 @@
         "dev"
       ],
       "exit_criteria": [],
+      "panels": [
+        "tidy"
+      ],
       "stop_requires": []
     },
     {
@@ -198,6 +204,9 @@
       "exit_criteria": [
         "verification_evidence"
       ],
+      "panels": [
+        "acceptance"
+      ],
       "stop_requires": [
         "verification_evidence"
       ]
@@ -217,31 +226,63 @@
         "retro_file",
         "promotion_decided"
       ],
+      "panels": [
+        "acceptance",
+        "retro"
+      ],
       "stop_requires": [
         "retro_file",
         "promotion_decided"
       ]
     }
   ],
-  "evidence_signals": {
+  "criteria": {
+    "intent_set": {
+      "satisfied_by": "cli",
+      "human": true,
+      "help": "이번에 할 작업을 `harness loop intent \"<작업>\"` 으로 기록해야 한다 (Context 의 recall 이 이것을 기준으로 조회한다)"
+    },
+    "acceptance": {
+      "satisfied_by": "cli",
+      "help": "무엇이 '끝'인지를 `harness loop done-when \"<조건>\" ...` 으로 기록해야 한다 (Verification 이 대조할 기준이다)"
+    },
     "plan_file": {
+      "satisfied_by": "file",
       "write_glob": [
         ".dev/plan/**/*.md"
-      ]
+      ],
+      "help": "계획 파일을 .dev/plan/ 아래에 남겨야 한다"
     },
-    "retro_file": {
-      "write_glob": [
-        ".dev/retrospect/**/*.md",
-        ".dev/learning/**/*.md"
-      ]
+    "plan_approved": {
+      "satisfied_by": "cli",
+      "human": true,
+      "help": "계획에 대한 사람의 승인이 필요하다 (harness approve-plan <file>)"
     },
     "verification_evidence": {
+      "satisfied_by": "observed",
+      "stages": [
+        "execution",
+        "verification"
+      ],
       "bash_pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?test\\b|\\bpytest\\b|\\bgo\\s+test\\b|\\bcargo\\s+test\\b|\\bmake\\s+(test|check|lint)\\b|\\bvitest\\b|\\bjest\\b|\\bruff\\b|\\bmypy\\b|\\btsc\\b|--dry-run\\b",
       "tools": [
         "Agent",
         "Task"
       ],
-      "tool_pattern": "^mcp__claude-in-chrome__|^mcp__playwright__"
+      "tool_pattern": "^mcp__claude-in-chrome__|^mcp__playwright__",
+      "help": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, 브라우저 확인, dry-run 중 하나를 수행하라. 관측이 안 잡히면 `harness verify -- <명령>` 으로 하네스가 직접 돌리게 하라 (통과해야 증거가 된다)"
+    },
+    "retro_file": {
+      "satisfied_by": "file",
+      "write_glob": [
+        ".dev/retrospect/**/*.md",
+        ".dev/learning/**/*.md"
+      ],
+      "help": "회고를 .dev/retrospect/ 또는 .dev/learning/ 아래에 기록해야 한다"
+    },
+    "promotion_decided": {
+      "satisfied_by": "no_pending_promotions",
+      "help": "여러 작업에서 반복된 항목에 대한 승격 결정이 남았다 — `harness promote` 로 목록을 보고 하나씩 결정하라. 승격하지 않기로 하는 것도 결정이다 (--decline --reason \"...\")"
     }
   }
 }
