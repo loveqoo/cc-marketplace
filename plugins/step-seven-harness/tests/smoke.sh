@@ -1192,9 +1192,11 @@ SH_="$SW/.claude/harness/bin/harness"
 
 check "Selection 스킵은 묻지 않고 거부" '"permissionDecision": "deny"' \
   "$(sb "$SH_ skip selection --reason x")"
-check "사람이 작업을 주는 자리라고 알려준다" '사람이 작업을 주는 자리' \
+check "스킵이 아니라 작업을 고르는 것이 다음 행동이라고 말한다" '작업을 고르는 것' \
   "$(sb "$SH_ skip selection --reason x")"
-check "스킵을 시도하지 말라고 말한다" '스킵을 시도하지 말고' \
+check "후보를 어디서 보는지 알려준다" 'harness status' \
+  "$(sb "$SH_ skip selection --reason x")"
+check "정말 없으면 멈추는 것이 정상 종료라고 말한다" '정상 종료' \
   "$(sb "$SH_ skip selection --reason x")"
 check "until:selection 도 거부 (항상 실패하는 명령이었다)" '뒤로 갈 수는 없다' \
   "$(sb "$SH_ skip until:selection --reason x")"
@@ -1249,6 +1251,61 @@ with con:
 PYP
 check "Planning 에서 승인 대기 중이면 밀지 않는다" 'plan_approved' "$(sstop sB Planning)"
 rm -rf "$SW" "$SW2"
+
+echo "== Selection: 새 작업이 없을 때 하네스가 할 일을 내놓는다"
+# "새 작업이 없다" 가 "할 일이 없다" 는 뜻이 아니다. 승격 결정, 재발한 승격,
+# 낡은 인덱스는 전부 복리를 유지하는 일이고 사람이 주지 않아도 존재한다.
+# 이걸 내놓지 않으면 무인 실행이 Selection 에서 멈춘다.
+CW3="$(mktemp -d)"
+(cd "$CW3" && git init -q . && python3 "$ENGINE" init >/dev/null)
+c3() { (cd "$CW3" && python3 "$ENGINE" "$@"); }
+python3 - "$CW3" "$(dirname "$ENGINE")" <<'PYW' >/dev/null
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+with con:
+    for i, l in enumerate(("250601-a", "250602-b", "250603-c")):
+        con.execute("INSERT OR IGNORE INTO loop(id,created_at,closed_at) VALUES(?,?,?)",
+                    (l, "2025-06-0%dT10:00:00+0900" % (i + 1), "x"))
+        con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                    "VALUES(?,?,?,?,?,?)",
+                    ("2025-06-0%dT11:00:00+0900" % (i + 1), l, "execution",
+                     "block", "docs_readonly", "docs/a.md"))
+    con.execute("INSERT OR REPLACE INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+                ("block:loop_prefix", "block", "hook", "regressed", "n", "x",
+                 "2025-05-01T00:00:00+0900", "2025-05-01T00:00:00+0900"))
+PYW
+SJ3="$(c3 status)"
+check "status 가 할 일 후보를 내놓는다" '하네스가 아는 할 일' "$SJ3"
+check "승격 결정을 후보로 준다" '승격 결정' "$SJ3"
+check "재발한 승격도 후보다" '재발한 승격' "$SJ3"
+check "실행할 명령을 함께 준다" 'harness promote' "$SJ3"
+check "정말 없으면 멈추라고 말한다" '그렇다고 말하고 멈춰라' "$SJ3"
+check "--json 에도 실린다" 'candidates' "$(c3 status --json)"
+
+echo "  -- 스킵 거부가 '물어라' 가 아니라 '고르라' 로 안내한다"
+sb3() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"%s"}}' "$CW3" "$1" \
+  | CLAUDE_PROJECT_DIR="$CW3" python3 "$ENGINE" hook; }
+SR3="$(sb3 "$CW3/.claude/harness/bin/harness skip selection --reason x")"
+check "작업을 고르는 것이 다음 행동" '작업을 고르는 것' "$SR3"
+check "후보를 어디서 보는지 알려준다" 'harness status' "$SR3"
+check "멈추는 것이 정상 종료라고 말한다" '정상 종료' "$SR3"
+
+echo "  -- 턴 종료 메시지가 후보 개수를 알려준다"
+check "할 일이 있으면 개수를 말한다" '아는 할 일이' \
+  "$(printf '{\"hook_event_name\":\"Stop\",\"cwd\":\"%s\",\"session_id\":\"sX\",\"last_assistant_message\":\"[Selection] 없습니다\"}' "$CW3" \
+     | CLAUDE_PROJECT_DIR="$CW3" python3 "$ENGINE" hook)"
+
+echo "  -- 작업이 정해지면 후보는 소음이므로 내놓지 않는다"
+c3 loop intent "정해진 작업" >/dev/null
+check "intent 가 있으면 후보를 숨긴다" '^0$' \
+  "$(c3 status | grep -c '하네스가 아는 할 일')"
+rm -rf "$CW3"
+
+echo "== Ctx 언팩 누락 (AST 전수)"
+COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)"; CRC2=$?
+check "ctx 를 풀지 않고 쓰는 함수가 없다" '^0$' "$CRC2"
+check "검사가 실제로 함수를 훑었다" '함수 [0-9]* 개\|함수 [0-9]*개' "$COUT"
 
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.

@@ -746,6 +746,66 @@ def retro_key_report(con, root, lid, lo):
     return keys, found, [k for k in keys if k not in found]
 
 
+def work_candidates(con, cfg, root, limit=6):
+    """하네스가 **자기 기록에서** 아는 할 일. Selection 의 작업 후보다.
+
+    "새 작업이 없다" 가 "할 일이 없다" 는 뜻이 아니다. 승격 결정이 밀려 있고,
+    통하지 않은 승격이 있고, 인덱스가 낡았고, 예산이 찼다면 그건 전부 복리를
+    유지하는 일이다. 이걸 내놓지 않으면 무인 실행이 Selection 에서 멈춘다 —
+    사람에게 물으라고 말해봐야 무인 실행에는 물을 사람이 없다.
+    """
+    out = []
+
+    def add(kind, what, how):
+        if len(out) < limit:
+            out.append({"kind": kind, "what": what, "how": how})
+
+    try:
+        for it in pending_promotions(con, cfg):
+            add("승격 결정", "'%s' 가 작업 %d개에서 반복된다 — 훅·구조로 올릴지 결정"
+                % (it["key"], it["loops"]),
+                "harness promote %s --as hook --note \"...\"" % it["key"])
+    except Exception:
+        pass
+    try:
+        for r in con.execute("SELECT key, decision, note FROM promotion "
+                             "WHERE maturity='regressed'"):
+            add("재발한 승격", "'%s' 는 %s 로 승격했는데 다시 걸렸다 — 그 방법이 통하지 "
+                "않았다" % (r["key"], r["decision"]),
+                "원인을 다시 보고 `harness promote %s` 로 다시 결정" % r["key"])
+    except Exception:
+        pass
+    try:
+        rep = tidy_report(con, cfg, root)
+        for d, note in rep["dirs"]:
+            add("기록 정리", "%s %s" % (d, note), "인덱스를 만들거나 갱신 (Scaffolding)")
+        if rep["groups"]:
+            add("기록 정리", "한 작업이 여러 파일을 남긴 묶음 %d개 — 하나로 병합"
+                % len(rep["groups"]), "harness tidy 로 목록 확인 (Scaffolding)")
+        if rep["stale"]:
+            add("기록 정리", "닫힌 작업의 오래된 파일 %d개 — 인덱스에 요약하고 정리"
+                % len(rep["stale"]), "harness tidy 로 목록 확인 (Scaffolding)")
+        if rep["learned"] and rep["learned"][0] >= rep["learned"][1]:
+            add("예산", "LEARNED.md 가 %d/%d 줄로 찼다 — 한 줄을 비워야 새 규칙이 들어간다"
+                % rep["learned"], "harness promote <기존키> --decline --reason \"...\"")
+    except Exception:
+        pass
+    return out
+
+
+def render_work_candidates(items, mode_note=True):
+    if not items:
+        return
+    print("\n하네스가 아는 할 일 (%d개) — 새 작업이 없다면 여기서 고를 수 있다:"
+          % len(items))
+    for i, it in enumerate(items, 1):
+        print("  %d. [%s] %s" % (i, it["kind"], it["what"]))
+        print("     → %s" % it["how"])
+    if mode_note:
+        print("  고르면 `harness loop intent \"...\"` 와 `harness loop done-when \"...\"` 로 "
+              "기록하고 진행하라. 이것들도 정말 필요 없으면 그렇다고 말하고 멈춰라.")
+
+
 def promotion_summary(con, cfg):
     rows = con.execute("SELECT maturity, COUNT(*) c FROM promotion "
                        "GROUP BY maturity").fetchall()
@@ -1241,12 +1301,13 @@ def skip_block_reason(cfg, sid, target):
     if ids[cur] == ids[0]:
         # 여기서 예전에는 `skip until:selection` 을 안내했다. 그건 dest 가 -1 이 되어
         # **항상 실패하는 명령**이고, 모델이 그대로 반복해 승인 요청이 무한히 떴다.
-        return ("%s 단계는 건너뛸 수 없다. 그리고 지금은 그럴 상황이 아니다 — "
-                "%s 은 **사람이 작업을 주는 자리**다. 할 작업이 없으면 스킵을 "
-                "시도하지 말고 그렇다고 말하고 멈춰라. 하네스는 작업을 만들 수 없다. "
-                "작업이 정해지면 `harness loop intent \"...\"` 와 "
-                "`harness loop done-when \"...\"` 로 기록하면 된다."
-                % (names, stage_obj(cfg, ids[0])["label"]))
+        return ("%s 단계는 건너뛸 수 없다 — 작업을 정하지 않고 넘어가면 이후 모든 단계가 "
+                "기준 없이 돌아간다. 스킵이 아니라 **작업을 고르는 것**이 다음 행동이다: "
+                "`harness status` 가 하네스가 아는 할 일을 후보로 보여준다(승격 결정, "
+                "재발한 승격, 낡은 인덱스, 예산 소진). 고르면 "
+                "`harness loop intent \"...\"` 와 `harness loop done-when \"...\"` 로 "
+                "기록하고 진행하라. 그 후보들까지 정말 필요 없으면 그렇다고 말하고 "
+                "멈춰라 — 그건 교착이 아니라 정상 종료다." % names)
     return ("%s 단계는 건너뛸 수 없다. 이 회차를 중단하려면 "
             "`harness skip until:%s --reason \"...\"` 로 %s 까지 이동한 뒤, 중단 사유를 "
             "회고로 남기고 `harness advance --cycle` (또는 `--done`) 으로 닫아라."
@@ -1548,7 +1609,7 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
 
 
 def hook_stop(inp, ctx):
-    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     stage = stage_obj(cfg, sid)
     # prompt_id 가 없는 환경에서 "-" 로 뭉치면 서로 다른 프롬프트가 이어붙임
     # 예산을 공유한다. 세션으로 대체하고, 그것도 없으면 작업 해시로 가둔다.
@@ -1577,7 +1638,7 @@ def hook_stop(inp, ctx):
             problems.append((key, "%s 단계를 끝낼 수 없다: %s"
                              % (stage["label"], CRITERIA_HELP.get(key, key))))
     if not problems:
-        return continue_or_stop(con, cfg, lid, sid, stage, prompt_id)
+        return continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id)
 
     blocked, exhausted = [], []
     with con:
@@ -1642,7 +1703,7 @@ def stalled_rounds(con, lid, prompt_id, fp):
     return stalled, len(seen)
 
 
-def continue_or_stop(con, cfg, lid, sid, stage, prompt_id):
+def continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id):
     """종료 조건을 다 채웠는데 단계가 남았으면 턴 종료를 막아 이어붙인다.
 
     하네스는 원래 반응만 하고 턴을 시작하지 않는다. 이건 그 한계를 Stop 훅으로
@@ -1663,9 +1724,18 @@ def continue_or_stop(con, cfg, lid, sid, stage, prompt_id):
     # Selection 에 작업이 없는 것은 교착이 아니라 **사람을 기다리는 상태**다.
     waiting = [k for k in exit_blockers(con, cfg, lid, sid) if k in HUMAN_CRITERIA]
     if waiting:
+        note = ""
+        if "intent_set" in waiting:
+            try:
+                n = len(work_candidates(con, cfg, root))
+            except Exception:
+                n = 0
+            if n:
+                note = (" 다만 하네스가 아는 할 일이 %d개 있다 — `harness status` 로 "
+                        "확인하고 고를 수 있다." % n)
         return emit({"systemMessage":
-                     "harness: %s 단계에서 사람의 입력을 기다린다 (%s). 턴을 끝낸다."
-                     % (stage["label"], ", ".join(waiting))})
+                     "harness: %s 단계에서 사람의 입력을 기다린다 (%s). 턴을 끝낸다.%s"
+                     % (stage["label"], ", ".join(waiting), note)})
     limit = cfg.num("stop_continue.max_per_prompt", 6, low=1)
     no_prog = cfg.num("stop_continue.no_progress_limit", 2, low=1)
     fp = progress_fingerprint(con, lid, sid)
@@ -1888,6 +1958,9 @@ def status_report(ctx):
         "pending_promotions": [it["key"] for it in pending_promotions(con, cfg)],
         "promoted": promotion_summary(con, cfg),
         "tidy": tidy_headline(con, cfg, root),
+        # 작업이 정해지지 않았을 때만. 정해졌으면 후보는 소음이다.
+        "candidates": ([] if (row and row["intent"])
+                       else work_candidates(con, cfg, root)),
     }
 
 
@@ -1930,6 +2003,8 @@ def render_status(d, cfg):
               % ", ".join("%s %d" % kv for kv in sorted(d["promoted"].items())))
     if d["tidy"]:
         print("  %s" % d["tidy"])
+    if d.get("candidates"):
+        render_work_candidates(d["candidates"])
 
 
 def cli_status(ctx, argv):
@@ -1962,6 +2037,13 @@ def _hint_on_enter(ctx, lid, sid):
     hint = stage_obj(cfg, sid).get("hint")
     if hint:
         print("\n%s" % hint)
+
+    # Selection 에 작업이 정해지지 않았으면 하네스가 아는 할 일을 후보로 내놓는다.
+    # 무인 실행에는 물을 사람이 없으므로, 고를 것을 주지 않으면 거기서 멈춘다.
+    if sid == cfg["stages"][0]["id"]:
+        row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+        if not (row and row["intent"]):
+            render_work_candidates(work_candidates(con, cfg, root))
 
     # Scaffolding 은 '줄이는' 단계다. 권고만으로는 아무도 줄이지 않았으므로 목록을 준다.
     if sid == "scaffolding":
