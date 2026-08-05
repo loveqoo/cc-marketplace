@@ -211,8 +211,11 @@ Scaffolding 이 불완전했다는 증거**다. 자식 루프로 감싸면 그 �
 - 상태 DB(`.claude/harness/harness.db`)는 커밋하지 않는 런타임 전용이고, 작업이 닫히면 그
   작업의 행은 버려진다. 영구 기록은 파일명에 해시가 박힌 md 파일들이다.
 - 스킵 사유는 반드시 노출한다. 사유 없는 `skip` 은 거부된다.
-- `bypassPermissions` 모드에서는 동의 다이얼로그가 뜨지 않으므로 `skip`/`allow`/`approve-plan`
-  이 모두 거부된다. 권한 모드를 낮추고 다시 시도한다.
+- `bypassPermissions`(`--dangerously-skip-permissions`)는 **사람이 세션 단위로 미리 승인한**
+  상태다. `skip`/`allow`/`approve-plan`/`loop new` 가 다이얼로그 없이 통과하지만 **사유는
+  여전히 필수**이고 우회 사실이 `bypass` 이벤트로 남는다 (`harness stats` 의 '게이트 우회',
+  `metrics` 의 회피 열). 무인 실행에 쓰는 모드다.
+  예외는 `auto-skip on` 하나 — 그 효과가 세션을 넘어 남으므로 사람의 판단이 필요하다.
 - 계획과 검증 결과를 **다른 모델이나 서브에이전트에게 적대적으로 검토받는 것을 고려한다**
   (권고 — 강제하지 않는다). 사용자가 원하면 여러 모델에 돌린다.
 - 하네스 자신(`.claude/harness/bin/`, `harness.db`, `LEARNED.md`)은 Write/Edit 뿐 아니라

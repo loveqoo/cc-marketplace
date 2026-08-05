@@ -1335,11 +1335,31 @@ def ctrl_decision(con, cfg, sub, cmd, mode, lid, sid):
     if reason:
         detail += "\n사유: %s" % reason
     detail += "\n승인하면 하네스 상태에 기록된다."
-    if mode == "bypassPermissions":
+    if mode == "bypassPermissions" and sub == "auto-skip":
+        # 하나의 예외. `auto-skip on` 의 효과는 **세션을 넘어 지속된다**(meta 에 저장되고
+        # scope 를 project 로 두면 이후 세션에도 남는다). 세션 단위 사전 승인으로
+        # 세션을 넘는 결정을 덮을 수는 없다. 이건 진짜 사람의 판단이 필요하다.
         record_event(con, lid, sid, "block", "bypass_mode", sub, cmd[:200])
         return pre_decision("deny", detail +
-            "\nbypassPermissions 모드에서는 사람의 동의를 받을 수 없어 거부한다. "
-            "권한 모드를 낮추고 다시 시도하라.")
+            "\nbypassPermissions 는 이 세션의 사전 승인이지만 `auto-skip on` 은 효과가 "
+            "세션을 넘어 남는다. 그래서 이것만은 거부한다 — 권한 모드를 낮추고 사람의 "
+            "판단을 받아라. 이 세션의 스킵은 이미 사전 승인으로 통과한다.")
+
+    if mode == "bypassPermissions":
+        # `--dangerously-skip-permissions` 는 **사람이 세션 단위로 미리 승인한** 상태다.
+        # "동의를 받을 수 없는 상태" 로 읽고 거부했더니, 무인 실행 전용 모드에서
+        # `approve-plan` 이 불가능해져 Planning 이 교착됐다 — 모델은 산문으로
+        # "승인하면 진행한다" 며 사람을 기다리고, 루프가 멈춘다.
+        #
+        # 승인은 면제하되 **기록은 면제하지 않는다.** auto-skip on 과 같은 취급이다.
+        # 우회 사실은 bypass 이벤트로 남아 `stats` 와 `metrics` 의 회피 열에 드러난다.
+        record_event(con, lid, sid, "bypass", "bypass_mode", sub, cmd[:200])
+        out = pre_decision("defer", None)
+        out["systemMessage"] = (
+            "harness: %s 을 bypassPermissions 사전 승인으로 통과시켰다%s. "
+            "기록은 남는다 — `harness stats` 의 '게이트 우회'."
+            % (sub, " (사유: %s)" % reason if reason else ""))
+        return out
     return pre_decision("ask", detail)
 
 

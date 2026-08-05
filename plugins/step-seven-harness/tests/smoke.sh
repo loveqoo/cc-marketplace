@@ -174,7 +174,7 @@ check "사유 있는 skip 은 ask" '"permissionDecision": "ask"' \
   "$(hook "$(B '.claude/harness/bin/harness skip verification --reason \"문서 작업이라 불필요\"' default)")"
 check "ask 에 사유 노출" '문서 작업이라 불필요' \
   "$(hook "$(B '.claude/harness/bin/harness skip verification --reason \"문서 작업이라 불필요\"' default)")"
-check "bypassPermissions 에서는 deny" '"permissionDecision": "deny"' \
+check "bypassPermissions 는 사전 승인으로 통과" '"permissionDecision": "defer"' \
   "$(hook "$(B '.claude/harness/bin/harness skip verification --reason \"x\"' bypassPermissions)")"
 check_empty "status 는 통과" "$(hook "$(B '.claude/harness/bin/harness status' default)")"
 
@@ -293,7 +293,7 @@ check "auto-skip on 은 사용자 승인 필요" '"permissionDecision": "ask"' \
   "$(hook "$(B "$SKON --reason \\\"급한 핫픽스 기간\\\"" default)")"
 check "켜는 행위의 위험을 다이얼로그에 노출" '다이얼로그 없이 통과' \
   "$(hook "$(B "$SKON --reason \\\"급한 핫픽스 기간\\\"" default)")"
-check "bypassPermissions 에서는 켤 수 없다" '"permissionDecision": "deny"' \
+check "auto-skip on 은 bypass 에서도 거부 (세션을 넘는 결정)" '"permissionDecision": "deny"' \
   "$(hook "$(B "$SKON --reason \\\"x\\\"" bypassPermissions)")"
 check_empty "auto-skip off 는 승인 없이 통과" \
   "$(hook "$(B '.claude/harness/bin/harness auto-skip off' default)")"
@@ -620,7 +620,7 @@ check "loop adopt 는 ask" '"permissionDecision": "ask"' \
   "$(hook "$(B '.claude/harness/bin/harness loop adopt 260101-abcdef --reason x' default)")"
 check "사유 없는 loop new 는 거부" '사유 없이 loop new' \
   "$(hook "$(B '.claude/harness/bin/harness loop new' default)")"
-check "bypassPermissions 에서는 loop new 거부" '"permissionDecision": "deny"' \
+check "bypassPermissions 에서 loop new 는 사전 승인" '"permissionDecision": "defer"' \
   "$(hook "$(B '.claude/harness/bin/harness loop new --reason x' bypassPermissions)")"
 check_empty "loop 조회는 동의 없이" "$(hook "$(B '.claude/harness/bin/harness loop' default)")"
 check_empty "loop intent 는 동의 없이" \
@@ -990,7 +990,7 @@ check "홑따옴표 값도 사유로 인식된다" '사유: a b' \
   "$(gb "$W_ loop new --reason 'a b'")"
 check "&& 로 이어도 걸린다" '"permissionDecision": "ask"' \
   "$(gb "$W_ recall x && $W_ allow docs/x.md --reason y")"
-check "bypassPermissions 에서는 거부" '"permissionDecision": "deny"' \
+check "bypassPermissions 에서 옵션 배치도 사전 승인" '"permissionDecision": "defer"' \
   "$(gb "$W_ loop --reason=x new" bypassPermissions)"
 check_empty "동의 불필요 명령은 조용하다 (status)" "$(gb "$W_ status")"
 check_empty "동의 불필요 명령은 조용하다 (loop)" "$(gb "$W_ loop")"
