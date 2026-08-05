@@ -1885,6 +1885,126 @@ wred 'cfg["write_rules"][4]["deny"] = "x"; cfg["write_rules"][4]["id"] = "protec
 check "id 중복을 지적한다" "id 'protected' 가 중복" "$(wr status 2>&1)"
 rm -rf "$WR"
 
+echo "== 정책·내용도 설정이 정한다 (recall 폴더·회고 질문·동의·셸 분류)"
+# recall.dirs 는 조용한 결함이었다. dev_subdirs 에 폴더를 더해도 recall 이 그 폴더를
+# 못 봐서, 안내대로 stages.json 을 고친 사람이 **다시 안 읽히는 기록**을 쌓게 됐다.
+# 파일은 있고 키워드도 맞는데 영원히 안 나온다 — 복리의 반대다.
+PW5="$(mktemp -d)"
+(cd "$PW5" && git init -q . && python3 "$ENGINE" init >/dev/null)
+p5() { (cd "$PW5" && python3 "$ENGINE" "$@"); }
+p5ed() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$PW5/.claude/harness/stages.json" "$1"; }
+
+p5 loop intent "정책 어휘" >/dev/null
+P5PRE="$(p5 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$PW5/.dev/postmortem"
+printf '# 사후분석\nENOENT 오류를 이렇게 고쳤다\n' > "$PW5/.dev/postmortem/${P5PRE}pm.md"
+check_empty "recall 대상이 아닌 폴더는 안 나온다" \
+  "$(p5 recall ENOENT 2>&1 | grep 'postmortem' || true)"
+p5ed '
+cfg["folder_rules"]["dev_subdirs"].append("postmortem")
+cfg["folder_rules"]["loop_prefixed_dirs"].append("postmortem")
+cfg["recall"]["dirs"].append("postmortem")'
+check "recall.dirs 에 넣으면 나온다" 'postmortem' "$(p5 recall ENOENT 2>&1)"
+check "쓸 수 없는 폴더를 recall 대상으로 두면 지적한다" 'dev_subdirs 에 없다' \
+  "$(p5ed 'cfg["recall"]["dirs"].append("nowhere")'; p5 status 2>&1)"
+check "recall.dirs 가 비면 지적한다" '하나도 찾지 못한다' \
+  "$(p5ed 'cfg["recall"]["dirs"] = []'; p5 status 2>&1)"
+
+echo "  -- 회고 질문은 복리의 핵심이므로 사람이 정한다"
+p5ed 'cfg["recall"]["dirs"] = ["retrospect", "learning", "troubleshooting"]
+cfg["retro_questions"] = [{"q": "무엇을 다시 만들 뻔했나", "why": "중복 구현이 가장 비싸다"}]'
+p5 loop done-when "끝" >/dev/null
+p5 advance >/dev/null; p5 advance >/dev/null; p5 advance >/dev/null
+P5B="$(p5 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$PW5/.dev/plan"; printf '#\n' > "$PW5/.dev/plan/${P5B}p.md"
+p5 approve-plan ".dev/plan/${P5B}p.md" >/dev/null
+p5 advance >/dev/null
+printf 'check:\n\t@true\n' > "$PW5/Makefile"
+p5 verify -- make check >/dev/null
+p5 advance >/dev/null
+check "설정한 회고 질문이 제시된다" '무엇을 다시 만들 뻔했나' "$(p5 advance 2>&1)"
+check_empty "기본 질문은 더 이상 나오지 않는다" \
+  "$(p5 advance 2>&1 | grep '무엇이 통했나' || true)"
+check "질문이 비면 지적한다" '무엇을 물을지가 없다' \
+  "$(p5ed 'cfg["retro_questions"] = []'; p5 status 2>&1)"
+
+echo "  -- 동의가 필요한 명령도 설정이다 (마찰이 크면 덜어낼 수 있다)"
+CS="$(mktemp -d)"
+(cd "$CS" && git init -q . && python3 "$ENGINE" init >/dev/null)
+csb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$CS" "$1" \
+  | CLAUDE_PROJECT_DIR="$CS" python3 "$ENGINE" hook; }
+CSH="$CS/.claude/harness/bin/harness"
+check "기본은 allow 에 승인을 요구한다" '"permissionDecision": "ask"' \
+  "$(csb "$CSH allow 'docs/x.md' --reason '필요'")"
+check "무엇을 승인하는지 설정 문구가 나온다" '쓰기 금지 경로에 대한 예외 요청' \
+  "$(csb "$CSH allow 'docs/x.md' --reason '필요'")"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['consent'].pop('allow')
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$CS/.claude/harness/stages.json"
+check_empty "consent 에서 덜어내면 묻지 않는다" \
+  "$(csb "$CSH allow 'docs/x.md' --reason '필요'")"
+# 단 auto-skip on 은 별도 분기라 설정과 무관하게 계속 묻는다 (세션을 넘는 결정이다)
+check "auto-skip on 은 덜어내도 계속 묻는다" '"permissionDecision": "ask"' \
+  "$(python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['consent'] = {}
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$CS/.claude/harness/stages.json"; csb "$CSH auto-skip on --reason '무인 실행'")"
+
+echo "  -- 셸 명령 분류도 설정이다 (툴체인이 프로젝트마다 다르다)"
+BS="$(mktemp -d)"
+(cd "$BS" && git init -q . && python3 "$ENGINE" init >/dev/null)
+bsb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$BS" "$1" \
+  | CLAUDE_PROJECT_DIR="$BS" python3 "$ENGINE" hook; }
+# mutator_pattern 이 좌우하는 것은 **부모 디렉터리**를 대상으로 하는 경우다
+# (`rm -rf .claude`). 보호 경로를 직접 지정하면 패턴과 무관하게 막힌다 — fail-safe 다.
+check "보호 경로 직접 지정은 패턴과 무관하게 막힌다" '하네스 자신' \
+  "$(bsb "myrm .claude/harness/harness.db")"
+check_empty "모르는 명령의 부모 디렉터리 지정은 통과 (기본 패턴)" \
+  "$(bsb "myrm -rf .claude")"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['bash']['mutator_pattern'] = r'(^|[;&|]\s*)(myrm|rm)\b'
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$BS/.claude/harness/stages.json"
+check "패턴에 넣으면 부모 디렉터리도 막는다" '하네스 자신' "$(bsb "myrm -rf .claude")"
+
+echo "  -- readers 도 설정이다 (읽기 명령은 막지 않는다)"
+check_empty "cat 은 보호 경로를 읽어도 통과" "$(bsb "cat .claude/harness/harness.db")"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['bash']['readers'] = [r for r in cfg['bash']['readers'] if r != 'cat']
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$BS/.claude/harness/stages.json"
+check "readers 에서 빼면 cat 도 막힌다" '하네스 자신' \
+  "$(bsb "cat .claude/harness/harness.db")"
+check "잘못된 정규식은 지적하고 기본값으로 돈다" '잘못된 정규식' \
+  "$(python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['bash']['mutator_pattern'] = '([unclosed'
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$BS/.claude/harness/stages.json"; (cd "$BS" && python3 "$ENGINE" status 2>&1))"
+check "그래도 기본 보호는 살아 있다" '하네스 자신' "$(bsb "rm .claude/harness/harness.db")"
+rm -rf "$PW5" "$CS" "$BS"
+
 echo "== 어휘 안에서 덜어낸 것은 되살리지 않는다"
 # "마찰이 크면 stages.json 에서 덜어낸다"가 이 하네스의 작업 방식이다. 템플릿 채움이
 # 항목 단위로 병합하면 지운 것이 되살아나 그 자유를 빼앗는다. 영역이 통째로 없을 때만 채운다.

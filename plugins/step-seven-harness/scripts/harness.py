@@ -55,16 +55,6 @@ CTRL_NAMES = ("harness", "harness.py")
 # 따옴표 안은 값이다. 먼저 한 토큰으로 뭉개야 `--reason "a b"` 의 'b' 가 위치
 # 인자로 오인되지 않는다 — 그 오인이 subcommand 판정을 틀리게 만들었다.
 QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
-CONSENT_CMDS = ("skip", "allow", "approve-plan", "loop new", "loop adopt")
-CTRL_HEAD = {
-    "skip": "단계 스킵 요청",
-    "allow": "쓰기 금지 경로에 대한 예외 요청",
-    "approve-plan": "계획 승인 요청",
-    "loop new": "현재 작업을 닫고 새 작업을 시작하는 요청 — "
-                "남은 단계와 승격 결정을 건너뛰게 된다",
-    "loop adopt": "기존 루프 해시 재연결 요청",
-    "auto-skip": "스킵 자동 승인 활성화 요청 — 이후 스킵은 다이얼로그 없이 통과한다",
-}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS loop (
@@ -315,6 +305,61 @@ def _adopt_evidence_signals(cfg):
 
 SATISFIED_BY = ("cli", "file", "observed", "no_pending_promotions")
 
+# 아래 다섯 개는 **정책·내용**이라 설정이 정한다. 엔진에 박아 두면 프로젝트마다 다른
+# 것을 하나로 강요하게 되고, 특히 recall_dirs 는 조용한 결함이었다 — 설정에 폴더를
+# 더해도 recall 이 그 폴더를 못 봐서, 안내대로 고친 사람이 **다시 안 읽히는 기록**을
+# 쌓게 됐다. 파일은 있고 키워드도 맞는데 영원히 안 나온다. 복리의 반대다.
+RECALL_DIRS_DEFAULT = ("retrospect", "learning", "troubleshooting")
+INDEX_NAMES_DEFAULT = ("INDEX.md", "README.md")
+BASH_READERS_DEFAULT = ("cat", "less", "more", "head", "tail", "grep", "rg", "wc",
+                        "file", "stat", "ls", "diff", "shasum", "md5", "md5sum", "cut")
+BASH_INTERPRETERS_DEFAULT = ("python", "python3", "sh", "bash", "zsh", "env",
+                             "exec", "node")
+
+
+def recall_dirs(cfg):
+    """`recall` 이 읽는 폴더. 이 밖의 기록은 **존재하지 않는 것과 같다.**
+
+    `dev_subdirs` 전체를 읽지 않는 것은 의도다 — `plan`·`log`·`scratch` 는 교훈이
+    아니라 산출물이고, 그것까지 끌어오면 조회가 소음으로 덮인다.
+    """
+    return tuple(cfg.seq("recall.dirs", RECALL_DIRS_DEFAULT))
+
+
+def index_names(cfg):
+    return tuple(cfg.seq("recall.index_names", INDEX_NAMES_DEFAULT))
+
+
+def recall_read_bytes(cfg):
+    return cfg.num("recall.read_bytes", 50000, low=1000)
+
+
+def retro_questions(cfg):
+    """회고에서 물을 것. 무엇을 묻는지가 회고의 값을 정하므로 사람이 정해야 한다."""
+    out = []
+    for it in cfg.seq("retro_questions"):
+        if isinstance(it, dict) and it.get("q"):
+            out.append((it["q"], it.get("why") or ""))
+    return out
+
+
+def consent_map(cfg):
+    """사람의 승인이 필요한 하네스 명령 → 무엇을 승인하는지의 설명.
+
+    설정이라는 것은 **줄일 수 있다는 뜻**이다. `allow` 다이얼로그가 시끄러우면
+    하네스를 끄는 대신 그 항목을 덜어낼 수 있다.
+    """
+    m = cfg.obj("consent")
+    return {k: v for k, v in m.items() if isinstance(v, str)} if m else {}
+
+
+def bash_mutator_re(cfg):
+    pat = cfg.at("bash.mutator_pattern")
+    try:
+        return re.compile(pat) if pat else BASH_MUTATORS
+    except re.error:
+        return BASH_MUTATORS       # 잘못된 정규식으로 게이트를 열지 않는다
+
 
 def config_problems(cfg):
     """설정의 **오타**를 찾는다. 규칙 위반이 아니라 어휘 오류만 본다.
@@ -397,6 +442,28 @@ def config_problems(cfg):
         if isinstance(name, str) and cfg.at(name) is None:
             out.append("%s.require.basename_matches='%s' 가 설정에 없다 "
                        "— 아무것도 막지 못한다" % (at, name))
+
+    # recall 대상 폴더. 여기 오타가 나면 그 폴더의 기록은 **영원히 안 나온다** —
+    # 파일은 있고 키워드도 맞는데 조회에 안 걸린다. 조용한 결함으로 실제로 있었다.
+    dev_dirs = set(cfg.seq("folder_rules.dev_subdirs"))
+    for d in cfg.seq("recall.dirs", RECALL_DIRS_DEFAULT):
+        if dev_dirs and d not in dev_dirs:
+            out.append("recall.dirs 의 '%s' 가 folder_rules.dev_subdirs 에 없다 "
+                       "— 그 폴더에는 쓸 수 없으므로 조회할 것도 없다" % d)
+    if not cfg.seq("recall.dirs", RECALL_DIRS_DEFAULT):
+        out.append("recall.dirs 가 비어 있다 — 과거 회고를 하나도 찾지 못한다")
+    if not retro_questions(cfg):
+        out.append("retro_questions 가 비어 있다 — 회고에서 무엇을 물을지가 없다")
+    for i, it in enumerate(cfg.seq("retro_questions")):
+        if not isinstance(it, dict) or not it.get("q"):
+            out.append("retro_questions[%d] 에 q 가 없다 — 이 질문은 무시된다" % i)
+    pat = cfg.at("bash.mutator_pattern")
+    if pat:
+        try:
+            re.compile(pat)
+        except re.error as e:
+            out.append("bash.mutator_pattern 이 잘못된 정규식이다 (%s) "
+                       "— 기본 패턴으로 되돌아간다" % e)
 
     known = set(crit)
     for st in cfg.get("stages") or []:
@@ -846,16 +913,6 @@ def promote_change_seen(con, cfg, lid, as_kind):
 #
 # 통찰의 질은 채점하지 않는다(판단이다). 찾아지는지만 확인한다(기계적 사실이다).
 
-RETRO_QUESTIONS = (
-    ("무엇이 통했나", "막혔던 것을 결국 어떻게 풀었는가. 실패만 적으면 절반이다 — "
-                      "다음에 필요한 건 해결 쪽이다"),
-    ("무엇을 잘못 가정했나", "시작할 때 참이라고 믿었는데 틀린 것. 같은 오해가 "
-                             "다음 작업에서 되풀이된다"),
-    ("이 회차를 싸게 만들었을 것은", "미리 알았다면 무엇이 줄었을까. 이게 복리의 "
-                                     "정의 그 자체다"),
-)
-
-
 def cycle_search_keys(con, lid, lo, limit=6):
     """이 회차에 관측된 것들의 **검색 키**.
 
@@ -871,11 +928,11 @@ def cycle_search_keys(con, lid, lo, limit=6):
     return keys[:limit]
 
 
-def retro_files_of_cycle(con, root, lid):
+def retro_files_of_cycle(con, cfg, root, lid):
     """이 회차가 쓴 회고·학습 파일. 파일명 접두사로 가른다."""
     pre = file_prefix(con, lid)
     out = []
-    for sub in RECALL_DIRS:
+    for sub in recall_dirs(cfg):
         d = os.path.join(root, ".dev", sub)
         if not os.path.isdir(d):
             continue
@@ -889,16 +946,16 @@ def retro_files_of_cycle(con, root, lid):
     return out
 
 
-def retro_key_report(con, root, lid, lo):
+def retro_key_report(con, cfg, root, lid, lo):
     """(키, 찾은 키, 못 찾은 키). 검색과 **같은 범위**를 읽어 확인한다."""
     keys = cycle_search_keys(con, lid, lo)
     if not keys:
         return [], [], []
     hay = ""
-    for path in retro_files_of_cycle(con, root, lid):
+    for path in retro_files_of_cycle(con, cfg, root, lid):
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                hay += "\n" + fh.read(RECALL_READ_BYTES).lower()
+                hay += "\n" + fh.read(recall_read_bytes(cfg)).lower()
         except OSError:
             continue
     found = [k for k in keys if k.lower() in hay]
@@ -1323,11 +1380,8 @@ def check_write(ctx, rel):
 BASH_SPLIT = re.compile(r"\|\||&&|[;&|\n]")
 # 이 프로그램들에 넘긴 경로는 '실행 대상'이다. 하네스 래퍼를 python3 로 돌리는 것은
 # 정상 동작이므로 변경 시도로 오인해서는 안 된다.
-BASH_INTERPRETERS = ("python", "python3", "sh", "bash", "zsh", "env", "exec", "node")
 # 읽기만 하는 명령은 막지 않는다. 과잉 차단은 마찰이 되고, 마찰은 게이트를 끄게 만든다.
 # find 는 없다 — `-delete`/`-exec` 로 파일을 지운다.
-BASH_READERS = ("cat", "less", "more", "head", "tail", "grep", "rg", "wc", "file",
-                "stat", "ls", "diff", "shasum", "md5", "md5sum", "cut")
 
 
 def bash_protected_hit(cfg, root, cmd):
@@ -1340,7 +1394,7 @@ def bash_protected_hit(cfg, root, cmd):
     if not pats:
         return None
 
-    mutating = bool(BASH_MUTATORS.search(cmd))
+    mutating = bool(bash_mutator_re(cfg).search(cmd))
     # `>|경로` 의 `|` 를 BASH_SPLIT 이 파이프로 보고 쪼개면 경로가 다음 세그먼트의
     # **명령어 자리**로 밀려 '실행 대상' 으로 건너뛰어진다. 먼저 떼어놓는다.
     cmd = cmd.replace(">|", "> ")
@@ -1375,9 +1429,9 @@ def bash_protected_hit(cfg, root, cmd):
             continue
         head = os.path.basename(toks[0].strip("\"'"))
         # 리다이렉트가 있으면 읽기 명령도 쓰기가 된다 (`cat x > 엔진`).
-        if head in BASH_READERS and ">" not in seg:
+        if head in cfg.seq("bash.readers", BASH_READERS_DEFAULT) and ">" not in seg:
             continue
-        skip = 2 if head in BASH_INTERPRETERS and len(toks) > 1 else 1
+        skip = 2 if head in cfg.seq("bash.interpreters", BASH_INTERPRETERS_DEFAULT) and len(toks) > 1 else 1
         for tok in toks[skip:]:
             hit = protected(tok)
             if hit:
@@ -1641,7 +1695,7 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
         # 반드시 사람의 동의를 받는다 — 그러지 않으면 모델이 스스로 켤 수 있다.
         if not re.search(r"auto-skip\s+on\b", cmd):
             return
-    elif sub not in CONSENT_CMDS:
+    elif sub not in consent_map(cfg):
         return
 
     if sub == "skip":
@@ -1673,7 +1727,7 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
                                 % (reason, auto_skip_scope_note(con)))
         return out
 
-    detail = "%s: `%s`" % (CTRL_HEAD[sub], cmd.strip())
+    detail = "%s: `%s`" % (consent_map(cfg).get(sub, sub + " 요청"), cmd.strip())
     if reason:
         detail += "\n사유: %s" % reason
     if sub == "approve-plan":
@@ -1739,7 +1793,7 @@ def hook_pre_tool_use(inp, ctx):
         if reqs:
             return  # 제어 명령이지만 동의가 필요 없다
 
-        if BASH_MUTATORS.search(cmd):
+        if bash_mutator_re(cfg).search(cmd):
             for tok in re.findall(r"[\w./~-]+", cmd):
                 rel = rel_to_root(root, tok)
                 if rel and "/" in rel and classify(rel, cfg) == "docs" \
@@ -1909,7 +1963,7 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
 
     # 인덱스는 조건 없이 앞에 놓이므로, 그대로 쓰면 모든 실패에 같은 인덱스가 붙어
     # 벽지가 된다. 키워드에 실제로 걸린 파일을 우선하고 인덱스는 대체 경로로만 준다.
-    indexes, files = _recall_files(root, [target], limit=4)
+    indexes, files = _recall_files(cfg, root, [target], limit=4)
     if files:
         lines.append("관련 기록 — 같은 실수를 다시 하기 전에 읽어라: %s"
                      % ", ".join(files[:3]))
@@ -2436,7 +2490,7 @@ def _hint_on_enter(ctx, lid, sid):
     # 무엇을 물을지가 회고의 값을 정한다. 관측을 나열하기 **전에** 질문을 둔다 —
     # 순서를 뒤집으면 "규칙에 걸린 목록"이 회고의 전부가 된다.
     print("\n회고에 답할 것:")
-    for i, (q, why) in enumerate(RETRO_QUESTIONS, 1):
+    for i, (q, why) in enumerate(retro_questions(cfg), 1):
         print("  %d. **%s** — %s" % (i, q, why))
 
     keys = cycle_search_keys(con, lid, cycle_window_start(con, lid))
@@ -2547,7 +2601,7 @@ def cli_advance(ctx, argv):
     if sid == last:
         try:
             keys, found, missing = retro_key_report(
-                con, root, lid, cycle_window_start(con, lid))
+                con, cfg, root, lid, cycle_window_start(con, lid))
             if keys:
                 retro_note = (keys, found, missing)
                 with con:
@@ -2775,10 +2829,8 @@ def cli_approve_plan(ctx, argv):
     return 0
 
 
-RECALL_DIRS = ("retrospect", "learning", "troubleshooting")
 # 회고 파일에서 읽는 범위. 이 밖의 내용은 `recall` 이 못 본다 — 즉 존재하지 않는
 # 것과 같다. 회고 키 확인도 **같은 상수**를 써야 확인이 거짓말을 하지 않는다.
-RECALL_READ_BYTES = 50000
 
 # 작업 설명에서 키워드를 뽑을 때 걸러낼 저정보 단어. 이것들이 남으면 OR 조회가
 # 거의 모든 기록에 걸려서 조회가 무의미해진다.
@@ -2809,10 +2861,9 @@ def _expand_keywords(keywords):
     return out
 
 
-INDEX_NAMES = ("INDEX.md", "README.md")
 
 
-def _recall_files(root, keywords, limit=6):
+def _recall_files(cfg, root, keywords, limit=6):
     """회고·학습·트러블슈팅 파일 중 키워드에 걸리는 것. 내용은 읽지 않고 경로만 준다.
 
     인덱스 파일은 키워드와 무관하게 항상 앞에 놓는다. 파일이 수백 개로 쌓이면
@@ -2820,7 +2871,7 @@ def _recall_files(root, keywords, limit=6):
     """
     keywords = _expand_keywords(keywords) if keywords else set()
     indexes, hits = [], []
-    for sub in RECALL_DIRS:
+    for sub in recall_dirs(cfg):
         d = os.path.join(root, ".dev", sub)
         if not os.path.isdir(d):
             continue
@@ -2829,7 +2880,7 @@ def _recall_files(root, keywords, limit=6):
             if not os.path.isfile(path):
                 continue
             rel = ".dev/%s/%s" % (sub, name)
-            if name in INDEX_NAMES:
+            if name in index_names(cfg):
                 indexes.append(rel)
                 continue
             if not keywords:
@@ -2838,7 +2889,7 @@ def _recall_files(root, keywords, limit=6):
             hay = name.lower()
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:
-                    hay += "\n" + fh.read(RECALL_READ_BYTES).lower()
+                    hay += "\n" + fh.read(recall_read_bytes(cfg)).lower()
             except Exception:
                 pass
             if any(kw.lower() in hay for kw in keywords):
@@ -2860,7 +2911,7 @@ def tidy_report(con, cfg, root):
                   con.execute("SELECT id FROM loop WHERE closed_at IS NULL")}
 
     out = {"dirs": [], "stale": [], "groups": [], "learned": None, "regressed": []}
-    for sub in RECALL_DIRS:
+    for sub in recall_dirs(cfg):
         d = os.path.join(root, ".dev", sub)
         if not os.path.isdir(d):
             continue
@@ -2869,7 +2920,7 @@ def tidy_report(con, cfg, root):
         except OSError:
             continue
         files = [n for n in names
-                 if os.path.isfile(os.path.join(d, n)) and n not in INDEX_NAMES]
+                 if os.path.isfile(os.path.join(d, n)) and n not in index_names(cfg)]
         if not files:
             continue
         idx = os.path.join(d, "INDEX.md")
@@ -3286,7 +3337,7 @@ def cli_promote(ctx, argv):
 
 def cli_recall(ctx, argv):
     """과거 관측 기록과 회고 파일을 조회한다 (pull). 무엇이 관련 있는지는 호출자가 판단한다."""
-    con, root, lid = ctx.con, ctx.root, ctx.lid
+    con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
     keywords = argv_positional(argv)
     kind = argv_value(argv, "kind")
     rule = argv_value(argv, "rule")
@@ -3358,7 +3409,7 @@ def cli_recall(ctx, argv):
             for r in matched:
                 print("  %-40s ×%d (작업 %d)" % (r["target"][:40], r["c"], r["loops"]))
 
-    indexes, files = _recall_files(root, keywords)
+    indexes, files = _recall_files(cfg, root, keywords)
     if indexes:
         print("\n인덱스 — 쌓인 기록의 진입점 (먼저 읽어라)")
         for f in indexes:
