@@ -22,5 +22,8 @@
         "metrics"
       ]
     }
-  ]
+  ],
+  "renames": {
+    "step-six-harness": "step-seven-harness"
+  }
 }

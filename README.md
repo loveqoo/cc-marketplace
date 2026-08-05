@@ -25,6 +25,9 @@ AI와 함께 일할 때 **복리가 쌓이도록** 작업 절차를 훅으로 �
 /plugin install step-seven-harness@cc-marketplace
 ```
 
+> `step-six-harness` 로 설치하셨던 분은 그대로 쓰시면 됩니다 — 이름 변경 매핑(`renames`)이
+> 있어 자동으로 이어집니다. `/plugin update` 로 최신 버전을 받으십시오.
+
 📖 **[사용법·설계 근거는 플러그인 README](plugins/step-seven-harness/README.md)** 를 보십시오 —
 누구에게 맞는지, 언제 끼어드는지, 무엇이 어디에 저장되는지, 막혔을 때 무엇을 하는지,
 그리고 무엇을 조사해 만들었는지가 적혀 있습니다.

@@ -249,13 +249,18 @@ sh tests/init_diff.sh         # 설치 동작이 리팩터 전과 같은지 차�
 <details>
 <summary><strong><code>step-six-harness</code> 를 쓰고 계셨다면</strong></summary>
 
-단계가 6개에서 7개가 되어 이름이 바뀌었습니다. 이름 변경 매핑을 넣지 않았으므로 기존
-설치는 그대로 이어지지 않습니다.
+단계가 6개에서 7개가 되어 이름이 바뀌었습니다. **이름 변경 매핑(`renames`)이 있어 기존
+설치가 자동으로 이어집니다.** 최신 버전을 받으시려면:
 
 ```bash
-/plugin uninstall step-six-harness
-/plugin install step-seven-harness@cc-marketplace
+/plugin update step-seven-harness@cc-marketplace
 ```
+
+> 매핑을 넣기 전에 이름을 바꿨던 짧은 기간이 있었습니다. 그 사이에 새 세션을 여셨다면
+> 플러그인이 **미설치로 보이고 스킬이 로드되지 않았을** 수 있습니다. 지금은 해결됐지만
+> 여전히 그렇게 보이면 한 번 재설치하십시오:
+> `/plugin uninstall step-six-harness@cc-marketplace` 후
+> `/plugin install step-seven-harness@cc-marketplace`.
 
 **프로젝트의 기록은 안전합니다.** `.claude/harness/` 는 플러그인 이름과 무관한 고정
 경로이므로 회고·계획 파일, 상태 DB, `LEARNED.md`, 승격 이력이 전부 그대로 쓰입니다.
