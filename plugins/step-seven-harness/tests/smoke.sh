@@ -1307,6 +1307,49 @@ COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)"; CRC2=$?
 check "ctx 를 풀지 않고 쓰는 함수가 없다" '^0$' "$CRC2"
 check "검사가 실제로 함수를 훑었다" '함수 [0-9]* 개\|함수 [0-9]*개' "$COUT"
 
+echo "== 계획 승인 다이얼로그가 계획을 보여준다"
+# auto-mode(acceptEdits)에서도 계획 승인은 물어야 한다 — "편집 자동 수락" 이지
+# "계획 검토 생략" 이 아니다. 다만 다이얼로그가 파일 이름만 보여주면 읽지 않고
+# 찍는 도장이 되고, 그렇게 남은 plan_approved 기록은 가짜다.
+PW="$(mktemp -d)"
+(cd "$PW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+pw() { (cd "$PW" && python3 "$ENGINE" "$@"); }
+pb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","permission_mode":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$PW" "$2" "$1" \
+  | CLAUDE_PROJECT_DIR="$PW" python3 "$ENGINE" hook; }
+pw loop intent "결제 리팩터" >/dev/null
+pw loop done-when "테스트 통과" >/dev/null
+pw advance >/dev/null; pw advance >/dev/null; pw advance >/dev/null
+PPRE="$(python3 - "$PW" "$(dirname "$ENGINE")" <<'PYP'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+print(h.file_prefix(con, h.head_loop(con)))
+PYP
+)"
+mkdir -p "$PW/.dev/plan"
+printf '# 결제 리팩터\n\n## 목표\n전략 패턴으로 분리한다.\n\n## 위험\n결제는 되돌릴 수 없다.\n' \
+  > "$PW/.dev/plan/${PPRE}plan.md"
+PCMD="$PW/.claude/harness/bin/harness approve-plan .dev/plan/${PPRE}plan.md"
+
+for M in default acceptEdits plan; do
+  check "$M 에서 계획 승인은 물어본다" '"permissionDecision": "ask"' "$(pb "$PCMD" "$M")"
+done
+check "bypassPermissions 는 사전 승인으로 통과" '"permissionDecision": "defer"' \
+  "$(pb "$PCMD" bypassPermissions)"
+POUT2="$(pb "$PCMD" acceptEdits)"
+check "다이얼로그가 계획 본문을 보여준다" '전략 패턴으로 분리한다' "$POUT2"
+check "위험 절도 보인다" '되돌릴 수 없다' "$POUT2"
+check "계획 구역을 표시한다" '─── 계획 ───' "$POUT2"
+check "파일 경로도 알려준다" "${PPRE}plan.md" "$POUT2"
+check "계획 파일이 없으면 경고한다" '계획 파일이 없다' \
+  "$(pb "$PW/.claude/harness/bin/harness approve-plan .dev/plan/nope.md" default)"
+check "긴 계획은 잘라서 알려준다" '이하 .*줄 생략' \
+  "$(python3 -c "
+import sys
+open(sys.argv[1], 'w').write('# 계획\n' + '내용 줄\n' * 200)" "$PW/.dev/plan/${PPRE}long.md"; \
+     pb "$PW/.claude/harness/bin/harness approve-plan .dev/plan/${PPRE}long.md" default)"
+rm -rf "$PW"
+
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
 # cycle_counters 11개 항목과 _survival 8개 항목.

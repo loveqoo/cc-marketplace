@@ -1314,6 +1314,45 @@ def skip_block_reason(cfg, sid, target):
             % (names, last, stage_obj(cfg, last)["label"]))
 
 
+PLAN_PREVIEW_LINES = 24
+PLAN_PREVIEW_CHARS = 1400
+
+
+def plan_preview(root, cmd):
+    """승인 다이얼로그에 실을 계획 본문.
+
+    계획 승인은 이 하네스에서 사람이 방해받는 유일하게 값있는 자리인데, 다이얼로그가
+    **파일 이름만** 보여주고 있었다. 읽지 않고 찍는 도장은 마찰만 있고 정보가 없다 —
+    그렇게 남은 `plan_approved` 기록은 가짜다. 무엇을 승인하는지 보여준다.
+    """
+    pos = [t for t in QUOTED_RE.sub(" ", cmd).split() if not t.startswith("--")]
+    path = None
+    for i, t in enumerate(pos):
+        if t == "approve-plan" and i + 1 < len(pos):
+            path = pos[i + 1].strip("\"'")
+            break
+    if not path:
+        return "계획 파일 경로가 없다. `approve-plan <파일>` 형식으로 지정하라."
+    full = path if os.path.isabs(path) else os.path.join(root, path)
+    if not os.path.isfile(full):
+        return "⚠ 계획 파일이 없다: %s — 승인하기 전에 확인하라." % path
+    try:
+        with open(full, encoding="utf-8", errors="replace") as fh:
+            body = fh.read(PLAN_PREVIEW_CHARS * 2)
+    except OSError as exc:
+        return "⚠ 계획 파일을 읽을 수 없다 (%s): %s" % (path, exc)
+    lines = body.splitlines()
+    shown = lines[:PLAN_PREVIEW_LINES]
+    text = "\n".join(shown)[:PLAN_PREVIEW_CHARS]
+    more = []
+    if len(lines) > len(shown):
+        more.append("이하 %d줄 생략" % (len(lines) - len(shown)))
+    if len(text) < len("\n".join(shown)):
+        more.append("길이 잘림")
+    tail = " (%s — 전문은 %s)" % (", ".join(more), path) if more else ""
+    return "%s%s\n%s" % (path, tail, text)
+
+
 def ctrl_requests(cmd):
     """명령 문자열의 하네스 제어 호출을 **전부** 찾아 (subcommand, 세그먼트) 로 준다.
 
@@ -1348,7 +1387,7 @@ def ctrl_requests(cmd):
     return out
 
 
-def ctrl_decision(con, cfg, sub, cmd, mode, lid, sid):
+def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
     """제어 명령에 대한 판정을 **돌려준다**(emit 하지 않는다).
 
     한 Bash 명령에 제어 호출이 여러 개 있을 수 있어서, 호출자가 전부 순회하며
@@ -1395,6 +1434,9 @@ def ctrl_decision(con, cfg, sub, cmd, mode, lid, sid):
     detail = "%s: `%s`" % (CTRL_HEAD[sub], cmd.strip())
     if reason:
         detail += "\n사유: %s" % reason
+    if sub == "approve-plan":
+        # 무엇을 승인하는지 보여준다. 이름만 보고 찍는 승인은 기록으로도 가짜다.
+        detail += "\n\n─── 계획 ───\n%s\n───────────" % plan_preview(root, cmd)
     detail += "\n승인하면 하네스 상태에 기록된다."
     if mode == "bypassPermissions" and sub == "auto-skip":
         # 하나의 예외. `auto-skip on` 의 효과는 **세션을 넘어 지속된다**(meta 에 저장되고
@@ -1449,7 +1491,7 @@ def hook_pre_tool_use(inp, ctx):
         reqs = ctrl_requests(cmd)
         for req_sub, seg in reqs:
             with con:
-                out = ctrl_decision(con, cfg, req_sub, seg, mode, lid, sid)
+                out = ctrl_decision(con, cfg, root, req_sub, seg, mode, lid, sid)
             if out:
                 return emit(out)
         if reqs:

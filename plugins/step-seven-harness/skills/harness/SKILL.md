@@ -31,7 +31,7 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 | `advance --cycle` | (Compounding 에서만) 다음 회차 → Scaffolding, 같은 작업 유지 | |
 | `skip <stage\|+N\|until:<stage>> --reason "..."` | 단계 건너뛰기 | ✅ 다이얼로그 |
 | `allow <glob> --reason "..." [--uses N]` | 쓰기 금지 경로에 예외 등록 (`docs/` 등) | ✅ 다이얼로그 |
-| `approve-plan <file>` | 계획에 대한 사람의 승인 기록 | ✅ 다이얼로그 |
+| `approve-plan <file>` | 계획에 대한 사람의 승인 기록. **다이얼로그에 계획 본문이 함께 표시된다** | ✅ 다이얼로그 (auto-mode 에서도) |
 | `recall [키워드\|경로] [--kind K] [--rule R]` | 과거 차단·실패·재편집 기록과 관련 회고 파일을 찾는다. **Context 단계의 주 도구** | |
 | `stats [--loop]` | 누적 수치. 어떤 규칙에 몇 번 걸렸는지, 무엇이 여러 작업에 걸쳐 반복되는지 | |
 | `promote` | 여러 작업에서 반복된 항목과 승격 결정 목록. **Compounding 의 종료 조건** | |
