@@ -65,15 +65,48 @@ _real_open = builtins.open
 state = {"raced": False}
 
 
+def _external_write():
+    """Claude Code 가 이 파일을 쓴 것처럼 만든다."""
+    d = json.load(_real_open(p, encoding="utf-8"))
+    d["enabledPlugins"] = {"step-seven-harness@cc-marketplace": True}
+    with _real_open(p, "w", encoding="utf-8") as w:
+        json.dump(d, w)
+
+
+class _RaceOnRead(object):
+    """`read()` 가 **끝난 뒤** 한 번만 외부 쓰기를 일으킨다.
+
+    예전에는 open 직후에 썼다. 그러면 호출자가 아직 읽지 않았으므로 **첫 스냅샷이
+    이미 새 내용**이고, 비교-교환의 불일치가 발생하지 않아 재시도 경로에 도달하지
+    못했다 — "경쟁 쓰기가 있어도 성공한다"가 경쟁 없이 통과했다. 적대적 리뷰가
+    지적했고, 실제로 그랬다.
+    """
+
+    def __init__(self, fh):
+        self._fh = fh
+
+    def read(self, *a, **k):
+        out = self._fh.read(*a, **k)
+        if not state["raced"]:
+            state["raced"] = True
+            _external_write()
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+    def __enter__(self):
+        self._fh.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._fh.__exit__(*exc)
+
+
 def racing_open(path, *a, **k):
-    """첫 읽기 직후 한 번만 Claude Code 의 쓰기를 흉내낸다."""
     fh = _real_open(path, *a, **k)
     if path == p and not state["raced"] and (not a or "r" in str(a[0])):
-        state["raced"] = True
-        d = json.load(_real_open(p, encoding="utf-8"))
-        d["enabledPlugins"] = {"step-seven-harness@cc-marketplace": True}
-        with _real_open(p, "w", encoding="utf-8") as w:
-            json.dump(d, w)
+        return _RaceOnRead(fh)
     return fh
 
 
@@ -83,6 +116,7 @@ try:
 finally:
     builtins.open = _real_open
 d = load(p)
+ck("경쟁이 실제로 일어났다", state["raced"])
 ck("경쟁 쓰기가 있어도 성공한다", rc > 0, rc)
 ck("남이 쓴 enabledPlugins 가 살아남는다", "enabledPlugins" in d)
 ck("우리 권한도 함께 들어간다", len(d["permissions"]["allow"]) > 0)

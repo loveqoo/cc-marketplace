@@ -51,6 +51,7 @@ _MESSAGES = {}
 LANG_ENV = "HARNESS_LANG"
 # 정의 시점에 번역할 수 없어 사용 지점에서 감싸는 상수들. 검사기가 이 목록을 안다.
 LAZY_MSG_NAMES = ("USAGE", "AGENTS_BLOCK", "LEARNED_HEAD", "PROMOTE_AS_DEFAULT",
+                  "SELF_LOCK_MSG", "NEVER_READERS", "SELF_LOCK",
                   "SATISFIED_BY", "WRITE_SELECTORS", "WRITE_TESTS", "SCHEMA",
                   "EVENT_KINDS", "STOPWORDS", "TREND_KEYS", "VERDICT_TEXT",
                   "NO_CYCLES", "WRAPPER", "RECALL_DIRS_DEFAULT",
@@ -90,7 +91,9 @@ def load_messages(root, lang=None):
     멈추는 것은 어떤 번역 누락보다 나쁘다."""
     global _MESSAGES, _LANG
     _MESSAGES = {}
-    lang = lang or os.environ.get(LANG_ENV) or ""
+    # 환경변수가 설정을 이긴다. 파일을 고치지 않고 시험해 보려고 쓰는 것이므로,
+    # 설정에 language 가 적혀 있다고 무시하면 그 용도가 사라진다.
+    lang = os.environ.get(LANG_ENV) or lang or ""
     _LANG = lang
     if not lang or lang == "ko":
         return 0        # 원문이 한국어다. 조회 자체를 하지 않는다.
@@ -555,6 +558,38 @@ def config_problems(cfg):
     for i, it in enumerate(cfg.seq("retro_questions")):
         if not isinstance(it, dict) or not it.get("q"):
             out.append(t("retro_questions[%d] 에 q 가 없다 — 이 질문은 무시된다") % i)
+    # **있는데 공허한 값**을 본다. 예전 진단은 '없는 참조'와 '모르는 값'만 봤고,
+    # 그래서 `protected_paths: []`·`write_rules: []`·`mutator_pattern: "(?!)"` 가
+    # 아무 말 없이 강제를 껐다. 적대적 리뷰에서 여섯 모양으로 확인했다.
+    # 바닥값(SELF_LOCK)이 있으므로 하네스 자기 잠금은 이제 이것들로 풀리지 않지만,
+    # 사용자가 지정한 보호 경로와 규칙은 여전히 조용히 사라질 수 있다.
+    fr_raw = cfg.get("folder_rules")
+    if isinstance(fr_raw, dict) and "protected_paths" in fr_raw \
+            and not cfg.seq("folder_rules.protected_paths"):
+        out.append(t("folder_rules.protected_paths 가 비어 있다 — 하네스 자신은 "
+                     "코드의 바닥값으로 계속 보호되지만, 여기에 적었던 경로는 "
+                     "더 이상 보호되지 않는다"))
+    if "write_rules" in cfg and not (cfg.get("write_rules") or []):
+        out.append(t("write_rules 가 비어 있다 — 폴더·파일명 규칙이 하나도 없다 "
+                     "(하네스 자기 잠금만 바닥값으로 남는다)"))
+    if not isinstance(cfg.get("write_rules", []), list):
+        out.append(t("write_rules 가 배열이 아니다 — 규칙이 하나도 적용되지 않는다"))
+    # 문법이 맞는데 아무것도 안 맞는 정규식. `(?!)` 이 그 예다.
+    mpat = cfg.at("bash.mutator_pattern")
+    if mpat:
+        try:
+            probe = re.compile(mpat)
+        except re.error:
+            probe = None
+        if probe is not None and not any(probe.search(s) for s in
+                                         ("rm x", "mv a b", "echo x > y", "sed -i s/a/b/ f")):
+            out.append(t("bash.mutator_pattern 이 흔한 변경 명령을 하나도 잡지 못한다 "
+                         "— 문법은 맞지만 사실상 꺼진 것이다"))
+    bad_readers = [r for r in cfg.seq("bash.readers") if r in NEVER_READERS]
+    if bad_readers:
+        out.append(t("bash.readers 의 %s 는 변경 명령이라 읽기로 선언할 수 없다 "
+                     "— 무시된다") % ", ".join(sorted(bad_readers)))
+
     kinds = promote_as(cfg)
     if not [k for k in kinds if k != "declined"]:
         out.append(t("promotion.as_kinds 에 승격 종류가 없다 — 보류밖에 할 수 없다"))
@@ -1453,12 +1488,61 @@ def _first_violation(w, rules):
     return None, None
 
 
+# 하네스 자신을 지키는 **바닥값**. 설정은 여기에 더할 수만 있고 뺄 수 없다.
+#
+# 왜 코드에 있나: 이것만 데이터로 두면 자기 잠금이 협상 가능해진다. `stages.json` 은
+# `context` 클래스라 여러 단계에서 모델이 쓸 수 있고, 거기서 `protected` 규칙을 지우거나
+# `protected_paths: []` 로 두거나 `write_rules: []` 로 비우면 엔진과 DB가 열렸다.
+# 엔진을 쓸 수 있으면 **모든 게이트가 끝난다.** 적대적 리뷰에서 여섯 가지 모양으로
+# 확인했고, 0.30.0 엔진에서도 뚫렸다 — 새 결함이 아니라 원래 있던 구조 문제다.
+#
+# "규칙이 틀렸으면 stages.json 을 고쳐라"는 그대로 유지된다. 단 하나, **잠금을 푸는
+# 방향으로는** 고칠 수 없다. 근거 문서가 이미 "이 차단은 allow 로도 열리지 않는다"고
+# 못박은 그 예외를 설정에도 적용하는 것이다.
+SELF_LOCK = (".claude/harness/bin/**",
+             ".claude/harness/harness.db",
+             ".claude/harness/harness.db-wal",
+             ".claude/harness/harness.db-shm")
+SELF_LOCK_MSG = ("하네스 자신은 수정할 수 없다 (%s). 이 차단은 `allow` 로도, "
+                 "`stages.json` 을 고쳐서도 열 수 없다 — 엔진과 상태를 바꿀 수 있으면 "
+                 "모든 게이트가 무의미해진다. 규칙을 바꾸려면 `stages.json` 의 "
+                 "규칙을, 엔진을 바꾸려면 플러그인을 수정하라.")
+
+
+def self_lock_hit(rel):
+    """바닥값에 걸리나. 설정을 보지 않는다 — 그게 요점이다."""
+    for pat in SELF_LOCK:
+        if glob_match(rel, pat):
+            return True
+    return False
+
+
+# 이 이름들은 `bash.readers` 로 선언할 수 없다. 설정이 변경 명령을 읽기로 위장해
+# 잠금을 우회하는 것을 막는다 (`readers: ["rm"]` 로 확인했다).
+NEVER_READERS = ("rm", "mv", "cp", "dd", "tee", "truncate", "shred", "install",
+                 "ln", "sed", "mkdir", "touch", "find")
+
+
+def protected_pats(cfg):
+    """보호 경로 = 바닥값 ∪ 설정. 설정이 비어 있어도 바닥값은 남는다."""
+    out = list(SELF_LOCK)
+    for p in cfg.seq("folder_rules.protected_paths"):
+        if isinstance(p, str) and p not in out:
+            out.append(p)
+    return out
+
+
 def check_write(ctx, rel):
     """(decision, reason). decision None 이면 판정하지 않음.
 
     차단은 event 에 적립한다 — 어떤 규칙에 몇 번 걸리는지가 복리의 원료다.
     """
     w = WriteReq(ctx, rel)
+    # 바닥값은 설정보다 앞이고 grant 도 보지 않는다. write_rules 가 비어 있어도 남는다.
+    if self_lock_hit(rel):
+        reason = t(SELF_LOCK_MSG) % rel
+        record_event(ctx.con, ctx.lid, ctx.sid, "block", "self_lock", rel, reason)
+        return "deny", reason
     rules = write_rules(ctx.cfg)
     name, reason = _first_violation(w, rules)
     if reason:
@@ -1495,9 +1579,10 @@ def bash_protected_hit(cfg, root, cmd):
     check_write 는 Write/Edit 만 본다. Bash 는 `rm`, `sed -i`, 리다이렉트,
     `sqlite3 ... UPDATE` 로 같은 파일을 바꿀 수 있었고 그 경로는 검사되지 않았다.
     """
-    pats = (cfg.get("folder_rules") or {}).get("protected_paths") or []
-    if not pats:
-        return None
+    # 바닥값 ∪ 설정. 설정을 비워도(`protected_paths: []`) 바닥값은 남는다 —
+    # 예전에는 여기서 `if not pats: return None` 으로 통째로 꺼졌다.
+    pats = protected_pats(cfg)
+    floor = set(SELF_LOCK)
 
     mutating = bool(bash_mutator_re(cfg).search(cmd))
     # `>|경로` 의 `|` 를 BASH_SPLIT 이 파이프로 보고 쪼개면 경로가 다음 세그먼트의
@@ -1516,15 +1601,21 @@ def bash_protected_hit(cfg, root, cmd):
         return [it for it in out if it]
 
     def protected(tok):
+        use = pats
         for cand in candidates(tok):
             rel = rel_to_root(root, cand)
             if not rel or rel == ".":
                 continue
-            if any(glob_match(rel, p) for p in pats):
+            if any(glob_match(rel, p) for p in use):
                 return rel
             # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
             # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
-            if mutating and any(p.startswith(rel + "/") for p in pats):
+            # 바닥값에 대해서는 mutating 판정을 믿지 않는다 — `mutator_pattern` 을
+            # `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이 검사가
+            # 통째로 꺼졌다. 설정으로 잠금을 푸는 방향은 막는다.
+            if any(p.startswith(rel + "/") for p in floor):
+                return rel
+            if mutating and any(p.startswith(rel + "/") for p in use):
                 return rel
         return None
 
@@ -1534,7 +1625,14 @@ def bash_protected_hit(cfg, root, cmd):
             continue
         head = os.path.basename(toks[0].strip("\"'"))
         # 리다이렉트가 있으면 읽기 명령도 쓰기가 된다 (`cat x > 엔진`).
-        if head in cfg.seq("bash.readers", BASH_READERS_DEFAULT) and ">" not in seg:
+        # `readers` 에 `rm` 을 넣어 잠금을 우회한 것을 확인했으므로, 읽기로 분류된
+        # 세그먼트도 **바닥값만은** 검사한다.
+        # `readers` 에 `rm` 을 넣어 잠금을 우회한 것을 확인했다. 그래서 **변경 명령
+        # 이름은 읽기로 선언될 수 없다**(NEVER_READERS). 그 위장만 막으면 되고,
+        # 읽기는 원래대로 통째로 건너뛴다 — `cat` 으로 DB를 읽는 것까지 막으면
+        # 과잉 차단이고, 마찰은 게이트를 끄게 만든다.
+        if (head in cfg.seq("bash.readers", BASH_READERS_DEFAULT)
+                and head not in NEVER_READERS and ">" not in seg):
             continue
         skip = 2 if head in cfg.seq("bash.interpreters", BASH_INTERPRETERS_DEFAULT) and len(toks) > 1 else 1
         for tok in toks[skip:]:
@@ -3719,7 +3817,16 @@ def cli_loop(ctx, argv):
         with con:
             close_loop(con, lid)
             create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
-        print(t("작업 %s 재연결(사용자 승인). 단계는 1단계부터 다시 추적한다.") % want)
+            # **회차를 올린다.** 올리지 않으면 접두사가 그대로여서 지난 회차의
+            # 계획서·회고가 이번 회차의 종료 조건을 채운다 — `criterion_met` 이
+            # 디스크를 보기 때문이다. 실제로 그렇게 Planning 을 계획 없이 통과하고
+            # 스킵까지 되는 것을 확인했다. 재연결은 "1단계부터 다시"이므로 새 회차가
+            # 정직한 표현이고, 앞단 해시는 그대로라 과거 산출물은 여전히 grep 된다.
+            con.execute("UPDATE loop SET cycle=? WHERE id=?",
+                        (cycle_of(con, want) + 1, want))
+        print(t("작업 %s 재연결(사용자 승인). 단계는 1단계부터, 회차 %d 로 다시 "
+                "추적한다 — 지난 회차의 산출물은 이번 조건을 채우지 않는다.")
+              % (want, cycle_of(con, want)))
         return 0
     row = con.execute("SELECT * FROM loop WHERE id=?", (lid,)).fetchone()
     print("loop %s · branch %s · created %s"

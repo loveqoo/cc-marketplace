@@ -1305,7 +1305,8 @@ rm -rf "$CW3"
 echo "== Ctx 언팩 누락 (AST 전수)"
 COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)"; CRC2=$?
 check "ctx 를 풀지 않고 쓰는 함수가 없다" '^0$' "$CRC2"
-check "검사가 실제로 함수를 훑었다" '함수 [0-9]* 개\|함수 [0-9]*개' "$COUT"
+# `[0-9]*` 는 `함수 0개` 에도 맞았다 — 0개를 훑고도 '훑었다'가 통과했다.
+check "검사가 실제로 함수를 훑었다" '함수 [1-9][0-9]* *개' "$COUT"
 
 echo "== 계획 승인 다이얼로그가 계획을 보여준다"
 # auto-mode(acceptEdits)에서도 계획 승인은 물어야 한다 — "편집 자동 수락" 이지
@@ -1728,7 +1729,9 @@ ow() { (cd "$OW" && python3 "$ENGINE" "$@"); }
 edcfg "$OW/.claude/harness/stages.json" '
 crit = cfg.pop("criteria")
 cfg["evidence_signals"] = {
-    "plan_file": {"write_glob": crit["plan_file"]["write_glob"]},
+    # **기본값을 복사하면 공허하다** — 이월이 없어도 템플릿 채움이 같은 값을 준다.
+    # 사용자가 고친 값이어야 이월을 검사한다.
+    "plan_file": {"write_glob": [".dev/design/**/*.md"]},
     "retro_file": {"write_glob": crit["retro_file"]["write_glob"]},
     "verification_evidence": {"bash_pattern": "\\bmake\\s+smoke\\b"},
 }
@@ -1741,10 +1744,18 @@ ow loop intent "옛 설치" >/dev/null
 ow loop done-when "끝" >/dev/null
 ow advance >/dev/null; ow advance >/dev/null; ow advance >/dev/null
 OPRE="$(ow status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
-mkdir -p "$OW/.dev/plan"; printf '#\n' > "$OW/.dev/plan/${OPRE}p.md"
-check "옛 write_glob 이 이어진다 (plan_file 이 선다)" '^plan_approved$' \
+# 사용자가 고친 위치(.dev/design)에 둔다. 이월이 없으면 템플릿 기본값(.dev/plan)만
+# 인정되므로 이 파일은 조건을 채우지 못한다 — 그때 이 단정이 실패한다.
+mkdir -p "$OW/.dev/design" "$OW/.dev/plan"
+printf '#\n' > "$OW/.dev/design/${OPRE}p.md"
+check "사용자가 고친 write_glob 이 이어진다" '^plan_approved$' \
   "$(ow status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))')"
-ow approve-plan ".dev/plan/${OPRE}p.md" >/dev/null
+# 그리고 기본 위치는 더 이상 인정되지 않아야 한다 (대체이지 병합이 아니다)
+rm -f "$OW/.dev/design/${OPRE}p.md"; printf '#\n' > "$OW/.dev/plan/${OPRE}p.md"
+check "기본 위치는 인정되지 않는다" 'plan_file' \
+  "$(ow status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))')"
+printf '#\n' > "$OW/.dev/design/${OPRE}p.md"
+ow approve-plan ".dev/design/${OPRE}p.md" >/dev/null
 ow advance >/dev/null; ow advance >/dev/null
 printf 'smoke:\n\t@true\n' > "$OW/Makefile"
 # `make smoke` 는 기본 패턴(`make (test|check|lint)`)에 없다. 고쳐 둔 패턴이 사라지면
@@ -1821,7 +1832,11 @@ check "거부 메시지가 데이터다" '하네스 자신은 수정할 수 없�
 
 echo "  -- 규칙마다 자기 id 로 적립돼야 한다 (승격의 원료다)"
 wrhk ".claude/harness/harness.db" >/dev/null
-check "protected 가 발동한다" '^protected$' "$(wrrule)"
+# 하네스 자신은 **바닥값**(코드)이 먼저 막는다. 설정으로 풀 수 없어야 하기 때문이다.
+check "바닥값이 먼저 발동한다" '^self_lock$' "$(wrrule)"
+wrhk ".claude/harness/LEARNED.md" >/dev/null
+# LEARNED.md 는 바닥값이 아니라 설정(protected_paths)이 지킨다 — 설정 규칙도 산다
+check "설정의 protected 규칙도 발동한다" '^protected$' "$(wrrule)"
 wrhk "docs/x.md" >/dev/null
 check "docs_readonly 가 발동한다" '^docs_readonly$' "$(wrrule)"
 wrhk ".dev/nope/a.md" >/dev/null
@@ -1968,12 +1983,20 @@ BS="$(mktemp -d)"
 (cd "$BS" && git init -q . && python3 "$ENGINE" init >/dev/null)
 bsb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$BS" "$1" \
   | CLAUDE_PROJECT_DIR="$BS" python3 "$ENGINE" hook; }
-# mutator_pattern 이 좌우하는 것은 **부모 디렉터리**를 대상으로 하는 경우다
-# (`rm -rf .claude`). 보호 경로를 직접 지정하면 패턴과 무관하게 막힌다 — fail-safe 다.
+# 보호 경로를 직접 지정하면 패턴과 무관하게 막힌다 — fail-safe 다.
 check "보호 경로 직접 지정은 패턴과 무관하게 막힌다" '하네스 자신' \
   "$(bsb "myrm .claude/harness/harness.db")"
-check_empty "모르는 명령의 부모 디렉터리 지정은 통과 (기본 패턴)" \
-  "$(bsb "myrm -rf .claude")"
+# mutator_pattern 의 효과는 **바닥값이 아닌** 보호 경로의 부모에서만 관찰된다.
+# `.claude` 는 바닥값의 부모라 패턴과 무관하게 항상 막힌다(그게 요점이다).
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['folder_rules']['protected_paths'].append('vault/**')
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$BS/.claude/harness/stages.json"
+check_empty "모르는 명령의 부모 지정은 통과 (기본 패턴)" "$(bsb "myrm -rf vault")"
+check "바닥값의 부모는 패턴과 무관하게 막힌다" '하네스 자신' "$(bsb "myrm -rf .claude")"
 python3 -c "
 import json, sys
 p = sys.argv[1]
@@ -1981,7 +2004,7 @@ cfg = json.load(open(p, encoding='utf-8'))
 cfg['bash']['mutator_pattern'] = r'(^|[;&|]\s*)(myrm|rm)\b'
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$BS/.claude/harness/stages.json"
-check "패턴에 넣으면 부모 디렉터리도 막는다" '하네스 자신' "$(bsb "myrm -rf .claude")"
+check "패턴에 넣으면 그 부모도 막는다" '하네스 자신' "$(bsb "myrm -rf vault")"
 
 echo "  -- readers 도 설정이다 (읽기 명령은 막지 않는다)"
 check_empty "cat 은 보호 경로를 읽어도 통과" "$(bsb "cat .claude/harness/harness.db")"
@@ -2045,15 +2068,18 @@ check "설정한 언어로 번역된다" 'EN|advance 거부' "$(mw advance 2>&1)
 check "번역 없는 문장은 원문으로 떨어진다" 'intent_set: 이번에 할 작업을' "$(mw advance 2>&1)"
 MWH="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/.claude/harness/harness.db"}}' "$MW" "$MW" | CLAUDE_PROJECT_DIR="$MW" python3 "$ENGINE" hook)"
 check "훅 경로에서도 번역된다" 'EN|하네스 자신은' "$MWH"
-check "부분 번역이면 그 사실을 말한다" '번역이 2/' "$(mw status 2>&1)"
-check "환경변수로도 언어를 정할 수 있다" 'EN|advance 거부' \
+check "부분 번역이면 그 사실을 말한다" '번역이 [0-9]*/[0-9]*' "$(mw status 2>&1)"
+# 환경변수가 설정을 이겨야 한다 — 파일을 고치지 않고 시험하는 용도이기 때문이다
+check "환경변수가 설정을 이긴다" 'EN|advance 거부' \
   "$(python3 -c "
 import json, sys
 p = sys.argv[1]
 cfg = json.load(open(p, encoding='utf-8'))
-cfg.pop('language')
+cfg['language'] = 'ko'
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$MW/.claude/harness/stages.json"; (cd "$MW" && HARNESS_LANG=en python3 "$ENGINE" advance 2>&1) || true)"
+check "환경변수가 없으면 설정을 따른다" 'advance 거부 —' \
+  "$( (cd "$MW" && python3 "$ENGINE" advance 2>&1) || true)"
 # 카탈로그가 없는 언어를 켜면 전부 원문이 된다 — 켠 사람은 '설정이 안 먹었다'로 읽는다
 check "카탈로그가 없으면 그 사실을 말한다" '찾지 못했다' \
   "$(cd "$MW" && HARNESS_LANG=fr python3 "$ENGINE" status 2>&1)"
@@ -2217,6 +2243,116 @@ mkdir -p "$KW/.dev/plan"; printf '# 계획\n' > "$KW/.dev/plan/${KPRE}plan.md"
 check "관측 없이 파일만 있으면 skip 이 통과한다" '스킵(사용자 승인)' \
   "$(kw skip planning --reason '구조 선행' 2>&1)"
 rm -rf "$CW" "$BW" "$KW"
+
+echo "== 자기 잠금은 설정으로 열 수 없다 (바닥값)"
+# 적대적 리뷰가 일곱 모양으로 뚫었다. 뿌리는 하나였다 — 하네스의 자기 잠금이
+# `stages.json` 에 있었고, 그 파일은 `context` 클래스라 모델이 여러 단계에서 쓸 수
+# 있다. 엔진을 쓸 수 있으면 **모든 게이트가 끝난다.** 0.30.0 엔진에서도 뚫렸다.
+# 이제 바닥값(SELF_LOCK)이 코드에 있고 설정은 여기에 더할 수만 있다.
+SLW="$(mktemp -d)"
+(cd "$SLW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+sled() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$SLW/.claude/harness/stages.json" "$1"; }
+slw() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/%s"}}' "$SLW" "$SLW" "$1" \
+  | CLAUDE_PROJECT_DIR="$SLW" python3 "$ENGINE" hook; }
+slb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$SLW" "$1" \
+  | CLAUDE_PROJECT_DIR="$SLW" python3 "$ENGINE" hook; }
+# context 쓰기가 허용된 단계로 간다 (여기서 stages.json 을 고칠 수 있다)
+(cd "$SLW" && python3 "$ENGINE" loop intent "바닥값" >/dev/null \
+  && python3 "$ENGINE" loop done-when "끝" >/dev/null \
+  && python3 "$ENGINE" advance >/dev/null)
+check_empty "이 단계에서 stages.json 은 쓸 수 있다 (설계상)" \
+  "$(slw '.claude/harness/stages.json')"
+
+# 설정을 최대한 무력화한다 — 리뷰가 찾은 일곱 모양을 한꺼번에
+sled '
+cfg["folder_rules"]["protected_paths"] = []
+cfg["write_rules"] = []
+cfg["bash"]["readers"].append("rm")
+cfg["bash"]["mutator_pattern"] = "(?!)"
+'
+for F in ".claude/harness/bin/harness.py" ".claude/harness/bin/harness" \
+         ".claude/harness/harness.db" ".claude/harness/bin/defaults.json"; do
+  check "설정을 비워도 막힌다: $F" '하네스 자신은 수정할 수 없다' "$(slw "$F")"
+done
+check "allow 로도 stages.json 으로도 못 연다고 말한다" 'stages.json` 을 고쳐서도 열 수 없다' \
+  "$(slw '.claude/harness/harness.db')"
+check "차단이 self_lock 으로 적립된다" '^self_lock$' \
+  "$(python3 -c "
+import sqlite3, sys
+r = sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='block' ORDER BY rowid DESC LIMIT 1\").fetchone()
+print(r[0] if r else '(없음)')" "$SLW/.claude/harness/harness.db")"
+for C in "rm .claude/harness/bin/harness.py" "rm -rf .claude" \
+         "dd if=/dev/null of=.claude/harness/harness.db" \
+         "find .claude/harness -delete" "printf x >|.claude/harness/harness.db"; do
+  check "Bash 도 막힌다: $C" '하네스 자신' "$(slb "$C")"
+done
+# 과잉 차단은 마찰이 되고, 마찰은 게이트를 끄게 만든다 — 읽기는 여전히 통과해야 한다
+check_empty "읽기는 여전히 통과한다 (cat)" "$(slb 'cat .claude/harness/harness.db')"
+check_empty "읽기는 여전히 통과한다 (grep)" "$(slb 'grep -c x .claude/harness/bin/harness.py')"
+# grant 로도, grant_opens 로도 열리지 않는다
+sled 'cfg["write_rules"] = [{"id": "protected", "grant_opens": True, "when": {},
+      "require": {"not_matching": "protected_paths"}, "deny": "x"}]'
+(cd "$SLW" && python3 "$ENGINE" allow '.claude/harness/**' --reason '시험' >/dev/null 2>&1) || true
+check "예외를 등록해도 막힌다" '하네스 자신은 수정할 수 없다' \
+  "$(slw '.claude/harness/bin/harness.py')"
+# stages.json 자체는 바닥값이 아니다 — 사람이 고쳐야 하는 문서다
+check_empty "stages.json 은 여전히 고칠 수 있다" "$(slw '.claude/harness/stages.json')"
+
+echo "  -- 공허한 설정은 진단이 말한다"
+check "protected_paths 를 비우면 말한다" '바닥값으로 계속 보호되지만' \
+  "$( (cd "$SLW" && python3 "$ENGINE" status 2>&1) )"
+sled 'cfg["folder_rules"]["protected_paths"] = [".claude/harness/LEARNED.md"]
+cfg["write_rules"] = []'
+check "write_rules 를 비우면 말한다" 'write_rules 가 비어 있다' \
+  "$( (cd "$SLW" && python3 "$ENGINE" status 2>&1) )"
+sled "cfg['write_rules'] = json.load(open('$SLW/.claude/harness/bin/defaults.json', encoding='utf-8'))['write_rules']
+cfg['bash']['mutator_pattern'] = '(?!)'"
+check "아무것도 안 맞는 정규식을 말한다" '하나도 잡지 못한다' \
+  "$( (cd "$SLW" && python3 "$ENGINE" status 2>&1) )"
+sled 'cfg["bash"]["mutator_pattern"] = "(^|[;&|]\\s*)(rm|mv)\\b"'
+check "변경 명령을 readers 로 선언하면 말한다" '읽기로 선언할 수 없다' \
+  "$( (cd "$SLW" && python3 "$ENGINE" status 2>&1) )"
+rm -rf "$SLW"
+
+echo "== 재연결은 회차를 올린다 (낡은 산출물이 조건을 채우지 않게)"
+# 적대적 리뷰가 찾았다. 재연결 후 접두사가 그대로여서 **1회차 계획서가 이번 회차의
+# plan_file 을 채웠고**, skip 까지 통과했다. 0.31.1 에서 skip 을 criterion_met 으로
+# 바꾼 것이 파일 판정과 만나 생긴 구멍이다.
+AW2="$(mktemp -d)"
+(cd "$AW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+aw() { (cd "$AW2" && python3 "$ENGINE" "$@"); }
+printf 'check:\n\t@true\n' > "$AW2/Makefile"
+aw loop intent "1회차" >/dev/null || true
+aw loop done-when "끝" >/dev/null || true
+AL="$(aw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["loop"])')"
+AP1="$(aw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+aw advance >/dev/null; aw advance >/dev/null; aw advance >/dev/null || true
+mkdir -p "$AW2/.dev/plan" "$AW2/.dev/retrospect"
+printf '#\n' > "$AW2/.dev/plan/${AP1}plan.md"
+aw approve-plan ".dev/plan/${AP1}plan.md" >/dev/null || true
+aw advance >/dev/null; aw verify -- make check >/dev/null; aw advance >/dev/null || true
+printf '#\n' > "$AW2/.dev/retrospect/${AP1}r.md"
+aw advance --done >/dev/null 2>&1 || true
+check "재연결이 회차를 올린다고 말한다" '회차 2 로 다시' \
+  "$(aw loop adopt "$AL" --reason '재개' 2>&1)"
+aw loop intent "재연결" >/dev/null || true
+aw loop done-when "끝" >/dev/null || true
+aw advance >/dev/null; aw advance >/dev/null; aw advance >/dev/null || true
+AP2="$(aw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+check "접두사가 1회차와 다르다" '[0-9a-f]-2-' "$AP2"
+check "1회차 접두사가 아니다" '^0$' "$(printf '%s' "$AP2" | grep -c -- '-1-' || true)"
+check "낡은 계획서는 조건을 채우지 못한다" 'plan_file' \
+  "$(aw status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))')"
+check "낡은 계획서로 스킵도 안 된다" '기록은 남겨야 한다' \
+  "$(aw skip planning --reason '구조 선행' 2>&1)"
+rm -rf "$AW2"
 
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"

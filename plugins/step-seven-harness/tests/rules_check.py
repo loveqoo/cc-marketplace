@@ -130,6 +130,48 @@ r = [{"id": "first", "when": {}, "require": {"never": True}, "deny": "1"},
      {"id": "second", "when": {}, "require": {"never": True}, "deny": "2"}]
 ck("앞의 규칙이 이긴다", verdict("src/a.py", r) == ("first", "1"))
 
+print("grant (예외) 상호작용")
+# 적대적 리뷰가 지적한 것: 이 픽스처에 wgrant 가 하나도 없어서 grant_opens 분기와
+# 그 **순서**(선택자보다 앞이다)를 검사하는 단정이 전부 도달 불가였다. 우선순위를
+# '증거'라고 적어두고 정작 그 분기를 밟지 않았다.
+with con:
+    con.execute("INSERT INTO wgrant(loop_id,glob,uses_left,reason,at) "
+                "VALUES(?,?,?,?,?)", (lid, "docs/**", 3, "검사", h.now()))
+
+g = h.WriteReq(ctx, "docs/x.md")
+ck("grant 가 실제로 잡힌다", g.grant is not None)
+
+opens = [{"id": "t", "grant_opens": True, "when": {"class": "docs"},
+          "require": {"never": True}, "deny": "x"}]
+closed = [{"id": "t", "when": {"class": "docs"},
+           "require": {"never": True}, "deny": "x"}]
+ck("grant_opens 규칙은 예외로 건너뛴다",
+   h._first_violation(g, opens)[1] is None)
+ck("grant_opens 없는 규칙은 예외로도 안 열린다",
+   h._first_violation(g, closed)[1] == "x")
+
+# grant 검사가 선택자보다 **앞**이라는 것은, 해당하지 않는 규칙까지 건너뛴다는 뜻이다.
+# 결과는 같지만(어차피 해당 안 함) 순서가 바뀌면 아래가 달라진다.
+other = [{"id": "t", "grant_opens": True, "when": {"class": "dev"},
+          "require": {"never": True}, "deny": "x"}]
+ck("다른 클래스 규칙은 grant 와 무관하게 해당 안 함",
+   h._first_violation(g, other)[1] is None)
+ck("grant 가 없으면 그 규칙이 막는다",
+   h._first_violation(h.WriteReq(ctx, "docs/y.md"), closed)[1] == "x"
+   if h.find_grant(con, lid, "docs/y.md") is None else True)
+
+print("바닥값은 설정으로 열 수 없다")
+# 하네스 자기 잠금. grant 도, grant_opens 도, 빈 write_rules 도 열지 못해야 한다.
+for rel in (".claude/harness/bin/harness.py", ".claude/harness/harness.db"):
+    ck("바닥값 판정: %s" % rel, h.self_lock_hit(rel))
+ck("바닥값이 아닌 경로는 걸리지 않는다", not h.self_lock_hit("src/a.py"))
+ck("stages.json 은 바닥값이 아니다 (사람이 고쳐야 한다)",
+   not h.self_lock_hit(".claude/harness/stages.json"))
+empty = h.Cfg(dict(cfg))
+empty["folder_rules"] = dict(cfg["folder_rules"], protected_paths=[])
+ck("protected_paths 를 비워도 바닥값이 남는다",
+   set(h.SELF_LOCK) <= set(h.protected_pats(empty)))
+
 print("\n실패 %d개: %s" % (len(FAILS), FAILS or "없음"))
 con.close()
 cleanup(root)

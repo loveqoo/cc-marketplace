@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "language": "ko",
   "path_classes": {
     "docs": [
       "docs/**"
