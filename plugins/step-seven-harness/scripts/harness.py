@@ -1200,6 +1200,59 @@ def auto_skip_scope_note(con):
     return ", ".join(bits) or "무제한"
 
 
+HUMAN_CRITERIA = ("intent_set", "plan_approved")
+
+
+def skip_block_reason(cfg, sid, target):
+    """skip 이 **불가능한** 이유. 가능하면 None.
+
+    훅과 CLI 가 같은 함수를 쓴다. 다른 규칙을 쓰면 사용자가 승인한 뒤에 거부되고,
+    모델은 안내받은 명령을 다시 시도해 **다이얼로그가 무한 반복된다** — 실제로
+    도그푸딩에서 그렇게 됐다.
+    """
+    ids = stage_ids(cfg)
+    cur = stage_index(cfg, sid)
+    last = cfg["stages"][-1]["id"]
+    if target.startswith("+"):
+        try:
+            dest = min(cur + int(target[1:]) - 1, len(ids) - 1)
+        except ValueError:
+            return "잘못된 형식: %s" % target
+    elif target.startswith("until:"):
+        want = target.split(":", 1)[1]
+        if want not in ids:
+            return "알 수 없는 단계: %s" % want
+        dest = ids.index(want) - 1
+    elif target in ids:
+        dest = ids.index(target)
+    else:
+        return "알 수 없는 대상: %s" % target
+
+    if dest < cur:
+        return ("뒤로 갈 수는 없다 — 이미 %s 단계이거나 그보다 뒤다. "
+                "단계는 항상 앞으로만 간다." % label_of(cfg, sid))
+
+    locked = [ids[i] for i in range(cur, dest + 1)
+              if cfg["stages"][i].get("skippable") is False]
+    if not locked:
+        return None
+
+    names = ", ".join(stage_obj(cfg, x)["label"] for x in locked)
+    if ids[cur] == ids[0]:
+        # 여기서 예전에는 `skip until:selection` 을 안내했다. 그건 dest 가 -1 이 되어
+        # **항상 실패하는 명령**이고, 모델이 그대로 반복해 승인 요청이 무한히 떴다.
+        return ("%s 단계는 건너뛸 수 없다. 그리고 지금은 그럴 상황이 아니다 — "
+                "%s 은 **사람이 작업을 주는 자리**다. 할 작업이 없으면 스킵을 "
+                "시도하지 말고 그렇다고 말하고 멈춰라. 하네스는 작업을 만들 수 없다. "
+                "작업이 정해지면 `harness loop intent \"...\"` 와 "
+                "`harness loop done-when \"...\"` 로 기록하면 된다."
+                % (names, stage_obj(cfg, ids[0])["label"]))
+    return ("%s 단계는 건너뛸 수 없다. 이 회차를 중단하려면 "
+            "`harness skip until:%s --reason \"...\"` 로 %s 까지 이동한 뒤, 중단 사유를 "
+            "회고로 남기고 `harness advance --cycle` (또는 `--done`) 으로 닫아라."
+            % (names, last, stage_obj(cfg, last)["label"]))
+
+
 def ctrl_requests(cmd):
     """명령 문자열의 하네스 제어 호출을 **전부** 찾아 (subcommand, 세그먼트) 로 준다.
 
@@ -1234,7 +1287,7 @@ def ctrl_requests(cmd):
     return out
 
 
-def ctrl_decision(con, sub, cmd, mode, lid, sid):
+def ctrl_decision(con, cfg, sub, cmd, mode, lid, sid):
     """제어 명령에 대한 판정을 **돌려준다**(emit 하지 않는다).
 
     한 Bash 명령에 제어 호출이 여러 개 있을 수 있어서, 호출자가 전부 순회하며
@@ -1248,6 +1301,21 @@ def ctrl_decision(con, sub, cmd, mode, lid, sid):
             return
     elif sub not in CONSENT_CMDS:
         return
+
+    if sub == "skip":
+        # 불가능한 스킵은 **묻지 않고** 거부한다. 승인을 받아봐야 거부되고,
+        # 그러면 모델이 다시 시도해 다이얼로그만 반복된다.
+        pos = [t for t in QUOTED_RE.sub("_", cmd).split()[1:] if not t.startswith("--")]
+        tgt = None
+        for i, t in enumerate(pos):
+            if t == "skip" and i + 1 < len(pos):
+                tgt = pos[i + 1]
+                break
+        if tgt:
+            why = skip_block_reason(cfg, sid, tgt)
+            if why:
+                record_event(con, lid, sid, "block", "skip_impossible", tgt, why)
+                return pre_decision("deny", why)
 
     reason = raw_flag(cmd, "reason")
     if sub != "approve-plan" and not reason:
@@ -1300,7 +1368,7 @@ def hook_pre_tool_use(inp, ctx):
         reqs = ctrl_requests(cmd)
         for req_sub, seg in reqs:
             with con:
-                out = ctrl_decision(con, req_sub, seg, mode, lid, sid)
+                out = ctrl_decision(con, cfg, req_sub, seg, mode, lid, sid)
             if out:
                 return emit(out)
         if reqs:
@@ -1570,6 +1638,14 @@ def continue_or_stop(con, cfg, lid, sid, stage, prompt_id):
                        "AND status IN ('pending','active')", (lid,)).fetchone()["c"]
     if not left:
         return
+    # 사람만 채울 수 있는 조건이 남았으면 **밀지 않는다.** 여기서 밀면 모델이
+    # 만들 수 없는 것을 만들려 애쓰고, 그 시도가 매번 승인 다이얼로그가 된다.
+    # Selection 에 작업이 없는 것은 교착이 아니라 **사람을 기다리는 상태**다.
+    waiting = [k for k in exit_blockers(con, cfg, lid, sid) if k in HUMAN_CRITERIA]
+    if waiting:
+        return emit({"systemMessage":
+                     "harness: %s 단계에서 사람의 입력을 기다린다 (%s). 턴을 끝낸다."
+                     % (stage["label"], ", ".join(waiting))})
     limit = cfg.num("stop_continue.max_per_prompt", 6, low=1)
     no_prog = cfg.num("stop_continue.no_progress_limit", 2, low=1)
     fp = progress_fingerprint(con, lid, sid)
@@ -2064,39 +2140,20 @@ def cli_skip(ctx, argv):
     if not target or not reason:
         print("사용법: harness skip <stage-id|+N|until:<stage-id>> --reason \"...\"")
         return 2
+    # 훅과 **같은 함수**로 판정한다. 훅이 이미 막았으므로 보통 여기 오지 않지만,
+    # 셸 간접 호출로 훅을 우회해 들어온 경우에도 같은 답을 내야 한다.
+    why = skip_block_reason(cfg, sid, target)
+    if why:
+        print(why)
+        return 1
     ids = stage_ids(cfg)
     cur = stage_index(cfg, sid)
     if target.startswith("+"):
-        try:
-            dest = min(cur + int(target[1:]) - 1, len(ids) - 1)
-        except ValueError:
-            print("잘못된 형식: %s" % target)
-            return 2
+        dest = min(cur + int(target[1:]) - 1, len(ids) - 1)
     elif target.startswith("until:"):
-        want = target.split(":", 1)[1]
-        if want not in ids:
-            print("알 수 없는 단계: %s" % want)
-            return 2
-        dest = ids.index(want) - 1
-    elif target in ids:
-        dest = ids.index(target)
+        dest = ids.index(target.split(":", 1)[1]) - 1
     else:
-        print("알 수 없는 대상: %s" % target)
-        return 2
-    if dest < cur:
-        print("뒤로 갈 수는 없다. 현재 단계 %s 유지." % label_of(cfg, sid))
-        return 1
-
-    # 건너뛸 수 없는 단계 — 회차를 중단하더라도 회고는 남겨야 복리가 끊기지 않는다.
-    # 이 검사가 먼저다. 아래 기록 검사보다 뒤에 두면 엉뚱한 이유를 내놓는다.
-    locked = [ids[i] for i in range(cur, dest + 1)
-              if cfg["stages"][i].get("skippable") is False]
-    if locked:
-        print("%s 단계는 건너뛸 수 없다." % ", ".join(stage_obj(cfg, s)["label"] for s in locked))
-        print("이 회차를 중단하려면 `harness skip until:%s --reason \"...\"` 로 그 단계까지 "
-              "이동한 뒤, 중단 사유를 회고로 남기고 `harness advance` 로 루프를 닫아라."
-              % locked[0])
-        return 1
+        dest = ids.index(target)
 
     # 스킵은 **승인**을 면제하지만 **기록**을 면제하지 않는다.
     # 무인 실행으로 Planning 을 건너뛰어도 계획 파일은 남아야 한다 — 회차 10번을 돌았을 때

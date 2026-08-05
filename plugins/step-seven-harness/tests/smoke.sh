@@ -989,7 +989,7 @@ check "따옴표 안 공백이 위치 인자를 흐리지 않는다" '"permissio
 check "홑따옴표 값도 사유로 인식된다" '사유: a b' \
   "$(gb "$W_ loop new --reason 'a b'")"
 check "&& 로 이어도 걸린다" '"permissionDecision": "ask"' \
-  "$(gb "$W_ recall x && $W_ skip context --reason y")"
+  "$(gb "$W_ recall x && $W_ allow docs/x.md --reason y")"
 check "bypassPermissions 에서는 거부" '"permissionDecision": "deny"' \
   "$(gb "$W_ loop --reason=x new" bypassPermissions)"
 check_empty "동의 불필요 명령은 조용하다 (status)" "$(gb "$W_ status")"
@@ -1177,6 +1177,78 @@ print("ok")
 PYB
 )"
 rm -rf "$RW2"
+
+echo "== 불가능한 스킵은 묻지 않고 거부한다 (다이얼로그 무한 반복 방지)"
+# 도그푸딩에서 나온 버그: Selection 에 작업이 없을 때 모델이 skip 을 시도하면
+# ask 가 뜨고, 승인 뒤에 거부되고, 안내 메시지가 `skip until:selection` 이라는
+# **항상 실패하는 명령**을 알려줘서 모델이 그것을 반복했다. 승인 요청이 무한히 떴다.
+SW="$(mktemp -d)"
+(cd "$SW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+sw() { (cd "$SW" && python3 "$ENGINE" "$@"); }
+# JSON 안에서는 홑따옴표를 쓴다. 겹따옴표는 셸이 먼저 벗겨 JSON 이 깨진다.
+sb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","permission_mode":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$SW" "${2:-default}" "$1" \
+  | CLAUDE_PROJECT_DIR="$SW" python3 "$ENGINE" hook; }
+SH_="$SW/.claude/harness/bin/harness"
+
+check "Selection 스킵은 묻지 않고 거부" '"permissionDecision": "deny"' \
+  "$(sb "$SH_ skip selection --reason x")"
+check "사람이 작업을 주는 자리라고 알려준다" '사람이 작업을 주는 자리' \
+  "$(sb "$SH_ skip selection --reason x")"
+check "스킵을 시도하지 말라고 말한다" '스킵을 시도하지 말고' \
+  "$(sb "$SH_ skip selection --reason x")"
+check "until:selection 도 거부 (항상 실패하는 명령이었다)" '뒤로 갈 수는 없다' \
+  "$(sb "$SH_ skip until:selection --reason x")"
+check "+1 도 Selection 을 포함하면 거부" '"permissionDecision": "deny"' \
+  "$(sb "$SH_ skip +1 --reason x")"
+check "불가능한 스킵도 기록에 남는다" 'skip_impossible' \
+  "$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='block' AND rule='skip_impossible' LIMIT 1\"
+).fetchone() or '')" "$SW/.claude/harness/harness.db")"
+for M in acceptEdits plan bypassPermissions; do
+  check "권한 모드 $M 에서도 같은 거부" '"permissionDecision": "deny"' \
+    "$(sb "$SH_ skip selection --reason x" "$M")"
+done
+
+echo "  -- 안내받은 명령이 실제로 동작해야 한다"
+sw loop intent "작업" >/dev/null
+sw loop done-when "끝" >/dev/null
+sw advance >/dev/null
+# Selection 을 지난 뒤에는 '회차 중단' 안내가 맞다. Selection 에 있을 때와 다르다.
+check "Compounding 스킵 거부는 until:compounding 을 안내한다" 'until:compounding' \
+  "$(sb "$SH_ skip compounding --reason x")"
+check "정상 스킵은 여전히 승인을 받는다" '"permissionDecision": "ask"' \
+  "$(sb "$SH_ skip context --reason '불필요'")"
+check "until:compounding 도 승인을 받는다" '"permissionDecision": "ask"' \
+  "$(sb "$SH_ skip until:compounding --reason '구조 선행'")"
+check "안내받은 명령이 실제로 실행된다 (거부 이유가 다르다)" '기록은 남겨야 한다' \
+  "$(sw skip until:compounding --reason '구조 선행')"
+
+echo "== 사람만 채울 수 있는 조건이 남으면 턴을 밀지 않는다"
+SW2="$(mktemp -d)"
+(cd "$SW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+s2() { (cd "$SW2" && python3 "$ENGINE" "$@"); }
+sstop() { printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"%s","last_assistant_message":"[%s] 했습니다"}' "$SW2" "$1" "$2" \
+  | CLAUDE_PROJECT_DIR="$SW2" python3 "$ENGINE" hook; }
+check "Selection 에 작업이 없으면 턴을 끝낸다" '사람의 입력을 기다린다' \
+  "$(sstop sA Selection)"
+check "무엇을 기다리는지 말한다" 'intent_set' "$(sstop sA Selection)"
+check "이어붙이지 않는다" '^0$' \
+  "$(printf '%s' "$(sstop sA Selection)" | grep -c '이어서 진행하라')"
+# Planning 에서 계획은 썼고 승인만 남은 상태
+s2 loop intent "작업" >/dev/null
+s2 loop done-when "끝" >/dev/null
+s2 advance >/dev/null; s2 advance >/dev/null; s2 advance >/dev/null
+python3 - "$SW2" "$(dirname "$ENGINE")" <<'PYP' >/dev/null
+import os, sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+root = sys.argv[1]; con = h.connect(root); lid = h.head_loop(con)
+with con:
+    h.record_evidence(con, lid, "planning", "plan_file", "p")
+PYP
+check "Planning 에서 승인 대기 중이면 밀지 않는다" 'plan_approved' "$(sstop sB Planning)"
+rm -rf "$SW" "$SW2"
 
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
