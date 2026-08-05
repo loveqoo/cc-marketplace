@@ -27,7 +27,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Write|Edit|NotebookEdit|Bash|Agent|Task|^mcp__claude-in-chrome__|^mcp__playwright__",
+        "matcher": "Write|Edit|NotebookEdit|Bash|Agent|Task|ExitPlanMode|^mcp__claude-in-chrome__|^mcp__playwright__",
         "hooks": [
           {
             "type": "command",

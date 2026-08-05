@@ -1350,6 +1350,56 @@ open(sys.argv[1], 'w').write('# 계획\n' + '내용 줄\n' * 200)" "$PW/.dev/pla
      pb "$PW/.claude/harness/bin/harness approve-plan .dev/plan/${PPRE}long.md" default)"
 rm -rf "$PW"
 
+echo "== plan mode: 확정 뒤에 파일을 쓴다"
+# plan mode 는 파일 쓰기를 막으므로 그 안에서 plan_file 을 채울 수 없다.
+# 그래서 순서를 뒤집는다 — 계획을 대화로 확정하고, 나온 뒤에 확정본만 파일로.
+MW2="$(mktemp -d)"
+(cd "$MW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+m2() { (cd "$MW2" && python3 "$ENGINE" "$@"); }
+check "Planning 안내가 파일을 먼저 쓰지 말라고 한다" '파일을 먼저 쓰지 마라' \
+  "$(python3 -c "
+import json,sys
+c=json.load(open(sys.argv[1]))
+print([s for s in c['stages'] if s['id']=='planning'][0]['hint'])" \
+  "$MW2/.claude/harness/stages.json")"
+check "확정본을 그대로 쓰라고 한다" '확정본을 그대로' \
+  "$(python3 -c "
+import json,sys
+c=json.load(open(sys.argv[1]))
+print([s for s in c['stages'] if s['id']=='planning'][0]['hint'])" \
+  "$MW2/.claude/harness/stages.json")"
+
+m2 loop intent "계획" >/dev/null
+m2 loop done-when "끝" >/dev/null
+m2 advance >/dev/null; m2 advance >/dev/null; m2 advance >/dev/null
+printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"s1","tool_name":"ExitPlanMode","tool_input":{"plan":"# 계획"},"tool_response":{"approved":true}}' "$MW2" \
+  | CLAUDE_PROJECT_DIR="$MW2" python3 "$ENGINE" hook >/dev/null
+check "ExitPlanMode 를 관측해 기록한다" 'ExitPlanMode' \
+  "$(python3 -c "
+import sqlite3,sys
+r=sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT detail FROM event WHERE kind='plan_mode_exit'\").fetchone()
+print(r[0] if r else '')" "$MW2/.claude/harness/harness.db")"
+# **아직 증거로 쓰지 않는다.** 거절 시에도 훅이 뜨는지 모르기 때문이다.
+check "그것만으로 plan_approved 가 서지 않는다" 'plan_approved' \
+  "$(python3 - "$MW2" "$(dirname "$ENGINE")" <<'PYE'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+root = sys.argv[1]; con = h.connect(root)
+cfg = h.load_config(root, None)
+print(",".join(h.exit_blockers(con, cfg, h.head_loop(con), "planning")))
+PYE
+)"
+check "관측만으로 게이트가 열리지 않는다" '^0$' \
+  "$(python3 - "$MW2" "$(dirname "$ENGINE")" <<'PYF'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+print(1 if h.has_evidence(con, h.head_loop(con), "plan_approved") else 0)
+PYF
+)"
+rm -rf "$MW2"
+
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
 # cycle_counters 11개 항목과 _survival 8개 항목.

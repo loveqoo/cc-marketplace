@@ -110,6 +110,7 @@ EVENT_KINDS = {
     "promote_verify": "승격 시 변경 관측",
     "cycle_close": "회차 종료",
     "retro_keys": "회고 검색 키 확인",
+    "plan_mode_exit": "plan mode 종료 관측",
     "stop_continue": "턴 이어붙임",
     "stop_stalled": "진전 없어 이어붙임 중단",
 }
@@ -1526,6 +1527,20 @@ def hook_post_tool_use(inp, ctx):
     """증거만 조용히 적립한다. 컨텍스트로 출력하지 않는다."""
     con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     tool = inp.get("tool_name") or ""
+
+    if tool == "ExitPlanMode":
+        # **관측만 한다. 아직 plan_approved 증거로 쓰지 않는다.**
+        # 사용자가 계획을 거절했을 때도 이 훅이 뜨는지 모른다. 뜬다면 거절된 계획이
+        # 승인으로 기록되고, 그건 게이트가 사람 없이 열리는 것이다 — 두 번 찾아낸
+        # 부류의 구멍이다. 응답의 모양을 기록해 두고, 한 번 실제로 돌려본 뒤에
+        # 안전하게 배선한다. 그때까지 승인은 `harness approve-plan` 이 담당한다.
+        shape = {k: str(v)[:120] for k, v in sorted(inp.items())
+                 if k not in ("tool_input", "cwd", "session_id", "transcript_path")}
+        with con:
+            record_event(con, lid, sid, "plan_mode_exit", "observed",
+                         "ExitPlanMode", json.dumps(shape, ensure_ascii=False)[:400])
+        return
+
     ti = inp.get("tool_input") or {}
     signals = cfg.get("evidence_signals", {})
 
