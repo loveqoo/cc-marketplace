@@ -1400,6 +1400,75 @@ PYF
 )"
 rm -rf "$MW2"
 
+echo "== 모드 사전승인은 회피로 세지 않는다"
+# bypassPermissions 로 돌리면 모든 동의 명령이 bypass 로 적립된다. 그걸 회피로
+# 세면 무인 실행이 곧바로 "게이트가 연극이 되고 있다" 로 판정된다 — 사람이
+# 그렇게 하라고 지시한 것인데. preauth 열로 갈라 판정에서 뺀다.
+AW="$(mktemp -d)"
+(cd "$AW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+aw() { (cd "$AW" && python3 "$ENGINE" "$@"); }
+aw loop intent "무인" >/dev/null
+aw loop done-when "끝" >/dev/null
+aw advance >/dev/null
+for i in 1 2 3; do
+  printf '{"hook_event_name":"PreToolUse","cwd":"%s","permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":".claude/harness/bin/harness allow docs/x%d.md --reason 스펙"}}' "$AW" "$i" \
+    | CLAUDE_PROJECT_DIR="$AW" python3 "$ENGINE" hook >/dev/null
+done
+python3 - "$AW" "$(dirname "$ENGINE")" <<'PYA' >/dev/null
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1]); lid = h.head_loop(con)
+with con:
+    h.record_event(con, lid, "verification", "bypass", "prefix", "verification", "상한 소진")
+PYA
+ACNT="$(python3 - "$AW" "$(dirname "$ENGINE")" <<'PYB'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1]); lid = h.head_loop(con)
+c = h.cycle_counters(con, lid, h.cycle_window_start(con, lid))
+print("preauth=%d bypass=%d" % (c["preauth"], c["bypass"]))
+PYB
+)"
+check "사전승인 3건을 따로 센다" 'preauth=3' "$ACNT"
+check "실제 우회 1건만 우회로 센다" 'bypass=1' "$ACNT"
+
+echo "  -- 판정이 사전승인에 흔들리지 않는다"
+AV="$(python3 - "$(dirname "$ENGINE")" <<'PYV'
+import sys; sys.path.insert(0, sys.argv[1])
+import harness as h
+mk = lambda b, r, by, pre: {"blocks": b, "refails": r, "bypass": by, "skips": 0,
+                            "declines": 0, "churn": 0, "preauth": pre}
+out = []
+out.append("무인=%s" % h.trend_verdict([mk(5, 3, 0, 0), mk(2, 1, 0, 40)]))
+out.append("실제회피=%s" % h.trend_verdict([mk(5, 3, 0, 0), mk(2, 1, 3, 0)]))
+out.append("둘다=%s" % h.trend_verdict([mk(5, 3, 0, 0), mk(2, 1, 3, 40)]))
+print(" ".join(out))
+PYV
+)"
+check "사전승인만 늘면 개선 신호" '무인=improving' "$AV"
+check "실제 우회가 늘면 회피" '실제회피=evasion' "$AV"
+check "실제 우회가 있으면 사전승인과 무관하게 회피" '둘다=evasion' "$AV"
+# 추세 표는 회차 스냅샷이 있어야 나오고, 판정은 구간이 둘 이상이어야 나온다
+# (_bucket 은 6개 미만이면 한 구간으로 묶는다). 6개를 심는다.
+python3 - "$AW" "$(dirname "$ENGINE")" <<'PYC' >/dev/null
+import json, sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+with con:
+    for i in range(6):
+        snap = dict(cycle=1, dur=100, blocks=6 - i, fails=3, refails=max(0, 2 - i // 2),
+                    churn=2, edits=5, gates=0, bypass=0, skips=0, declines=0,
+                    preauth=0 if i < 3 else 30, promotes=0)
+        con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    ("2026-0%d-01T10:00:00+0900" % (i + 1), "z", "compounding",
+                     "cycle_close", "1", "z-%d" % i, json.dumps(snap)))
+PYC
+AM="$(aw metrics)"
+check "metrics 표에 사전승인 열이 있다" '사전승인' "$AM"
+check "사전승인만 올라도 개선 신호로 읽는다" '개선 신호' "$AM"
+rm -rf "$AW"
+
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
 # cycle_counters 11개 항목과 _survival 8개 항목.

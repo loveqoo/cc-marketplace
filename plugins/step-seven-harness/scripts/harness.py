@@ -604,6 +604,12 @@ def cycle_counters(con, lid, lo):
     for r in rows:
         tally[r["kind"]] = tally.get(r["kind"], 0) + 1
 
+    # 모드 사전 승인(bypassPermissions)은 **회피가 아니다.** 사용자가 고른 모드다.
+    # 같이 세면 무인 실행이 곧바로 "게이트가 연극이 되고 있다" 로 판정된다 —
+    # 실제로는 사람이 그렇게 하라고 지시한 것인데. 열을 갈라 둘 다 보이게 한다.
+    preauth = sum(1 for r in rows
+                  if r["kind"] == "bypass" and r["rule"] == "bypass_mode")
+
     # 재편집 최대치: 한 파일을 몇 번 고쳤나. 구조 냄새의 대리 지표.
     edits = {}
     for r in rows:
@@ -630,7 +636,8 @@ def cycle_counters(con, lid, lo):
         "churn": max(edits.values()) if edits else 0,
         "edits": tally.get("edit", 0),
         "gates": tally.get("stop_gate", 0),
-        "bypass": tally.get("bypass", 0),
+        "bypass": tally.get("bypass", 0) - preauth,
+        "preauth": preauth,
         "skips": tally.get("skip", 0),
         "declines": tally.get("promote_declined", 0),
         "promotes": tally.get("promote", 0),
@@ -2667,8 +2674,11 @@ def _bucket(rows, n=3):
     return out
 
 
+# 사전승인(preauth)은 표에는 보이지만 **판정에는 들어가지 않는다.** 무인 실행을
+# 회피로 세면 그 판정은 모드 선택을 비난하는 것이 된다.
 TREND_KEYS = (("blocks", "차단"), ("refails", "반복실패"), ("churn", "재편집"),
-              ("bypass", "우회"), ("skips", "스킵"), ("declines", "보류"))
+              ("bypass", "우회"), ("skips", "스킵"), ("declines", "보류"),
+              ("preauth", "사전승인"))
 
 
 def trend_verdict(avgs):
@@ -2679,6 +2689,7 @@ def trend_verdict(avgs):
     """
     if len(avgs) < 2:
         return None
+    # preauth 는 의도적으로 빠져 있다 — 아래 evasion 계산을 보라.
     first, last = avgs[0], avgs[-1]
     friction = last["blocks"] + last["refails"] < first["blocks"] + first["refails"]
     evasion = (last["bypass"] + last["skips"] + last["declines"]
@@ -3013,7 +3024,7 @@ def cli_stats(ctx, argv):
                              ("tool_fail", "실패한 도구", "target"),
                              ("skip", "건너뛴 단계", "rule"),
                              ("stop_gate", "미충족 종료 조건", "rule"),
-                             ("bypass", "우회한 게이트", "rule")):
+                             ("bypass", "우회한 게이트 (사전승인 포함)", "rule")):
         q = ("SELECT IFNULL(%s,'-') k, COUNT(*) c, COUNT(DISTINCT loop_id) loops, "
              "COUNT(DISTINCT target) targets FROM event WHERE kind=? %s "
              "GROUP BY k ORDER BY loops DESC, c DESC LIMIT 6"
