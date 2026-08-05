@@ -2005,6 +2005,64 @@ json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 check "그래도 기본 보호는 살아 있다" '하네스 자신' "$(bsb "rm .claude/harness/harness.db")"
 rm -rf "$PW5" "$CS" "$BS"
 
+echo "== 출력 문자열이 카탈로그로 번역된다 (원문이 키다)"
+# 영어 버전을 분기로 만들려면 2,860줄 번역 + 413개 단정을 함께 고쳐야 했다. 출력
+# 문자열이 카탈로그로 나오면 그것이 **파일 하나**가 된다. 원문을 키로 쓰므로 키를
+# 발명할 필요가 없고, 번역이 없으면 원문으로 떨어져 동작이 바뀌지 않는다.
+MW="$(mktemp -d)"
+(cd "$MW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+mw() { (cd "$MW" && python3 "$ENGINE" "$@"); }
+check "카탈로그가 엔진 사본 옆에 복사된다" 'messages.ko.json' "$(ls "$MW/.claude/harness/bin")"
+check "카탈로그는 커밋 대상이 아니다" '^0$' \
+  "$(cd "$MW" && git status --porcelain | grep -c 'messages' || true)"
+# 원문 언어에서는 조회조차 하지 않는다
+check_empty "기본(한국어)에서는 번역 경고가 없다" \
+  "$(mw status 2>&1 | grep 'language=' || true)"
+
+# 시험용 영어 카탈로그를 만든다. 세 문장만 번역하고 나머지는 원문으로 떨어져야 한다.
+python3 -c "
+import json, sys
+bin_dir = sys.argv[1]
+ko = json.load(open(bin_dir + '/messages.ko.json', encoding='utf-8'))
+pick = [k for k in ko if k.startswith('advance 거부 —')] \
+     + [k for k in ko if k.startswith('하네스 자신은 수정할 수 없다')]
+en = {}
+for k in pick:
+    en[k] = 'EN|' + k
+json.dump(en, open(bin_dir + '/messages.en.json', 'w', encoding='utf-8'),
+          ensure_ascii=False, indent=2)
+print(len(en))
+" "$MW/.claude/harness/bin" > /dev/null
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['language'] = 'en'
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$MW/.claude/harness/stages.json"
+
+check "설정한 언어로 번역된다" 'EN|advance 거부' "$(mw advance 2>&1)"
+check "번역 없는 문장은 원문으로 떨어진다" 'intent_set: 이번에 할 작업을' "$(mw advance 2>&1)"
+MWH="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/.claude/harness/harness.db"}}' "$MW" "$MW" | CLAUDE_PROJECT_DIR="$MW" python3 "$ENGINE" hook)"
+check "훅 경로에서도 번역된다" 'EN|하네스 자신은' "$MWH"
+check "부분 번역이면 그 사실을 말한다" '번역이 2/' "$(mw status 2>&1)"
+check "환경변수로도 언어를 정할 수 있다" 'EN|advance 거부' \
+  "$(python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg.pop('language')
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$MW/.claude/harness/stages.json"; (cd "$MW" && HARNESS_LANG=en python3 "$ENGINE" advance 2>&1) || true)"
+# 카탈로그가 없는 언어를 켜면 전부 원문이 된다 — 켠 사람은 '설정이 안 먹었다'로 읽는다
+check "카탈로그가 없으면 그 사실을 말한다" '찾지 못했다' \
+  "$(cd "$MW" && HARNESS_LANG=fr python3 "$ENGINE" status 2>&1)"
+# 카탈로그가 깨져도 게이트가 멈추면 안 된다
+printf 'not json {' > "$MW/.claude/harness/bin/messages.en.json"
+check "깨진 카탈로그에도 원문으로 동작한다" 'advance 거부' \
+  "$(cd "$MW" && HARNESS_LANG=en python3 "$ENGINE" advance 2>&1 || true)"
+rm -rf "$MW"
+
 echo "== 승격의 종류도 설정이다 (기계화하는 방법이 프로젝트마다 다르다)"
 AK="$(mktemp -d)"
 (cd "$AK" && git init -q . && python3 "$ENGINE" init >/dev/null)
