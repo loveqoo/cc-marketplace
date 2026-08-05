@@ -2005,6 +2005,87 @@ json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 check "그래도 기본 보호는 살아 있다" '하네스 자신' "$(bsb "rm .claude/harness/harness.db")"
 rm -rf "$PW5" "$CS" "$BS"
 
+echo "== 승격의 종류도 설정이다 (기계화하는 방법이 프로젝트마다 다르다)"
+AK="$(mktemp -d)"
+(cd "$AK" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ak() { (cd "$AK" && python3 "$ENGINE" "$@"); }
+# 반복 항목을 먼저 만든다 — 키 검사가 --as 검사보다 앞이라 유효한 키가 필요하다
+python3 -c "
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+n = time.strftime('%Y-%m-%dT%H:%M:%S+0900')
+for i in range(3):
+    c.execute('INSERT INTO loop(id,intent,created_at) VALUES(?,?,?)', ('ak%d' % i, 't', n))
+    c.execute('INSERT INTO event(loop_id,stage,kind,rule,target,at) VALUES(?,?,?,?,?,?)',
+              ('ak%d' % i, 'execution', 'block', 'fakerule', 'f.py', n))
+c.commit()" "$AK/.claude/harness/harness.db"
+check "기본 종류가 안내된다" 'hook, rule, skill, structure' \
+  "$(ak promote 'block:fakerule' --as bogus 2>&1)"
+check_empty "없는 종류로는 승격되지 않는다" \
+  "$(ak promote 'block:fakerule' --as bogus 2>&1 | grep '승격 기록' || true)"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['promotion']['as_kinds']['test'] = '회귀 테스트로 승격 (다시 깨지면 CI 가 잡는다)'
+cfg['promotion']['verify_globs']['test'] = ['tests/**']
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$AK/.claude/harness/stages.json"
+check "새 종류가 안내에 들어간다" 'test' "$(ak promote 'block:fakerule' --as bogus 2>&1)"
+check "설정한 종류로 승격된다" '회귀 테스트로 승격' \
+  "$(ak promote 'block:fakerule' --as test --note '테스트로 막았다' 2>&1)"
+check "as_kinds 에 없는 verify_globs 를 지적한다" '죽은 설정이다' \
+  "$(python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['promotion']['as_kinds'].pop('test')
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$AK/.claude/harness/stages.json"; ak status 2>&1)"
+rm -rf "$AK"
+
+echo "== 훅과 CLI 의 판정이 같아야 한다 (엔진 사본 문제)"
+# 실제 버그였다. 래퍼는 프로젝트 사본(.claude/harness/bin/harness.py)을 실행하고,
+# 그때 plugin_root() 는 `.claude/harness/` 를 가리켜 templates/ 가 없다. 그래서
+# 어휘 기본값을 못 찾았다 — 훅(플러그인 엔진)은 알고 CLI(사본)는 모르는 상태가 됐고,
+# 래퍼로 advance 하면 satisfied_by 를 몰라 **디스크의 계획 파일을 인정하지 않았다.**
+# 0.31.1 에서 고친 함정이 다른 문으로 돌아온 것이다.
+EW="$(mktemp -d)"
+(cd "$EW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+check "기본값이 엔진 사본 옆에 복사된다" 'defaults.json' "$(ls "$EW/.claude/harness/bin")"
+check "기본값은 커밋 대상이 아니다" '^0$' \
+  "$(cd "$EW" && git status --porcelain | grep -c 'defaults.json' || true)"
+# 어휘화 이전 문서를 흉내낸다
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg.pop('criteria'); cfg.pop('write_rules')
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$EW/.claude/harness/stages.json"
+EPLUG="$( (cd "$EW" && python3 "$ENGINE" advance 2>&1) || true )"
+EWRAP="$( (cd "$EW" && .claude/harness/bin/harness advance 2>&1) || true )"
+check "플러그인 엔진이 도움말을 안다" 'harness loop intent' "$EPLUG"
+check "래퍼도 같은 도움말을 낸다" 'harness loop intent' "$EWRAP"
+check "래퍼도 쓰기 규칙 7개를 안다" '^7$' \
+  "$(cd "$EW" && python3 -c "
+import sys, os
+sys.path.insert(0, '.claude/harness/bin')
+import harness as h
+print(len(h.write_rules(h.load_config(os.getcwd()))))")"
+# 파일 판정도 같아야 한다 — 이게 실제로 갈렸던 지점이다
+(cd "$EW" && .claude/harness/bin/harness loop intent "사본 판정" >/dev/null \
+  && .claude/harness/bin/harness loop done-when "끝" >/dev/null \
+  && .claude/harness/bin/harness advance >/dev/null \
+  && .claude/harness/bin/harness advance >/dev/null \
+  && .claude/harness/bin/harness advance >/dev/null)
+EPRE="$(cd "$EW" && .claude/harness/bin/harness status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+mkdir -p "$EW/.dev/plan"; printf '# 계획\n' > "$EW/.dev/plan/${EPRE}p.md"
+check "래퍼도 디스크의 계획 파일을 인정한다" '^plan_approved$' \
+  "$(cd "$EW" && .claude/harness/bin/harness status --json \
+     | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))')"
+rm -rf "$EW"
+
 echo "== 어휘 안에서 덜어낸 것은 되살리지 않는다"
 # "마찰이 크면 stages.json 에서 덜어낸다"가 이 하네스의 작업 방식이다. 템플릿 채움이
 # 항목 단위로 병합하면 지운 것이 되살아나 그 자유를 빼앗는다. 영역이 통째로 없을 때만 채운다.

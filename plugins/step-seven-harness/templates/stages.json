@@ -219,6 +219,13 @@
       "block",
       "tool_fail"
     ],
+    "as_kinds": {
+      "hook": "훅/규칙으로 기계화 (stages.json 또는 플러그인)",
+      "rule": "LEARNED.md 한 줄로 승격 (항상 로드된다)",
+      "skill": "스킬/커맨드로 승격",
+      "structure": "구조를 바꿔 원인을 제거",
+      "declined": "승격하지 않는다 (사유 기록)"
+    },
     "exclude_rules": [
       "no_reason",
       "bypass_mode",

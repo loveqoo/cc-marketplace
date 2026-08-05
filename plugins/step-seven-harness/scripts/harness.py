@@ -104,7 +104,7 @@ EVENT_KINDS = {
 }
 
 # 승격 결정의 종류. 'declined' 는 "안 한다 + 사유" — 결정이지 회피가 아니다.
-PROMOTE_AS = {
+PROMOTE_AS_DEFAULT = {
     "hook": "훅/규칙으로 기계화 (stages.json 또는 플러그인)",
     "rule": "LEARNED.md 한 줄로 승격 (항상 로드된다)",
     "skill": "스킬/커맨드로 승격",
@@ -262,13 +262,17 @@ def load_config(root, plugin_root_dir=None):
     """
     path = os.path.join(root, CONFIG_REL)
     cfg = jload(path)
+    if plugin_root_dir is None:
+        plugin_root_dir = plugin_root()
     # **있는데 못 읽는 것과 없는 것은 다르다.** 손상된 문서를 템플릿으로 갈아치우면
     # 사용자가 덜어낸 규칙이 말없이 되살아나고, 그 사람은 이유 모를 차단만 본다.
     # 없으면(설치 전) 템플릿을 쓰고, 깨졌으면 그대로 알린다.
     if cfg is None and os.path.exists(path):
         return None
-    tpl_dir = plugin_root_dir or plugin_root()
-    tpl = jload(os.path.join(tpl_dir, "templates", "stages.json"))
+    tpl = jload(os.path.join(plugin_root_dir, "templates", "stages.json"))
+    if tpl is None:
+        # 프로젝트 사본으로 실행 중이다. 기본값은 엔진 옆에 함께 복사돼 있다.
+        tpl = jload(os.path.join(root, DEFAULTS_REL))
     if cfg is None:
         cfg = tpl
     elif isinstance(cfg, dict) and isinstance(tpl, dict):
@@ -304,6 +308,17 @@ def _adopt_evidence_signals(cfg):
 
 
 SATISFIED_BY = ("cli", "file", "observed", "no_pending_promotions")
+
+
+def promote_as(cfg):
+    """승격의 종류 → 설명. 어떻게 기계화하는지는 프로젝트마다 다르다.
+
+    `test`(회귀 테스트로 승격)나 `lint`(린터 규칙으로) 같은 종류를 쓰는 팀이 있다.
+    `declined` 는 `--as` 값이 아니라 보류 **결정**이므로 목록을 보여줄 때 제외한다.
+    """
+    m = cfg.obj("promotion.as_kinds")
+    got = {k: v for k, v in m.items() if isinstance(v, str)} if m else {}
+    return got or dict(PROMOTE_AS_DEFAULT)
 
 # 아래 다섯 개는 **정책·내용**이라 설정이 정한다. 엔진에 박아 두면 프로젝트마다 다른
 # 것을 하나로 강요하게 되고, 특히 recall_dirs 는 조용한 결함이었다 — 설정에 폴더를
@@ -457,6 +472,13 @@ def config_problems(cfg):
     for i, it in enumerate(cfg.seq("retro_questions")):
         if not isinstance(it, dict) or not it.get("q"):
             out.append("retro_questions[%d] 에 q 가 없다 — 이 질문은 무시된다" % i)
+    kinds = promote_as(cfg)
+    if not [k for k in kinds if k != "declined"]:
+        out.append("promotion.as_kinds 에 승격 종류가 없다 — 보류밖에 할 수 없다")
+    for k in cfg.obj("promotion.verify_globs"):
+        if k not in kinds:
+            out.append("promotion.verify_globs 의 '%s' 가 as_kinds 에 없다 "
+                       "— 아무도 그 종류로 승격할 수 없어 죽은 설정이다" % k)
     pat = cfg.at("bash.mutator_pattern")
     if pat:
         try:
@@ -1955,7 +1977,7 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
     elif p:
         lines.append("이 항목은 이미 %s(%s): %s — 승격이 통하지 않고 있다면 "
                      "회고에 그 사실을 쓰라."
-                     % (PROMOTE_AS.get(p["decision"], p["decision"]),
+                     % (promote_as(cfg).get(p["decision"], p["decision"]),
                         p["maturity"], (p["note"] or "-")))
 
     if prev and prev["detail"]:
@@ -2260,6 +2282,8 @@ def argv_positional(argv):
 
 
 ENGINE_REL = os.path.join(HARNESS_DIR, "bin", "harness.py")
+# 어휘 기본값. 엔진 사본 옆에 두어 같은 수명을 갖는다 (`bin/` 은 이미 gitignore 된다).
+DEFAULTS_REL = os.path.join(HARNESS_DIR, "bin", "defaults.json")
 
 # 엔진 사본을 프로젝트 안에서 먼저 찾는다. 프로젝트 밖의 파일을 실행하면
 # auto-mode 분류기와 샌드박스가 막는다 — 둘 다 실제로 겪은 문제다.
@@ -2309,7 +2333,19 @@ def refresh_engine(root):
             body = fh.read()
     except Exception:
         return False
-    return _write_if_changed(dst, body, 0o644)
+    changed = _write_if_changed(dst, body, 0o644)
+    # **기본값도 사본과 함께 가야 한다.** 사본이 실행될 때 plugin_root() 는
+    # `.claude/harness/` 를 가리키고 거기엔 templates/ 가 없다. 그래서 어휘 기본값을
+    # 못 찾고, 훅(플러그인 엔진)과 CLI(사본)의 판정이 갈렸다 — 래퍼로 advance 하면
+    # satisfied_by 를 몰라 디스크의 계획 파일을 인정하지 않았다. 재현해 확인했다.
+    tpl = os.path.join(plugin_root(), "templates", "stages.json")
+    if os.path.isfile(tpl):
+        try:
+            with open(tpl, encoding="utf-8") as fh:
+                _write_if_changed(os.path.join(root, DEFAULTS_REL), fh.read(), 0o644)
+        except Exception:
+            pass  # 기본값 사본이 없어도 프로젝트 문서만으로 동작해야 한다
+    return changed
 
 
 def refresh_wrapper(root):
@@ -3265,11 +3301,11 @@ def cli_promote(ctx, argv):
         as_kind = "declined"
     if not as_kind:
         print("무엇으로 승격할지 골라야 한다: --as %s, 또는 --decline."
-              % "|".join(k for k in PROMOTE_AS if k != "declined"))
+              % "|".join(k for k in promote_as(cfg) if k != "declined"))
         return 2
-    if as_kind not in PROMOTE_AS:
+    if as_kind not in promote_as(cfg):
         print("알 수 없는 승격 종류: %s (가능: %s)"
-              % (as_kind, ", ".join(PROMOTE_AS)))
+              % (as_kind, ", ".join(promote_as(cfg))))
         return 2
     if not note:
         print("사유/내용이 필요하다: %s"
@@ -3311,7 +3347,7 @@ def cli_promote(ctx, argv):
     wrote = refresh_learned(con, cfg, root)
 
     print("%s: %s → %s" % ("보류 기록" if as_kind == "declined" else "승격 기록",
-                           key, PROMOTE_AS[as_kind]))
+                           key, promote_as(cfg)[as_kind]))
     print("  %s" % note)
     if wrote:
         print("  %s 갱신 (%d/%d줄)"
@@ -3929,7 +3965,7 @@ def promote_report(ctx):
     """승격 결정 현황. 계산만 한다."""
     return {
         "pending": pending_promotions(ctx.con, ctx.cfg),
-        "options": [{"as": k, "why": v} for k, v in PROMOTE_AS.items()],
+        "options": [{"as": k, "why": v} for k, v in promote_as(ctx.cfg).items()],
         "decided": [dict(r) for r in ctx.con.execute(
             "SELECT key, decision, maturity, note FROM promotion "
             "ORDER BY at DESC LIMIT 8")],
