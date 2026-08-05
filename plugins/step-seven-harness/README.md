@@ -42,7 +42,7 @@ AI와 오래 일하면 같은 문제를 반복하게 됩니다. 지난주에 겪
 - 한 번 쓰고 버릴 스크립트를 만드는 중인 분 — 쌓일 것이 없으면 복리도 없습니다
 - 절차적 제약을 답답해하는 분 — 마찰이 커지면 결국 게이트를 끄게 됩니다
 
-> **현재 상태를 솔직히 적어둡니다.** 테스트 375개와 두 차례의 적대적 코드 리뷰를
+> **현재 상태를 솔직히 적어둡니다.** 0.32.0 기준 테스트 519개와 두 차례의 적대적 코드 리뷰를
 > 통과했지만, **실제 프로젝트에서 길게 돌려본 적은 아직 없습니다.** 낮은 위험
 > 프로젝트에서 먼저 써보시는 것을 권합니다.
 
@@ -233,6 +233,20 @@ CLI 명령이라 누가 실행해도 종료 조건이 남아 있으면 거부하
 
 `satisfied_by` 는 `cli`(명령으로 기록) · `file`(디스크에 있으면) ·
 `observed`(도구 사용을 관측) · `no_pending_promotions` 중 하나입니다.
+
+**쓰기 규칙도 같습니다.** 폴더·파일명 규칙 일곱 개가 데이터입니다. 없던 규칙을
+더하는 것도 항목 하나입니다.
+
+```jsonc
+{ "id": "test_naming",
+  "when":    { "class": "tests", "min_depth": 2 },       // 어디에 해당하나
+  "require": { "basename_matches": "folder_rules.test_name_pattern" },  // 무엇을 요구하나
+  "deny":    "tests/ 파일명은 test_*.py 여야 한다. '{basename}' 는 규칙 위반이다." }
+```
+
+**배열 순서가 우선순위입니다.** 차단은 `id` 로 적립되므로 새 규칙도 곧바로
+`harness stats`·승격 대상이 됩니다. 어휘로 표현할 수 없는 규칙은
+`"require": {"predicate": "<이름>"}` 으로 파이썬에 남길 수 있습니다.
 `human: true` 를 붙이면 **사람만 채울 수 있는 조건**이 되어, 그것이 남았을 때
 하네스가 모델의 턴을 밀지 않습니다. 단계 진입 시 무엇을 보여줄지는
 `stages[].panels` 가 정합니다.
@@ -302,6 +316,7 @@ python3 tests/math_check.py   # 측정 산술을 손계산과 대조
 python3 tests/doc_check.py    # 문서의 산문 중복·깨진 링크
 python3 tests/ctx_check.py    # ctx 를 풀지 않고 쓰는 함수 (조용히 죽는 부류)
 python3 tests/settings_check.py  # .claude/settings.json 을 안전하게 쓰는지
+python3 tests/rules_check.py   # 쓰기 규칙 어휘·선택자·탈출 해치
 sh tests/init_diff.sh         # 설치가 옛 엔진이 만든 것을 잃지 않았는지
 ```
 

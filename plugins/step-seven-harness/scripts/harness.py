@@ -344,6 +344,60 @@ def config_problems(cfg):
         if how == "file" and not spec.get("write_glob"):
             out.append("criteria.%s 는 satisfied_by=file 인데 write_glob 이 없다 "
                        "— 어떤 파일도 이 조건을 채우지 못한다" % name)
+    # 쓰기 규칙. 여기 오타는 특히 조용하다 — 규칙이 아무것도 막지 않거나,
+    # 반대로 아무 경로에도 해당하지 않아 통째로 죽는다. 둘 다 티가 안 난다.
+    fr = cfg.obj("folder_rules")
+    seen_ids = set()
+    for i, r in enumerate(cfg.get("write_rules") or []):
+        at = "write_rules[%d]" % i
+        if not isinstance(r, dict):
+            out.append("%s 가 객체가 아니다 — 이 규칙은 무시된다" % at)
+            continue
+        rid = r.get("id")
+        if not rid:
+            out.append("%s 에 id 가 없다 — 차단 기록이 '?' 로 남아 승격에 쓸 수 없다" % at)
+        elif rid in seen_ids:
+            out.append("%s 의 id '%s' 가 중복이다 — 통계가 두 규칙을 한 덩어리로 센다"
+                       % (at, rid))
+        else:
+            seen_ids.add(rid)
+        at = "write_rules[%s]" % (rid or i)
+        if not r.get("deny"):
+            out.append("%s 에 deny 메시지가 없다 — 막으면서 무엇을 하라는 말이 없다" % at)
+        when, req = r.get("when") or {}, r.get("require") or {}
+        for k in when:
+            if k not in WRITE_SELECTORS:
+                out.append("%s.when 의 '%s' 는 모르는 선택자다 (%s 중 하나) "
+                           "— 이 조건은 무시된다" % (at, k, "/".join(WRITE_SELECTORS)))
+        tests = [k for k in req if k in WRITE_TESTS]
+        unknown = [k for k in req if k not in WRITE_TESTS]
+        for k in unknown:
+            out.append("%s.require 의 '%s' 는 모르는 판정이다 (%s 중 하나)"
+                       % (at, k, "/".join(WRITE_TESTS)))
+        if not tests:
+            out.append("%s 에 판정이 없다 — 이 규칙은 아무것도 막지 않는다" % at)
+        elif len(tests) > 1:
+            out.append("%s 에 판정이 %d개다 (%s) — 하나만 쓴다. 첫 것만 적용된다"
+                       % (at, len(tests), ", ".join(sorted(tests))))
+        pname = req.get("predicate")
+        if pname and pname not in WRITE_PREDICATES:
+            out.append("%s.require.predicate '%s' 라는 파이썬 술어가 없다 "
+                       "— 이 규칙은 아무것도 막지 않는다" % (at, pname))
+        # folder_rules 의 어느 목록을 가리키는 자리들. 없는 이름을 가리키면 조용히 죽는다.
+        for field, holder in (("subdir_in", when), ("basename_not_in", when),
+                              ("subdir_in", req), ("not_matching", req),
+                              ("stage_in", req)):
+            name = holder.get(field)
+            if isinstance(name, str) and name not in fr:
+                out.append("%s 의 %s='%s' 가 folder_rules 에 없다 — %s"
+                           % (at, field, name,
+                              "이 규칙이 어떤 경로에도 해당하지 않는다"
+                              if holder is when else "아무것도 막지 못한다"))
+        name = req.get("basename_matches")
+        if isinstance(name, str) and cfg.at(name) is None:
+            out.append("%s.require.basename_matches='%s' 가 설정에 없다 "
+                       "— 아무것도 막지 못한다" % (at, name))
+
     known = set(crit)
     for st in cfg.get("stages") or []:
         if not isinstance(st, dict):
@@ -1107,104 +1161,134 @@ class WriteReq(object):
 # 아래 WRITE_RULES 의 나열 순서가 곧 우선순위이고, 그게 이 표의 존재 이유다.
 # 이전에는 92줄 if-체인이어서 순서가 코드 흐름에 숨어 있었다.
 
-def _w_protected(w):
-    """하네스 자신. 예외(`allow`)로도 열리지 않으므로 grant 를 보지 않는다.
+# --------------------------------------------------------------- 쓰기 규칙 평가기
+#
+# 규칙 일곱 개가 전부 같은 모양이었다:
+#
+#   가드:  class == X  [· 깊이 ≥ N]  [· parts[1] ∈ <설정목록>]  [· basename ∉ <면제>]
+#   판정:  일곱 가지 테스트 중 하나
+#
+# 그래서 파이썬 함수가 아니라 데이터로 쓴다(`stages.json` 의 `write_rules`).
+# **배열 순서가 우선순위다** — 그게 이 표의 존재 이유이고, 예전 92줄 if-체인에서는
+# 순서가 코드 흐름에 숨어 있었다.
+#
+# 거부 메시지도 데이터다. 우리 원칙 중 "막을 때는 최적 행동을 함께 준다"가 스키마로
+# 강제되고, 부수적으로 번역이 데이터 파일 하나를 고치는 일이 된다.
 
-    엔진을 고치면 게이트를 무력화할 수 있고, DB 를 덮어쓰면 손상 시 차단하지 않는
-    설계(세션을 벽돌로 만들지 않기 위한 것) 때문에 게이트 전체가 조용히 꺼진다.
-    """
-    for pat in w.seq("protected_paths"):
-        if glob_match(w.rel, pat):
-            return ("하네스 자신은 수정할 수 없다 (%s). 규칙을 바꾸려면 "
-                    "`.claude/harness/stages.json` 을 고치고, 엔진을 바꾸려면 플러그인을 "
-                    "수정하라. 이 차단은 `allow` 로도 열리지 않는다." % w.rel)
+WRITE_SELECTORS = ("class", "min_depth", "subdir_in", "basename_not_in",
+                   "creates_new_toplevel")
+WRITE_TESTS = ("never", "not_matching", "class_in_stage_write", "stage_in",
+               "subdir_in", "basename_starts_with", "basename_matches", "predicate")
 
+# 탈출 해치. 어휘로 표현할 수 없는 규칙은 이름 붙인 파이썬으로 남긴다 — 어휘를 억지로
+# 늘리면 결국 튜링 완전해지고, 그러면 파이썬으로 쓰는 것과 같아진다. 비어 있는 것이
+# 정상이고, 여기 무언가 들어가면 그것이 다음 어휘 후보다.
+WRITE_PREDICATES = {}
 
-def _w_docs_readonly(w):
-    """docs/ 는 사람 소유."""
-    if w.cls == "docs" and not w.grant:
-        return ("docs/ 는 사람이 기록하는 영역이라 하네스가 쓰기를 막는다 (%s). "
-                "정말 필요하면 사용자에게 승인을 받아라: "
-                "`.claude/harness/bin/harness allow \"%s\" --reason \"...\"`"
-                % (w.rel, w.rel))
-
-
-def _w_stage_write(w):
-    """단계별 쓰기 허용 클래스."""
-    allowed = w.stage.get("write", [])
-    if w.cls not in allowed and not w.grant:
-        return ("현재 단계 %s 에서는 '%s' 클래스 경로에 쓸 수 없다 (%s). 허용: %s. "
-                "단계를 진행하려면 `.claude/harness/bin/harness advance`, "
-                "건너뛰려면 `... skip <stage> --reason \"...\"`."
-                % (w.lbl, w.cls, w.rel, ", ".join(allowed) or "(없음)"))
+FIELD_RE = re.compile(r"\{([a-z_]+)\}")
 
 
-def _w_new_toplevel(w):
-    """신규 최상위 폴더는 Scaffolding 에서만."""
-    if w.cls != "source":
-        return None
-    top = new_toplevel_dir(w.ctx.root, w.rel)
-    if top and w.ctx.sid not in w.seq("new_toplevel_dir_stages", ("scaffolding",)):
-        return ("신규 최상위 폴더 '%s/' 는 Scaffolding 단계에서만 만들 수 있다 (현재 %s). "
-                "구조 변경이 필요하면 Scaffolding 으로 되돌아가서 합의하라." % (top, w.lbl))
+def _subst(template, fields):
+    """`{rel}` 같은 자리만 채운다. 모르는 이름은 글자 그대로 남긴다 —
+    사용자가 쓴 메시지에 중괄호가 있어도 터지지 않아야 한다."""
+    return FIELD_RE.sub(lambda m: str(fields.get(m.group(1), m.group(0))), template)
 
 
-def _w_dev_subdir(w):
-    """`.dev/` 하위 폴더 이름.
-
-    `.dev/` 직속 파일(예: .dev/INDEX.md)은 제약하지 않는다 — 특정 회차에 속하지
-    않는 누적 문서의 자리가 필요하다. 폴더명 제약은 유지한다.
-    """
-    if w.cls != "dev" or len(w.parts) < 3:
-        return None
-    allowed = w.seq("dev_subdirs")
-    if allowed and w.parts[1] not in allowed:
-        return (".dev/ 하위 폴더는 %s 만 허용한다. '%s' 는 규칙 위반이다. "
-                "특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
-                % ("/".join(allowed), w.parts[1]))
-
-
-def _w_loop_prefix(w):
-    """산출물 파일명의 `<작업해시>-<회차>-` 접두사.
-
-    누적 문서(INDEX.md 등)는 특정 회차의 소유가 아니므로 접두사가 의미상 틀리다.
-    파일이 쌓이면 그 인덱스가 수백 개를 대표하는 진입점이 된다.
-    """
-    if w.cls != "dev" or len(w.parts) < 3:
-        return None
-    if w.parts[1] not in w.seq("loop_prefixed_dirs"):
-        return None
-    if w.parts[-1] in w.seq("prefix_exempt_names"):
-        return None
-    pre = file_prefix(w.ctx.con, w.ctx.lid)
-    if not w.parts[-1].startswith(pre):
-        return ("이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. "
-                "'%s' 대신 '%s%s' 로 써라. 앞단 해시(%s)로 grep 하면 한 작업의 "
-                "산출물이 회차와 무관하게 모인다."
-                % (w.parts[-1], pre, w.parts[-1], w.ctx.lid))
+def _w_selects(w, when):
+    """가드. 이 규칙이 이 쓰기에 해당하나."""
+    cls = when.get("class")
+    if cls is not None and w.cls != cls:
+        return False
+    md = when.get("min_depth")
+    if md is not None and len(w.parts) < int(md):
+        return False
+    for key, want_in in (("subdir_in", True), ("basename_not_in", False)):
+        name = when.get(key)
+        if name is None:
+            continue
+        if len(w.parts) < 2:
+            return False
+        part = w.parts[1] if key == "subdir_in" else w.parts[-1]
+        if (part in w.seq(name)) is not want_in:
+            return False
+    if when.get("creates_new_toplevel") and not new_toplevel_dir(w.ctx.root, w.rel):
+        return False
+    return True
 
 
-def _w_docs_naming(w):
-    """docs 하위 번호 명명 규칙 (grant 로 쓰기가 허용된 경우에만 도달)."""
-    if w.cls != "docs" or len(w.parts) < 3:
-        return None
-    if w.parts[1] not in w.seq("docs_subdirs"):
-        return None
-    pat = w.ctx.cfg.at("folder_rules.numbered_name_pattern")
-    if pat and not re.match(pat, w.parts[-1]):
-        return ("docs/%s/ 파일명은 NNN-name.md 형식이어야 한다. "
-                "'%s' 는 규칙 위반이다." % (w.parts[1], w.parts[-1]))
+def _w_violates(w, req):
+    """판정. True 면 위반이다."""
+    if req.get("never"):
+        return True
+    name = req.get("not_matching")
+    if name is not None:
+        return any(glob_match(w.rel, p) for p in w.seq(name))
+    if req.get("class_in_stage_write"):
+        return w.cls not in (w.stage.get("write") or [])
+    name = req.get("stage_in")
+    if name is not None:
+        return w.ctx.sid not in w.seq(name, ("scaffolding",))
+    name = req.get("subdir_in")
+    if name is not None:
+        allowed = w.seq(name)
+        # 목록이 비어 있으면 제약이 없다 — 덜어낸 것을 제약으로 읽으면 안 된다.
+        return bool(allowed) and w.parts[1] not in allowed
+    val = req.get("basename_starts_with")
+    if val is not None:
+        if val == "<loop_prefix>":
+            val = file_prefix(w.ctx.con, w.ctx.lid)
+        return not w.parts[-1].startswith(val)
+    name = req.get("basename_matches")
+    if name is not None:
+        pat = w.ctx.cfg.at(name)
+        return bool(pat) and not re.match(pat, w.parts[-1])
+    name = req.get("predicate")
+    if name:
+        fn = WRITE_PREDICATES.get(name)
+        return bool(fn) and bool(fn(w))
+    return False
 
 
-WRITE_RULES = (
-    ("protected", _w_protected),
-    ("docs_readonly", _w_docs_readonly),
-    ("stage_write", _w_stage_write),
-    ("new_toplevel", _w_new_toplevel),
-    ("dev_subdir", _w_dev_subdir),
-    ("loop_prefix", _w_loop_prefix),
-    ("docs_naming", _w_docs_naming),
-)
+def _w_fields(w, req):
+    f = {
+        "rel": w.rel,
+        "cls": w.cls,
+        "stage": w.lbl,
+        "loop": w.ctx.lid,
+        "basename": w.parts[-1],
+        "subdir": w.parts[1] if len(w.parts) > 1 else "",
+        "prefix": file_prefix(w.ctx.con, w.ctx.lid),
+        "top": new_toplevel_dir(w.ctx.root, w.rel) or "",
+    }
+    if req.get("class_in_stage_write"):
+        f["allowed"] = ", ".join(w.stage.get("write") or []) or "(없음)"
+    name = req.get("subdir_in")
+    if name:
+        f["allowed"] = "/".join(w.seq(name))
+    name = req.get("stage_in")
+    if name:
+        f["stages"] = ", ".join(
+            stage_obj(w.ctx.cfg, s)["label"] for s in w.seq(name, ("scaffolding",))
+            if s in stage_ids(w.ctx.cfg)) or "(없음)"
+    return f
+
+
+def write_rules(cfg):
+    return [r for r in (cfg.get("write_rules") or []) if isinstance(r, dict)]
+
+
+def _first_violation(w, rules):
+    """(규칙 id, 사유) 또는 (None, None). 배열 순서가 우선순위다."""
+    for r in rules:
+        if w.grant and r.get("grant_opens"):
+            continue          # 예외로 열리는 규칙. protected 는 이 표시가 없다.
+        if not _w_selects(w, r.get("when") or {}):
+            continue
+        if not _w_violates(w, r.get("require") or {}):
+            continue
+        return r.get("id") or "?", _subst(r.get("deny") or "규칙 위반이다: {rel}",
+                                          _w_fields(w, r.get("require") or {}))
+    return None, None
 
 
 def check_write(ctx, rel):
@@ -1213,11 +1297,11 @@ def check_write(ctx, rel):
     차단은 event 에 적립한다 — 어떤 규칙에 몇 번 걸리는지가 복리의 원료다.
     """
     w = WriteReq(ctx, rel)
-    for name, rule in WRITE_RULES:
-        reason = rule(w)
-        if reason:
-            record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
-            return "deny", reason
+    rules = write_rules(ctx.cfg)
+    name, reason = _first_violation(w, rules)
+    if reason:
+        record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
+        return "deny", reason
     if w.grant:
         # 조건부 UPDATE 로 소비한다. `with con:` 은 첫 DML 에서야 트랜잭션을
         # 시작하므로 find_grant 의 SELECT 는 트랜잭션 밖이다 — 병렬 훅 넷이
@@ -1229,11 +1313,10 @@ def check_write(ctx, rel):
         if not used:
             # 다른 훅이 먼저 썼다. 예외 없이도 통과하는지 다시 판정한다.
             w.grant = None
-            for name, rule in WRITE_RULES:
-                reason = rule(w)
-                if reason:
-                    record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
-                    return "deny", reason
+            name, reason = _first_violation(w, rules)
+            if reason:
+                record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
+                return "deny", reason
     return None, None
 
 

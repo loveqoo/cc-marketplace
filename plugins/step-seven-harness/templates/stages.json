@@ -61,6 +61,83 @@
       ".claude/harness/LEARNED.md"
     ]
   },
+  "write_rules": [
+    {
+      "id": "protected",
+      "when": {},
+      "require": {
+        "not_matching": "protected_paths"
+      },
+      "deny": "하네스 자신은 수정할 수 없다 ({rel}). 규칙을 바꾸려면 `.claude/harness/stages.json` 을 고치고, 엔진을 바꾸려면 플러그인을 수정하라. 이 차단은 `allow` 로도 열리지 않는다."
+    },
+    {
+      "id": "docs_readonly",
+      "grant_opens": true,
+      "when": {
+        "class": "docs"
+      },
+      "require": {
+        "never": true
+      },
+      "deny": "docs/ 는 사람이 기록하는 영역이라 하네스가 쓰기를 막는다 ({rel}). 정말 필요하면 사용자에게 승인을 받아라: `.claude/harness/bin/harness allow \"{rel}\" --reason \"...\"`"
+    },
+    {
+      "id": "stage_write",
+      "grant_opens": true,
+      "when": {},
+      "require": {
+        "class_in_stage_write": true
+      },
+      "deny": "현재 단계 {stage} 에서는 '{cls}' 클래스 경로에 쓸 수 없다 ({rel}). 허용: {allowed}. 단계를 진행하려면 `.claude/harness/bin/harness advance`, 건너뛰려면 `... skip <stage> --reason \"...\"`."
+    },
+    {
+      "id": "new_toplevel",
+      "when": {
+        "class": "source",
+        "creates_new_toplevel": true
+      },
+      "require": {
+        "stage_in": "new_toplevel_dir_stages"
+      },
+      "deny": "신규 최상위 폴더 '{top}/' 는 {stages} 단계에서만 만들 수 있다 (현재 {stage}). 구조 변경이 필요하면 그 단계로 되돌아가서 합의하라."
+    },
+    {
+      "id": "dev_subdir",
+      "when": {
+        "class": "dev",
+        "min_depth": 3
+      },
+      "require": {
+        "subdir_in": "dev_subdirs"
+      },
+      "deny": ".dev/ 하위 폴더는 {allowed} 만 허용한다. '{subdir}' 는 규칙 위반이다. 특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
+    },
+    {
+      "id": "loop_prefix",
+      "when": {
+        "class": "dev",
+        "min_depth": 3,
+        "subdir_in": "loop_prefixed_dirs",
+        "basename_not_in": "prefix_exempt_names"
+      },
+      "require": {
+        "basename_starts_with": "<loop_prefix>"
+      },
+      "deny": "이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. '{basename}' 대신 '{prefix}{basename}' 로 써라. 앞단 해시({loop})로 grep 하면 한 작업의 산출물이 회차와 무관하게 모인다."
+    },
+    {
+      "id": "docs_naming",
+      "when": {
+        "class": "docs",
+        "min_depth": 3,
+        "subdir_in": "docs_subdirs"
+      },
+      "require": {
+        "basename_matches": "folder_rules.numbered_name_pattern"
+      },
+      "deny": "docs/{subdir}/ 파일명은 NNN-name.md 형식이어야 한다. '{basename}' 는 규칙 위반이다."
+    }
+  ],
   "stop_continue": {
     "enabled": true,
     "max_per_prompt": 6,

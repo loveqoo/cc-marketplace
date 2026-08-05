@@ -1794,6 +1794,97 @@ check "세션 시작에서 사람에게 알린다" '무시되는 설정' \
   "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$CW" \
      | CLAUDE_PROJECT_DIR="$CW" python3 "$ENGINE" hook)"
 
+echo "== 쓰기 규칙이 선언형이다 (술어 7개가 데이터가 됐다)"
+# 규칙 일곱 개가 전부 같은 모양이었다: 가드(선택자) + 판정 하나. 그래서 파이썬 함수가
+# 아니라 데이터로 쓴다. 배열 순서가 우선순위다.
+WR="$(mktemp -d)"
+(cd "$WR" && git init -q . && python3 "$ENGINE" init >/dev/null)
+wr() { (cd "$WR" && python3 "$ENGINE" "$@"); }
+wrhk() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/%s"}}' "$WR" "$WR" "$1" \
+  | CLAUDE_PROJECT_DIR="$WR" python3 "$ENGINE" hook; }
+wrrule() { python3 -c "
+import sqlite3, sys
+r = sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='block' ORDER BY rowid DESC LIMIT 1\").fetchone()
+print(r[0] if r else '(없음)')" "$WR/.claude/harness/harness.db"; }
+wred() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$WR/.claude/harness/stages.json" "$1"; }
+
+check "규칙이 설정에 있다" 'write_rules' "$(cat "$WR/.claude/harness/stages.json")"
+check "거부 메시지가 데이터다" '하네스 자신은 수정할 수 없다' \
+  "$(cat "$WR/.claude/harness/stages.json")"
+
+echo "  -- 규칙마다 자기 id 로 적립돼야 한다 (승격의 원료다)"
+wrhk ".claude/harness/harness.db" >/dev/null
+check "protected 가 발동한다" '^protected$' "$(wrrule)"
+wrhk "docs/x.md" >/dev/null
+check "docs_readonly 가 발동한다" '^docs_readonly$' "$(wrrule)"
+wrhk ".dev/nope/a.md" >/dev/null
+check "dev_subdir 가 발동한다" '^dev_subdir$' "$(wrrule)"
+wrhk ".dev/plan/nohash.md" >/dev/null
+check "loop_prefix 가 발동한다" '^loop_prefix$' "$(wrrule)"
+wr loop intent "규칙" >/dev/null
+wr loop done-when "끝" >/dev/null
+wr advance >/dev/null; wr advance >/dev/null
+wrhk "src/new.py" >/dev/null
+check "stage_write 가 발동한다" '^stage_write$' "$(wrrule)"
+
+echo "  -- 없던 규칙을 설정만으로 만들 수 있다 (DSL 이 성립하나)"
+# 별도 픽스처. `tests` 쓰기가 허용된 단계(Scaffolding)여야 새 규칙까지 도달한다 —
+# 앞의 WR 은 Context 에 있어 stage_write 가 먼저 걸린다. 우선순위가 배열 순서인 증거다.
+NR="$(mktemp -d)"
+(cd "$NR" && git init -q . && python3 "$ENGINE" init >/dev/null)
+nrhk() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/%s"}}' "$NR" "$NR" "$1" \
+  | CLAUDE_PROJECT_DIR="$NR" python3 "$ENGINE" hook; }
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['folder_rules']['test_name_pattern'] = '^test_[a-z0-9_]+\\\\.py\$'
+cfg['write_rules'].append({
+    'id': 'test_naming',
+    'when': {'class': 'tests', 'min_depth': 2},
+    'require': {'basename_matches': 'folder_rules.test_name_pattern'},
+    'deny': \"tests/ 파일명은 test_*.py 여야 한다. '{basename}' 는 규칙 위반이다 ({rel}).\",
+})
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$NR/.claude/harness/stages.json"
+(cd "$NR" && python3 "$ENGINE" loop intent "새 규칙" >/dev/null \
+  && python3 "$ENGINE" loop done-when "끝" >/dev/null \
+  && python3 "$ENGINE" advance >/dev/null)      # Scaffolding: tests 쓰기 허용
+check "새 규칙이 나쁜 이름을 막는다" 'tests/ 파일명은 test_' "$(nrhk 'tests/wrong.py')"
+check "치환이 동작한다" "'wrong.py' 는 규칙 위반" "$(nrhk 'tests/wrong.py')"
+check "새 규칙 id 로 적립된다 (승격의 원료가 된다)" '^test_naming$' \
+  "$(nrhk 'tests/wrong.py' >/dev/null; python3 -c "
+import sqlite3, sys
+r = sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='block' ORDER BY rowid DESC LIMIT 1\").fetchone()
+print(r[0] if r else '(없음)')" "$NR/.claude/harness/harness.db")"
+check_empty "좋은 이름은 통과한다" "$(nrhk 'tests/test_ok.py')"
+rm -rf "$NR"
+
+echo "  -- 규칙 오타는 조용히 죽는다. 말해야 한다."
+check_empty "정상 설정에는 오진이 없다" \
+  "$(wr status 2>&1 | grep '무시되는 설정' || true)"
+wred 'cfg["write_rules"][1]["when"] = {"clazz": "docs"}'
+check "선택자 오타를 지적한다" "'clazz' 는 모르는 선택자" "$(wr status 2>&1)"
+wred 'cfg["write_rules"][1]["when"] = {"class": "docs"}; cfg["write_rules"][4]["require"]["never"] = True'
+check "판정이 둘이면 지적한다" '판정이 2개다' "$(wr status 2>&1)"
+wred 'cfg["write_rules"][4]["require"].pop("never"); cfg["write_rules"][4]["require"]["subdir_in"] = "dev_subdirz"'
+check "없는 folder_rules 키를 지적한다" "'dev_subdirz' 가 folder_rules 에 없다" "$(wr status 2>&1)"
+wred 'cfg["write_rules"][4]["require"] = {"predicate": "my_check"}'
+check "없는 파이썬 술어를 지적한다" '파이썬 술어가 없다' "$(wr status 2>&1)"
+wred 'cfg["write_rules"][4]["require"] = {"subdir_in": "dev_subdirs"}; cfg["write_rules"][4].pop("deny")'
+check "deny 가 없으면 지적한다" 'deny 메시지가 없다' "$(wr status 2>&1)"
+wred 'cfg["write_rules"][4]["deny"] = "x"; cfg["write_rules"][4]["id"] = "protected"'
+check "id 중복을 지적한다" "id 'protected' 가 중복" "$(wr status 2>&1)"
+rm -rf "$WR"
+
 echo "== 어휘 안에서 덜어낸 것은 되살리지 않는다"
 # "마찰이 크면 stages.json 에서 덜어낸다"가 이 하네스의 작업 방식이다. 템플릿 채움이
 # 항목 단위로 병합하면 지운 것이 되살아나 그 자유를 빼앗는다. 영역이 통째로 없을 때만 채운다.
