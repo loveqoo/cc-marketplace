@@ -621,6 +621,19 @@ def config_problems(cfg):
                                          ("rm x", "mv a b", "echo x > y", "sed -i s/a/b/ f")):
             out.append(t("bash.mutator_pattern 이 흔한 변경 명령을 하나도 잡지 못한다 "
                          "— 문법은 맞지만 사실상 꺼진 것이다"))
+    dead = [(r.get("id") or i) for i, r in enumerate(write_rules(cfg))
+            if not rule_reachable(cfg, r)]
+    if dead:
+        out.append(t("write_rules 의 %s 는 어떤 경로에도 해당할 수 없다 "
+                     "(모르는 class 이거나 판정이 없다) — 아무것도 막지 못한다")
+                   % ", ".join(str(d) for d in dead[:5]))
+    for i, r in enumerate(write_rules(cfg)):
+        cls = (r.get("when") or {}).get("class") if isinstance(r.get("when"), dict) else None
+        if cls is not None and cls not in known_classes(cfg):
+            out.append(t("write_rules[%s].when.class='%s' 는 path_classes 에 없다 "
+                         "(%s 중 하나) — 이 규칙은 죽어 있다")
+                       % (r.get("id") or i, cls,
+                          "/".join(sorted(known_classes(cfg)))))
     # 검증 증거 패턴을 **탐침한다.** 설정 텍스트를 읽어 "이게 너무 넓은가"를 판단하는
     # 것은 끝이 없다(`.*`, `.+`, `[\s\S]*`, `|`…). 대신 **증거가 되면 안 되는 명령**을
     # 넣어 보고 걸리는지 본다. 파싱이 아니라 실험이다.
@@ -2677,6 +2690,32 @@ def status_report(ctx):
     }
 
 
+def known_classes(cfg):
+    """존재하는 경로 클래스. `source` 는 어디에도 안 걸릴 때의 기본값이다."""
+    return set(cfg.obj("path_classes") or {}) | {"source"}
+
+
+def rule_reachable(cfg, rule):
+    """이 규칙이 **어떤 경로에도 해당할 수 있나.**
+
+    선택자의 키만 보고 값을 안 봤더니, `when.class` 를 없는 클래스로 두면 규칙이
+    조용히 죽었다. 직접 확인했다 — 일곱 규칙을 다 죽여도 아무 말이 없었다.
+    """
+    when = rule.get("when") or {}
+    if not isinstance(when, dict):
+        return False
+    cls = when.get("class")
+    if cls is not None and cls not in known_classes(cfg):
+        return False
+    req = rule.get("require") or {}
+    if not isinstance(req, dict) or not [k for k in req if k in WRITE_TESTS]:
+        return False
+    name = req.get("predicate")
+    if name and name not in WRITE_PREDICATES:
+        return False
+    return True
+
+
 def enforcing_summary(cfg):
     """**지금 실제로 강제되고 있는 것.**
 
@@ -2687,8 +2726,13 @@ def enforcing_summary(cfg):
     비웠는지는 알 필요가 없다.
     """
     stages = cfg.get("stages") or []
+    rules = write_rules(cfg)
     return {
-        "write_rules": len(write_rules(cfg)),
+        "write_rules": len(rules),
+        # **발동할 수 있는** 규칙만 따로 센다. 있기만 한 규칙은 강제가 아니다 —
+        # `when.class` 를 없는 클래스로 두면 일곱 규칙이 전부 죽는데 예전 요약은
+        # "쓰기 규칙 7" 이라고 말했다. 요약이 거짓말하면 '결과를 보여준다'가 무의미하다.
+        "live_rules": sum(1 for r in rules if rule_reachable(cfg, r)),
         "protected_paths": len(protected_pats(cfg)),
         "criteria": len(cfg.obj("criteria") or {}),
         "gated_stages": sum(1 for st in stages
@@ -2709,9 +2753,12 @@ def render_status(d, cfg):
     e = d.get("enforcing") or {}
     if e:
         # 무엇이 실제로 강제되는지 **숫자로** 보여준다. 0 이 보이면 그게 신호다.
-        print(t("강제 중: 쓰기 규칙 %d · 보호 경로 %d · 종료 조건 %d "
+        rules_txt = "%d" % e.get("write_rules", 0)
+        if e.get("live_rules", 0) != e.get("write_rules", 0):
+            rules_txt += t("(발동 가능 %d)") % e.get("live_rules", 0)
+        print(t("강제 중: 쓰기 규칙 %s · 보호 경로 %d · 종료 조건 %d "
                 "(게이트 있는 단계 %d/%d) · 승인 필요 %d · 언어 %s")
-              % (e.get("write_rules", 0), e.get("protected_paths", 0),
+              % (rules_txt, e.get("protected_paths", 0),
                  e.get("criteria", 0), e.get("gated_stages", 0), e.get("stages", 0),
                  e.get("consent", 0), e.get("language", "ko")))
     print(t("작업 %s · 회차 %d · 단계 %s") % (d["loop"], d["cycle"], d["stage_label"]))

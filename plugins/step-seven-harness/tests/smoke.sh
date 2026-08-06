@@ -2525,6 +2525,39 @@ check "승인 필요도 0" '승인 필요 0' "$(ef status 2>&1)"
 check "바닥값은 남아 있다 (보호 경로 3)" '보호 경로 3' "$(ef status 2>&1)"
 check "--json 에도 실린다" 'enforcing' "$(ef status --json 2>&1)"
 
+echo "  -- 요약이 거짓말하지 않는다 (있는 규칙 ≠ 발동하는 규칙)"
+# 규칙을 없는 class 로 두면 일곱 규칙이 전부 죽는데 예전 요약은 "쓰기 규칙 7" 이라고
+# 말했다. 요약이 거짓말하면 '예측 대신 결과를 보여준다' 가 무의미해진다. 직접 확인했다.
+EF2="$(mktemp -d)"
+(cd "$EF2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ef2() { (cd "$EF2" && python3 "$ENGINE" "$@"); }
+check_absent "정상이면 발동 가능 수를 따로 쓰지 않는다" '발동 가능' "$(ef2 status 2>&1)"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+for r in cfg['write_rules']:
+    r['when'] = {'class': 'nonexistent_class'}
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$EF2/.claude/harness/stages.json"
+check "죽은 규칙은 발동 가능 0 으로 보인다" '쓰기 규칙 7(발동 가능 0)' "$(ef2 status 2>&1)"
+check "모르는 class 를 지적한다" "path_classes 에 없다" "$(ef2 status 2>&1)"
+check "가능한 class 를 알려준다" 'context/dev/docs/source/tests' "$(ef2 status 2>&1)"
+check_empty "실제로 아무것도 막지 못한다" \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$EF2" "$EF2" \
+     | CLAUDE_PROJECT_DIR="$EF2" python3 "$ENGINE" hook | grep permissionDecision || true)"
+# 판정이 없는 규칙도 죽은 것이다
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['write_rules'] = json.load(open(sys.argv[2], encoding='utf-8'))['write_rules']
+cfg['write_rules'][4]['require'] = {}
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$EF2/.claude/harness/stages.json" "$EF2/.claude/harness/bin/defaults.json"
+check "판정이 없는 규칙도 발동 불가로 센다" '발동 가능 6' "$(ef2 status 2>&1)"
+rm -rf "$EF2"
+
 echo "  -- 검증 패턴은 탐침으로 본다 (텍스트를 읽지 않는다)"
 python3 -c "
 import json, sys

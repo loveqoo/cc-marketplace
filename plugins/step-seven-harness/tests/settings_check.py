@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
                        else os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -140,25 +141,19 @@ for label, body in (("깨진 JSON", "{not json"),
 # 인데 검사는 "내용이 같다"였다. 적대적 리뷰가 지적했다. 쓰기 모드로 열리는지 센다.
 root, p = fixture(json.dumps({"permissions": {"allow": list(h.SAFE_PERMS)}}))
 before = _real_open(p, encoding="utf-8").read()
-writes = {"n": 0}
-
-
-def counting_open(path, *a, **k):
-    mode = str(a[0]) if a else str(k.get("mode", "r"))
-    if path == p and any(c in mode for c in "wax+"):
-        writes["n"] += 1
-    return _real_open(path, *a, **k)
-
-
-builtins.open = counting_open
-try:
-    rc = h.ensure_permissions(root)
-finally:
-    builtins.open = _real_open
+# `builtins.open` 의 쓰기 모드만 세면 `os.replace`·`Path.write_text` 로 같은 내용을
+# 다시 쓰는 것을 놓친다 — 적대적 리뷰가 지적하고 실증했다. **파일 자체를 본다.**
+st_before = os.stat(p)
+time.sleep(0.01)          # mtime 해상도보다 크게 벌린다
+rc = h.ensure_permissions(root)
+st_after = os.stat(p)
 after = _real_open(p, encoding="utf-8").read()
 ck("이미 다 있으면 0 을 돌려준다", rc == 0, rc)
 ck("이미 다 있으면 내용이 그대로다", before == after)
-ck("이미 다 있으면 쓰기 모드로 열지 않는다", writes["n"] == 0, writes["n"])
+ck("이미 다 있으면 파일을 건드리지 않는다",
+   (st_before.st_mtime_ns, st_before.st_ino, st_before.st_size)
+   == (st_after.st_mtime_ns, st_after.st_ino, st_after.st_size),
+   "mtime/inode/size 가 바뀌었다")
 shutil.rmtree(root)
 
 # 5) 계속 경쟁하면 포기한다 (남의 변경을 덮느니 포기가 낫다)

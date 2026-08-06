@@ -30,7 +30,9 @@ DOCS = (
     "plugins/step-seven-harness/templates/rationale.md",
 )
 LINK_RE = re.compile(r"\]\((?!https?:|mailto:)([^)#\s]+)")
-STAGE_RE = re.compile(r"(\d+)/(\d+)\s+([A-Z][a-z]+)")
+# 대소문자를 가리지 않는다. `[A-Z][a-z]+` 만 잡으면 `1/7 selectoin` 같은 오타가
+# regex 에 아예 안 걸려 조용히 통과했다 — 적대적 리뷰가 지적했다.
+STAGE_RE = re.compile(r"(\d+)/(\d+)\s+([A-Za-z][A-Za-z]+)")
 STAGES_JSON = "plugins/step-seven-harness/templates/stages.json"
 
 
@@ -82,7 +84,9 @@ def main():
         for i, line in enumerate(body.splitlines(), 1):
             for m in STAGE_RE.finditer(line):
                 got, name = "%s/%s" % (m.group(1), m.group(2)), m.group(3)
-                want = real.get(name)
+                # 이름 비교도 대소문자를 가리지 않는다
+                low = {k.lower(): (k, v) for k, v in real.items()}
+                want = real.get(name) or (low.get(name.lower()) or (None, None))[1]
                 if want is None:
                     # 이름 오타는 조용히 통과했다 — `1/7 Selectoin` 이 그 예다.
                     # 모르는 이름이면 번호를 비교할 수조차 없으니 그것을 말한다.
