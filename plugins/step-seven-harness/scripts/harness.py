@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import time
@@ -127,6 +128,25 @@ CTRL_NAMES = ("harness", "harness.py")
 # 따옴표 안은 값이다. 먼저 한 토큰으로 뭉개야 `--reason "a b"` 의 'b' 가 위치
 # 인자로 오인되지 않는다 — 그 오인이 subcommand 판정을 틀리게 만들었다.
 QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
+
+
+def sh_tokens(seg):
+    """셸 토큰으로 쪼갠다. **따옴표는 토크나이저가 처리한다.**
+
+    예전에는 `QUOTED_RE.sub("_", seg)` 로 따옴표 구간을 `_` 로 뭉갰다. 목적은
+    `--reason "a b"` 의 `b` 가 위치 인자로 오인되지 않게 하는 것이었는데, 같은
+    마스킹이 **따옴표로 감싼 실행 경로까지 지웠다.** 그래서
+    `"...bin/harness" auto-skip on` 이 제어 명령으로 보이지 않아 **모든 동의
+    게이트가 사라졌다** — 5차 리뷰가 찾았고 재현했다.
+
+    근사를 고치지 않고 진짜 파서를 쓴다(`symtable` 때와 같은 판단). shlex 는
+    따옴표를 소비하고 `--reason "a b"` 를 한 토큰으로 준다. 따옴표가 안 맞으면
+    예외가 나므로, 그때는 옛 방식으로 떨어진다 — 판정을 아예 못 하는 것보다 낫다.
+    """
+    try:
+        return shlex.split(seg)
+    except ValueError:
+        return QUOTED_RE.sub("_", seg).split()
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS loop (
@@ -1960,7 +1980,7 @@ def plan_preview(root, cmd):
     **파일 이름만** 보여주고 있었다. 읽지 않고 찍는 도장은 마찰만 있고 정보가 없다 —
     그렇게 남은 `plan_approved` 기록은 가짜다. 무엇을 승인하는지 보여준다.
     """
-    pos = [it for it in QUOTED_RE.sub(" ", cmd).split() if not it.startswith("--")]
+    pos = [it for it in sh_tokens(cmd) if not it.startswith("--")]
     path = None
     for i, it in enumerate(pos):
         if it == "approve-plan" and i + 1 < len(pos):
@@ -2000,7 +2020,7 @@ def ctrl_requests(cmd):
     """
     out = []
     for seg in BASH_SPLIT.split(cmd):
-        toks = QUOTED_RE.sub("_", seg).split()
+        toks = sh_tokens(seg)
         for i, tok in enumerate(toks):
             if os.path.basename(tok.strip("\"'")) not in CTRL_NAMES:
                 continue
@@ -2040,7 +2060,7 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
     if sub == "skip":
         # 불가능한 스킵은 **묻지 않고** 거부한다. 승인을 받아봐야 거부되고,
         # 그러면 모델이 다시 시도해 다이얼로그만 반복된다.
-        pos = [it for it in QUOTED_RE.sub("_", cmd).split()[1:] if not it.startswith("--")]
+        pos = [it for it in sh_tokens(cmd)[1:] if not it.startswith("--")]
         tgt = None
         for i, it in enumerate(pos):
             if it == "skip" and i + 1 < len(pos):
@@ -2648,10 +2668,12 @@ D="$(cd "$(dirname "$0")" && pwd)"
 # 코드 실행이 된다. 4차 리뷰가 지적했고 맞다. 캐시 탐색을 먼저 한다.
 P="%s"
 if [ ! -f "$P" ]; then
-  # 정확한 이름을 먼저, 그다음 이름에 덜 묶인 glob. 플러그인 이름이 바뀌어도
-  # (6->7 단계처럼) 이 폴백이 살아 있다. 여러 개면 최신 것을 쓴다.
+  # **정확한 이름만 찾는다.** 예전에는 `*harness*` 로도 찾았다 — 이름이 바뀌어도
+  # (6->7 단계처럼) 살아 있게 하려던 것인데, 이 래퍼는 `.claude/settings.json` 에
+  # 사전 승인돼 있으므로 그 glob 은 **이름에 harness 가 들어간 아무 플러그인의
+  # Python 을 승인 없이 실행하는 길**이 된다. 5차 리뷰가 찾았고 재현했다.
+  # 이름이 바뀌면 폴백이 없어 CLI 가 안 되는 대신, 사용자가 그 사실을 즉시 안다.
   P="$(ls -t "$HOME"/.claude/plugins/cache/*/step-seven-harness/*/scripts/harness.py \
-             "$HOME"/.claude/plugins/cache/*/*harness*/*/scripts/harness.py \
              2>/dev/null | head -1)"
 fi
 if [ ! -f "$P" ]; then P="$D/harness.py"; fi
