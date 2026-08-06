@@ -202,7 +202,8 @@
       "env",
       "exec",
       "node"
-    ]
+    ],
+    "opaque_ask": true
   },
   "stop_continue": {
     "enabled": true,

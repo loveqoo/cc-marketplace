@@ -61,6 +61,34 @@ check_absent() { # check_absent <label> <must-not-appear> <actual>
   fi
 }
 
+# 자기검사 결과를 **값으로** 확인한다. 개수를 정규식에 박으면 안 된다.
+#
+# 예전에는 `자기검사: 1[0-9]*/1[0-9]* 통과` 였고, 그 정규식은 `18/19`(=1건 실패)에도
+# 맞았다 — 라벨은 "전부 통과한다" 인데 **부분 통과를 통과로 셌다.** 탐침을 19개에서
+# 22개로 늘리자 드러났다. 대리 지표(정규식)를 버리고 값을 꺼내 비교한다.
+check_selftest() { # <label> <기대-실패수> <status 출력>
+  local OUT
+  OUT="$(printf '%s' "$3" | SF_WANT="$2" python3 -c '
+import os, re, sys
+want = int(os.environ["SF_WANT"])
+m = re.search(r"자기검사: (\d+)/(\d+) 통과", sys.stdin.read())
+if not m:
+    print("자기검사 줄이 없다")
+else:
+    ok, total = int(m.group(1)), int(m.group(2))
+    if total < 15:
+        print("탐침이 %d개뿐이다 — 표가 비었나" % total)
+    elif total - ok != want:
+        print("실패 %d개, 기대 %d개 (%d/%d)" % (total - ok, want, ok, total))
+    else:
+        print("OK")')"
+  if [ "$OUT" = "OK" ]; then
+    PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %s\n     %s\n' "$1" "$OUT"
+  fi
+}
+
 check_no_prefix_complaint() { # <label> <hook-output>
   if printf '%s' "$2" | grep -q '말머리는'; then
     FAIL=$((FAIL + 1)); printf '  FAIL %s\n     말머리 불만이 나왔다: %s\n' "$1" "$2"
@@ -1092,10 +1120,71 @@ for BAD in "find .claude/harness -name harness.db -delete" \
            "ln -sf /dev/null .claude/harness/harness.db"; do
   check "차단: $BAD" 'Bash 로도 변경할 수 없다' "$(gb "$BAD")"
 done
-for OK in "mkdir -p .claude/hooks" "cat .claude/harness/LEARNED.md" \
+# `mkdir -p .claude/hooks` 는 여기서 빠졌다. 이 절은 **바닥값**을 검사하는데 그 명령은
+# 바닥값이 아니라 **단계 규칙** 질문이고, 이제 Bash 도 그 규칙을 받는다. 아래 절에서
+# Write 와 판정이 같은지로 검사한다 — 예전에는 이 목록이 "Bash 는 단계 규칙을 안
+# 받는다"는 비대칭을 기대값으로 굳혀 놓고 있었다.
+for OK in "cat .claude/harness/LEARNED.md" \
           "find . -name '*.py'" "rm src/tmp.txt" "grep -r foo src/"; do
   check_empty "허용: $OK" "$(gb "$OK")"
 done
+
+echo "== Bash 쓰기와 Write 의 판정이 같다 (규칙 엔진이 하나다)"
+# 이 리팩터가 세우는 불변식이다. 사례를 손으로 고르지 않고 **경로마다 두 문으로 같은
+# 질문을 넣어** 결과를 대조한다. 예전에는 Bash 가 쓰기 규칙 일곱 개 중 하나만(그것도
+# 훅에 손으로 베낀 채) 받았고, `sed -i` 한 줄로 `stage_write` 가 통째로 우회됐다.
+SYMW="$(mktemp -d)"
+# `.claude/hooks` 를 미리 만든다. 부모가 없는 경로는 Bash 쓰기가 **어차피 실패하므로**
+# 수집에서 빠진다(`_plausible`). 같은 현실을 두 문에 넣어야 비교가 정직하다.
+(cd "$SYMW" && git init -q . && python3 "$ENGINE" init >/dev/null && mkdir -p src docs/01-a .dev/plan .claude/hooks && touch src/a.py docs/01-a/01-n.md)
+sym_decision() { # <tool-json> -> deny|ask|allow|-
+  printf '%s' "$1" | CLAUDE_PROJECT_DIR="$SYMW" python3 -c '
+import json, sys
+o = json.loads(sys.stdin.read() or "{}")
+print((o.get("hookSpecificOutput") or {}).get("permissionDecision", "-"))'
+}
+sym_pair() { # <rel> -> "write=X bash=Y"
+  local RJ BJ
+  RJ="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s","content":"x"}}' "$SYMW" "$1" \
+    | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+  BJ="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"printf x > %s"}}' "$SYMW" "$1" \
+    | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+  printf 'write=%s bash=%s' "$(sym_decision "$RJ")" "$(sym_decision "$BJ")"
+}
+for REL in "src/a.py" "docs/01-a/01-n.md" "docs/새.md" ".claude/hooks/x.json" \
+           ".dev/plan/p.md" ".claude/harness/stages.json" "README.md"; do
+  SP="$(sym_pair "$REL")"
+  case "$SP" in
+    "write=deny bash=deny"|"write=- bash=-"|"write=ask bash=ask")
+      PASS=$((PASS + 1)); printf '  ok   %s: 같은 판정 (%s)\n' "$REL" "$SP" ;;
+    *) FAIL=$((FAIL + 1)); printf '  FAIL %s: 판정이 갈린다\n     %s\n' "$REL" "$SP" ;;
+  esac
+done
+# 갈리지 않는다는 것만으로는 부족하다 — 둘 다 통과여도 '같다'가 된다. 실제로 막는
+# 경로가 하나는 있어야 검사에 의미가 있다.
+check "적어도 하나는 실제로 막힌다" 'bash=deny' "$(sym_pair ".claude/hooks/x.json")"
+# 그리고 `sed -i` 로도 같아야 한다 — 리다이렉트만 막고 sed 는 지나가던 것이 결함이었다.
+check "sed -i 도 단계 규칙을 받는다" '"permissionDecision": "deny"' \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/hooks/x.json"}}' "$SYMW" \
+     | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+check "규칙 이름이 아니라 무엇을 바꾸는지 말한다" "이 명령이 '.claude/hooks/x.json' 를 바꾼다" \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/hooks/x.json"}}' "$SYMW" \
+     | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+# 부모를 **만드는** 명령은 그 필터를 건너뛴다 — 아니면 `mkdir -p` 로 새 디렉터리를
+# 만드는 것이 규칙 밖이 된다.
+check "mkdir -p 는 없는 부모도 대상으로 본다" '"permissionDecision": "deny"' \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"mkdir -p .claude/새폴더/깊이"}}' "$SYMW" \
+     | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+# 훅에서 실제로 `ask` 가 나오는지. 판정 함수만 검사하면 훅이 그 값을 안 쓸 수 있다.
+OPQ="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls | xargs rm"}}' "$SYMW" \
+  | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+check "대상을 모르면 훅이 사람에게 묻는다" '"permissionDecision": "ask"' "$OPQ"
+check "무엇을 모르는지 말한다" '무엇을 바꿀지 하네스가 알 수 없다' "$OPQ"
+check "끄는 방법을 알려준다" 'opaque_ask' "$OPQ"
+check_absent "정상 명령에는 묻지 않는다" '"ask"' \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls | xargs cat"}}' "$SYMW" \
+     | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
+rm -rf "$SYMW"
 
 echo "== 일회성 쓰기 예외는 병렬 훅에서도 한 번만 쓰인다"
 python3 - "$GW/.claude/harness/harness.db" <<'PYG'
@@ -2716,7 +2805,7 @@ exec(sys.argv[2])
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$SF/.claude/harness/stages.json" "$1"; }
 
-check "정상이면 전부 통과한다" '자기검사: 1[0-9]*/1[0-9]* 통과' "$(sf status 2>&1)"
+check_selftest "정상이면 전부 통과한다" 0 "$(sf status 2>&1)"
 check_absent "정상이면 실패를 내지 않는다" '자기검사 .* 실패' "$(sf status 2>&1)"
 check "--json 에도 실린다" 'selftest' "$(sf status --json 2>&1)"
 
@@ -2727,13 +2816,21 @@ check "죽은 규칙을 잡는다" '자기검사 .*실패' "$(sf status 2>&1)"
 check "무엇이 통과했는지 말한다" 'docs/ 쓰기' "$(sf status 2>&1)"
 # ② 규칙을 통째로 비움
 sfed "cfg['write_rules'] = json.load(open('$SF/.claude/harness/bin/defaults.json', encoding='utf-8'))['write_rules']"
-check "복구하면 다시 통과한다" '자기검사: 1[0-9]*/1[0-9]* 통과' "$(sf status 2>&1)"
+check_selftest "복구하면 다시 통과한다" 0 "$(sf status 2>&1)"
 sfed 'cfg["write_rules"] = []'
 check "규칙을 비우면 잡는다" '자기검사 .*실패' "$(sf status 2>&1)"
 # ③ 바닥값이 버티는 경우는 **통과가 사실**이다 (거짓 경고를 내지 않는다)
 sfed "cfg['write_rules'] = json.load(open('$SF/.claude/harness/bin/defaults.json', encoding='utf-8'))['write_rules']
 cfg['folder_rules']['protected_paths'] = []"
-check "바닥값이 버티면 통과가 사실이다" '자기검사: 1[0-9]*/1[0-9]* 통과' "$(sf status 2>&1)"
+# `protected_paths` 를 비우면 **설정으로만 보호되던** 경로(LEARNED.md)는 정말 열린다.
+# 그러니 자기검사가 그 한 건을 실패로 잡는 것이 사실이다. 확인할 것은 두 가지다:
+# 실패가 정확히 그 한 건인가, 그리고 **바닥값 탐침은 여전히 버티는가**.
+SFO="$(sf status 2>&1)"
+check_selftest "설정으로만 보호되던 경로 한 건만 실패로 잡는다" 1 "$SFO"
+check "무엇이 열렸는지 이름을 말한다" '설정의 보호 경로' "$SFO"
+check_absent "바닥값 탐침은 실패에 없다 (엔진)" '하네스 엔진 사본 쓰기 → 통과' "$SFO"
+check_absent "바닥값 탐침은 실패에 없다 (DB)" '상태 DB 쓰기 → 통과' "$SFO"
+check_absent "바닥값 탐침은 실패에 없다 (Bash)" 'Bash 로 엔진 삭제 → 통과' "$SFO"
 
 echo "  -- 종료 조건도 탐침한다 (Codex Claim C HIGH)"
 sfed "cfg['folder_rules']['protected_paths'] = ['.claude/harness/LEARNED.md']

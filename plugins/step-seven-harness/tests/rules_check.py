@@ -214,6 +214,46 @@ ck("정상 인터프리터로 래퍼를 돌리는 것은 막지 않는다",
    h.bash_protected_hit(cfg, root,
                         "python3 .claude/harness/bin/harness status") is None)
 
+print("리포 루트를 훑는 파괴는 바닥값을 담고 있다")
+# `find . -name harness.db -delete` 는 토큰에 바닥값이 없어 통째로 지나갔다. 대상이
+# 문자열 안이 아니라 **실행 결과 안**에 있는 명령이다.
+for cmd, want in ((("find . -name harness.db -delete"), True),
+                  (("find . -name 'harness*' -delete"), True),
+                  (("find . -delete"), True),
+                  (("find . -not -name '*.pyc' -delete"), True),
+                  (("find . ! -name '*.pyc' -delete"), True),
+                  (("find . -name '*' -delete"), True),
+                  # 정상 정리 작업은 막지 않는다 — 바닥값의 보장은 "하네스 자신은
+                  # 바뀌지 않는다"이지 "리포 루트를 훑지 마라"가 아니다.
+                  (("find . -name '*.pyc' -delete"), False),
+                  (("find . -name '*.pyc' -print"), False),
+                  (("find src -name '*.pyc' -delete"), False)):
+    got = h.bash_protected_hit(cfg, root, cmd) is not None
+    ck("%s%s" % ("막는다  " if want else "안 막는다", cmd), got == want,
+       "실제로는 %s" % ("막았다" if got else "안 막았다"))
+
+print("대상을 특정할 수 없는 파괴는 사람에게 묻는다")
+# 막으면 정상 정리가 막히고, 통과시키면 구멍이다. 모른다는 사실 자체가 판정이다.
+for cmd, want in (("find . -name '*.pyc' -delete", True),
+                  ("find src -type f -exec rm {} +", True),
+                  ("ls | xargs rm", True),
+                  ("eval \"$CMD\"", True),
+                  ("python3 -c \"open('src/a.py','w')\"", True),
+                  ("sh -c 'echo x > src/a.py'", True),
+                  # 파괴 신호가 없으면 묻지 않는다 — 마찰은 게이트를 끄게 만든다.
+                  ("python3 -c 'print(1)'", False),
+                  ("ls | xargs cat", False),
+                  ("find . -name '*.py' -print", False),
+                  ("npm test", False),
+                  ("pytest tests/ -q", False)):
+    got = h.bash_opaque(cfg, cmd) is not None
+    ck("%s%s" % ("묻는다  " if want else "안 묻는다", cmd), got == want,
+       "실제로는 %s" % ("물었다" if got else "안 물었다"))
+off = h.Cfg(dict(cfg))
+off["bash"] = dict(cfg.obj("bash") or {}, opaque_ask=False)
+ck("opaque_ask: false 로 끌 수 있다 (게이트 전체를 끄는 것보다 낫다)",
+   h.bash_opaque(off, "ls | xargs rm") is None)
+
 print("래퍼는 **내용**이 우리 것일 때만 신뢰한다")
 wp = os.path.join(root, h.WRAPPER_REL)
 h.refresh_wrapper(root)
