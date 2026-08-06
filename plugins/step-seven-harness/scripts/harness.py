@@ -58,8 +58,7 @@ LAZY_MSG_NAMES = ("USAGE", "AGENTS_BLOCK", "LEARNED_HEAD", "PROMOTE_AS_DEFAULT",
                   "NO_CYCLES", "WRAPPER", "RECALL_DIRS_DEFAULT",
                   "INDEX_NAMES_DEFAULT", "BASH_READERS_DEFAULT",
                   "BASH_INTERPRETERS_DEFAULT", "SHELL_META", "BASH_MUTATORS",
-                  "BASH_OPAQUE", "BASH_WRITERS", "BASH_WRITE_ARGS",
-                  "BASH_WRITERS_IF", "NEVER_BENIGN")
+                  "BASH_OPAQUE", "NEVER_BENIGN")
 
 
 _LANG = ""
@@ -279,6 +278,19 @@ def find_root(cwd):
     return None
 
 
+# 나중에 더해진 열. `CREATE TABLE IF NOT EXISTS` 는 **기존 표에 열을 더하지 못한다.**
+# 여기 적고 연결할 때마다 맞춘다 — "재실행이 곧 스키마 갱신" 이라는 성질을 유지한다.
+ADDED_COLUMNS = (("evidence", "digest", "TEXT"),)
+
+
+def migrate(con):
+    """빠진 열을 채운다. 이미 있으면 아무것도 하지 않는다."""
+    for table, col, typ in ADDED_COLUMNS:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
+        if cols and col not in cols:
+            con.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, typ))
+
+
 def connect(root, create=False):
     path = os.path.join(root, DB_REL)
     if not create and not os.path.isfile(path):
@@ -288,6 +300,11 @@ def connect(root, create=False):
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=10000")
+    try:
+        migrate(con)
+        con.commit()
+    except sqlite3.Error:
+        pass  # 읽기 전용 파일시스템에서도 판정은 돌아야 한다
     return con
 
 
@@ -915,9 +932,73 @@ def has_evidence(con, lid, kind):
                        (lid, kind)).fetchone() is not None
 
 
-def record_evidence(con, lid, sid, kind, item):
+def evidence_digest(root, item):
+    """이 증거가 가리키는 **파일의 지문.** 파일이 아니면 None.
+
+    ## 왜 필요한가 — 증거에는 유효기간이 있다
+
+    증거는 "언제 무엇을 봤다"를 적는데, **본 것이 그 뒤에 변할 수 있다.**
+    `plan_approved` 는 계획 **파일**을 가리킨다. 승인을 받은 뒤 그 파일을 고쳐도
+    승인 기록은 그대로 살아 있었고, 그래서 **사람이 보지 않은 계획으로 진행**할 수
+    있었다 — 5차 리뷰가 HIGH 로 찾았다.
+
+    승인만의 문제가 아니다. 파일을 가리키는 증거는 전부 같은 성질을 갖는다. 그래서
+    `plan_approved` 만 따로 손보지 않고 **증거라는 것 자체에 지문을 붙인다.** 지문이
+    다르면 그 증거가 말하는 사실은 더 이상 참이 아니다.
+
+    파일이 아닌 증거(완료 조건 문장, `agent:Task`, 명령 문자열)는 지문이 없고,
+    지문이 없는 증거는 늘 유효하다 — 변할 근거가 없다.
+    """
+    if not item or "/" not in item or root is None:
+        return None
+    rel = rel_to_root(root, item)
+    if not rel:
+        return None
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p):
+        return None
+    dig = hashlib.sha256()
+    try:
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                dig.update(chunk)
+    except OSError:
+        return None
+    return dig.hexdigest()
+
+
+def evidence_rows(con, root, lid, kind):
+    """(item, 아직 유효한가). 지문이 없으면 유효하다."""
+    out = []
+    for r in con.execute("SELECT * FROM evidence WHERE loop_id=? AND kind=?",
+                         (lid, kind)):
+        keys = r.keys()
+        dig = r["digest"] if "digest" in keys else None
+        out.append((r["item"], dig is None or dig == evidence_digest(root, r["item"])))
+    return out
+
+
+def has_valid_evidence(con, root, lid, kind):
+    return any(ok for _, ok in evidence_rows(con, root, lid, kind))
+
+
+def stale_evidence(con, root, lid, kind):
+    """근거가 바뀌어 만료된 증거들."""
+    return [it for it, ok in evidence_rows(con, root, lid, kind) if not ok]
+
+
+def record_evidence(con, lid, sid, kind, item, root=None):
     con.execute("INSERT OR IGNORE INTO evidence(loop_id,stage,kind,item,at) "
                 "VALUES(?,?,?,?,?)", (lid, sid, kind, item, now()))
+    dig = evidence_digest(root, item)
+    if dig is not None:
+        # **다시 적립할 때 지문이 갱신돼야 한다.** `INSERT OR IGNORE` 만 두면 계획을
+        # 고치고 다시 승인해도 옛 지문이 남아 영영 만료 상태가 된다. `OR REPLACE` 를
+        # 쓰지 않는 이유는 rowid 가 바뀌어 완료 조건의 **입력 순서**가 흐트러지기
+        # 때문이다 (`acceptance_of` 가 rowid 순으로 읽는다).
+        con.execute("UPDATE evidence SET digest=?, at=? "
+                    "WHERE loop_id=? AND kind=? AND item=?",
+                    (dig, now(), lid, kind, item))
 
 
 def acceptance_of(con, lid):
@@ -1415,7 +1496,9 @@ def criterion_met(con, cfg, root, lid, kind):
     if how == "no_pending_promotions":
         # evidence 행으로 심어두면 안 된다 — 다음 회차에 새로 생긴 반복을 놓친다.
         return not pending_promotions(con, cfg)
-    if has_evidence(con, lid, kind):
+    # **증거가 있는 것과 그 증거가 아직 참인 것은 다르다.** 파일을 가리키는 증거는
+    # 그 파일이 바뀌면 만료된다 — 자세한 근거는 `evidence_digest` 에 적었다.
+    if has_valid_evidence(con, root, lid, kind):
         return True
     if how == "file":
         return fs_evidence(cfg, root, file_prefix(con, lid), kind) is not None
@@ -1424,6 +1507,21 @@ def criterion_met(con, cfg, root, lid, kind):
 
 def criterion_help(cfg, kind):
     return t(cfg.at("criteria.%s.help" % kind, kind))
+
+
+def criterion_why(con, cfg, root, lid, kind):
+    """왜 아직 안 됐는지. **만료된 증거가 있으면 그 사실을 먼저 말한다.**
+
+    "계획 승인이 필요하다" 만 보면 이미 승인한 사람은 왜 또냐고 생각하고, 하네스가
+    고장 난 것으로 읽는다. 막을 때는 최적 행동을 함께 준다 — 그러려면 무엇이 달라졌는지
+    부터 말해야 한다.
+    """
+    stale = stale_evidence(con, root, lid, kind)
+    if stale:
+        return t("'%s' 이(가) 그때 본 것과 달라졌다 — 승인·관측은 그 시점의 내용에 "
+                 "대한 것이므로 만료됐다. %s") % (", ".join(stale),
+                                            criterion_help(cfg, kind))
+    return criterion_help(cfg, kind)
 
 
 def human_criteria(cfg):
@@ -1804,85 +1902,28 @@ BASH_SPLIT = re.compile(r"\|\||&&|[;&|\n]")
 # find 는 없다 — `-delete`/`-exec` 로 파일을 지운다.
 
 
-# 대상을 명령 문자열로 **특정할 수 없는** 파괴 방식.
+# 대상이 명령 문자열이 아니라 **실행 결과 안**에 있는 파괴. `find . -name harness.db
+# -delete` 는 토큰에 보호 경로가 없어 어떤 문자열 검사도 지나간다.
 #
-# ## 왜 세 번째 층이 필요한가
+# 특정하려 들지 않는다 — 그 방향은 셸 재구현이고, 근사는 이미 여러 번 틀렸다.
+# **모른다는 사실 자체가 판정이다:** 막지도(정상 정리가 막힌다) 통과시키지도(구멍이다)
+# 않고 사람에게 묻는다. 하네스에 이미 있는 어휘(`ask`)를 쓴다.
 #
-# `find . -name harness.db -delete` 는 바닥값을 지났다. 토큰에 `.claude/harness` 가
-# 없기 때문이다 — 이 명령의 대상은 문자열 안이 아니라 **실행 결과 안에** 있다.
-# `xargs`, `sh -c "..."`, `python3 -c "..."`, `eval` 도 같다.
-#
-# 여기서 세 번째로 같은 실수를 할 수 있었다: 정규식을 더 정교하게 만들어 특정하려는 것.
-# 그 방향은 셸과 파이썬을 재구현하는 일이고, 근사는 이미 세 번 틀렸다.
-#
-# 다르게 본다. **모른다는 사실 자체가 판정이다.** 대상을 모르면 막지도(정상 정리 작업이
-# 막힌다) 통과시키지도(구멍이다) 않고 **사람에게 묻는다.** 하네스에 이미 있는 어휘다 —
-# 동의가 필요한 명령이 그렇게 처리된다. 불확실한 판정을 불확실한 결과에 매핑한다.
-#
-# 이것은 **경계가 아니라 가시성**이다. 경계는 바닥값과 래퍼 무결성이다. 여기 없는
-# 형태로 파괴하는 것은 여전히 가능하고, 그것은 알려진 채로 남겨 둔 것이다.
-#
-# 마찰이 크면 `bash.opaque_ask: false` 로 끌 수 있다. 게이트 전체를 끄는 것보다 낫다.
+# 이것은 경계가 아니라 **가시성**이다. 경계는 바닥값과 래퍼 무결성이다.
 BASH_OPAQUE = (
     (re.compile(r"\bfind\b(?=.*\s-(?:delete|exec|execdir)\b)"),
      "find 가 **찾아낸 것**을 지우거나 그것에 명령을 실행한다"),
-    (re.compile(r"\bxargs\b(?=.*\b(?:rm|mv|cp|tee|truncate|shred|sed|chmod|chown)\b)"),
+    (re.compile(r"\bxargs\b(?=.*\b(?:rm|mv|tee|truncate|shred|sed|chmod)\b)"),
      "xargs 가 **넘겨받은 목록**을 대상으로 삼는다"),
-    (re.compile(r"\b(?:python3?|node|ruby|perl|sh|bash|zsh)\b[^|;&]*\s-c\b"
-                r"(?=[^|;&]*(?:open\(|write|unlink|remove|rmtree|truncate|rename|"
-                r"replace|mkdir|chmod|>))"),
-     "인터프리터에 넘긴 **코드 안**이라 무엇을 바꿀지 문자열로 알 수 없다"),
-    (re.compile(r"(^|[;&|]\s*)eval\b"), "eval 은 실행 시점에 만들어진다"),
 )
 
 
-def bash_opaque(cfg, cmd):
+def bash_opaque(cmd):
     """대상을 특정할 수 없는 파괴인가. 그 이유 또는 None."""
-    if not cfg.at("bash.opaque_ask", True):
-        return None
     for rex, why in BASH_OPAQUE:
         if rex.search(cmd):
             return t(why)
     return None
-
-
-# `-name`/`-path` 필터. 명령이 **스스로 적어 둔** 것이므로 해석해도 된다.
-FIND_FILTER_RE = re.compile(r"-i?(?:name|path|wholename)\s+(\S+)")
-FIND_NEGATION_RE = re.compile(r"(^|\s)(-not\b|!\s)")
-
-
-def floor_reachable(root, cmd):
-    """리포 루트를 훑는 파괴 명령이 **바닥값에 닿을 수 있나.**
-
-    바닥값의 보장은 "하네스 자신은 바뀌지 않는다"이지 "리포 루트를 훑지 마라"가 아니다.
-    `find . -name '*.pyc' -delete` 는 정상 정리 작업이고, 그것까지 거부하면 마찰이다.
-    마찰은 게이트를 끄게 만든다.
-
-    그래서 **명령이 스스로 적어 둔 이름 필터**에 바닥값 파일을 넣어 본다. 필터 하나를
-    fnmatch 로 대조하는 것이지 find 를 재구현하는 것이 아니다. 판단할 수 없는 경우는
-    전부 '닿는다' 쪽으로 떨어진다 — 필터가 없거나(전부 대상), 부정이 섞였거나(반대로
-    읽어야 한다), 바닥값 파일이 아직 없거나.
-    """
-    if FIND_NEGATION_RE.search(cmd):
-        return True
-    pats = FIND_FILTER_RE.findall(cmd)
-    if not pats:
-        return True
-    victims = []
-    for dirpath, _dirs, names in os.walk(os.path.join(root, HARNESS_DIR)):
-        for n in names:
-            r = rel_to_root(root, os.path.join(dirpath, n))
-            if r and self_lock_hit(r):
-                victims.append(r)
-    if not victims:
-        return True
-    for pat in pats:
-        pat = pat.strip("\"'")
-        for r in victims:
-            if (fnmatch.fnmatch(os.path.basename(r), pat)
-                    or fnmatch.fnmatch(r, pat) or fnmatch.fnmatch("./" + r, pat)):
-                return True
-    return False
 
 
 def bash_protected_hit(cfg, root, cmd):
@@ -1897,9 +1938,6 @@ def bash_protected_hit(cfg, root, cmd):
     floor = set(SELF_LOCK)
 
     mutating = bool(bash_mutator_re(cfg).search(cmd))
-    # 리포 루트 전체를 훑는 파괴는 바닥값을 담고 있다 — 단, 명령의 이름 필터가
-    # 바닥값에 닿을 수 없으면 담고 있다고 보지 않는다 (`floor_reachable`).
-    opaque = bash_opaque(cfg, cmd) is not None and floor_reachable(root, cmd)
     # `>|경로` 의 `|` 를 BASH_SPLIT 이 파이프로 보고 쪼개면 경로가 다음 세그먼트의
     # **명령어 자리**로 밀려 '실행 대상' 으로 건너뛰어진다. 먼저 떼어놓는다.
     cmd = cmd.replace(">|", "> ")
@@ -1924,13 +1962,9 @@ def bash_protected_hit(cfg, root, cmd):
                 # 리포 루트(`.`)는 바닥값을 **담고 있다.** 예전에는 여기서 건너뛰었고,
                 # 그래서 `find . -name harness.db -delete` 가 바닥값을 지나갔다.
                 # 담고 있는 것에 대한 판정은 아래 containment 검사로 내려보낸다.
-                # 리포 루트(`.`)는 바닥값을 **담고 있다.** 예전에는 여기서 건너뛰었고,
-                # 그래서 `find . -name harness.db -delete` 가 바닥값을 지나갔다.
-                # 대상을 특정할 수 없는 파괴에 한해 담고 있는 것까지 대상으로 본다 —
-                # 모든 변경 명령으로 넓히면 `cp -r . /tmp/백업` 이 오판된다.
-                if rel == "." and not opaque:
+                if rel == ".":
                     continue
-                if rel != "." and any(glob_match(rel, p) for p in use):
+                if any(glob_match(rel, p) for p in use):
                     return rel
                 # 바닥값은 대소문자를 무시하고도 본다 (macOS 에서 BIN == bin 이다).
                 if self_lock_hit(rel):
@@ -1941,7 +1975,7 @@ def bash_protected_hit(cfg, root, cmd):
                 # `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이 검사가
                 # 통째로 꺼졌다. 설정으로 잠금을 푸는 방향은 막는다.
                 low = rel.lower()
-                if rel == "." or any(p.lower().startswith(low + "/") for p in floor):
+                if any(p.lower().startswith(low + "/") for p in floor):
                     return rel
                 if mutating and any(p.startswith(rel + "/") for p in use):
                     return rel
@@ -1972,142 +2006,90 @@ def bash_protected_hit(cfg, root, cmd):
     return None
 
 
-# ------------------------------------------------- Bash 가 무엇을 쓰는가 (확신의 층)
-#
-# ## 왜 이것이 따로 필요한가
-#
-# 쓰기 판정은 `check_write` 하나였는데 **Write·Edit 만 그 문을 지났다.** Bash 는
-# `bash_protected_hit` 으로 바닥값과 `protected_paths` 만 봤고, 단계별 쓰기 규칙
-# 일곱 개 중 여섯 개는 Bash 에 아예 존재하지 않았다. `sed -i` 한 줄로 하네스의 핵심
-# 약속("단계마다 쓸 수 있는 곳이 다르다")이 통째로 우회됐다 — 5차 리뷰가 HIGH 로 찾았다.
-#
-# 진단의 증거는 훅 안에 있었다. `docs_readonly` 규칙 **하나만** Bash 용으로 손으로
-# 베껴 둔 블록이 있었다. 누군가 이미 이 구멍을 만났고, 규칙 하나를 복사해 막았다.
-# 나머지 여섯 개는 복사되지 않았다. 규칙을 하나씩 베끼는 것은 덧칠이다.
-#
-# ## 구조: 판정은 하나, 수집은 둘 — 다른 것은 **확신의 정도**다
-#
-# 두 갈래가 갈린 데는 이유가 있었다. 같은 질문에 필요한 정밀도가 다르다.
-#
-#   바닥값(하네스 자신)  — 걸리면 대가가 **전부**다. 과잉 차단을 받아들인다.
-#                          토큰을 하나도 빼지 않고 훑는다 (`bash_protected_hit`).
-#   단계 규칙            — 과잉 차단은 **마찰**이고, 마찰은 게이트를 끄게 만든다.
-#                          확실히 쓰는 것만 본다 (`bash_writes`).
-#
-# 그래서 갈리는 것은 **무엇을 대상으로 모으는가**여야 하고, **어떤 판정을 적용하는가**는
-# 갈려서는 안 된다. 아래가 확신하는 쪽 수집기다. 판정은 `check_write` 그대로 쓴다.
+# ------------------------------------------------- Bash 가 무엇을 쓰는가
 
-# 이 명령이 **쓰는 인자 자리**. 명령을 재구현하는 것이 아니라 자리만 적는다.
+# ## 왜 필요한가
 #
-#   all  — 위치 인자 전부      last — 마지막 하나만 (`cp a b` 의 b)
-#   rest — 첫 위치 인자는 제외 (`chmod 755 f` 의 755)
+# 쓰기 판정은 `check_write` 하나인데 **Write·Edit 만 그 문을 지났다.** Bash 는 바닥값만
+# 받았고, 단계별 쓰기 규칙 일곱 중 여섯은 Bash 에 없었다 — `sed -i` 한 줄로 "단계마다
+# 쓸 수 있는 곳이 다르다"는 약속이 통째로 우회됐다.
 #
-# 표에 없는 변경 명령은 `all` 이다. 표에 없는 **모르는** 명령은 애초에 여기 오지 않는다
-# — 확실하지 않은 것은 확실한 것에 넣지 않는다. 그것이 이 층의 이름값이다.
-BASH_WRITE_ARGS = {"cp": "last", "ln": "last", "install": "last",
-                   "chmod": "rest", "chown": "rest"}
-# 이 명령들은 없는 부모를 **만든다.** 그래서 "부모가 없으면 어차피 실패한다"는
-# `_plausible` 의 논거가 여기서만 성립하지 않는다 (`mkdir -p a/b/c`).
-BASH_MAKES_PARENTS = ("mkdir", "install")
-# 이 이름들은 쓴다. `bash_mutator_re` 는 명령 **전체**에 대한 거친 판정이고, 여기서는
-# 세그먼트의 **머리**를 본다 — `grep foo docs/a.md && rm /tmp/x` 에서 grep 세그먼트가
-# 변경으로 오인되지 않게.
-BASH_WRITERS = ("rm", "rmdir", "mv", "cp", "ln", "install", "mkdir", "touch",
-                "tee", "truncate", "shred", "chmod", "chown", "dd")
-# 이 플래그가 있을 때만 쓴다.
-# `find` 는 여기 없다. 대상이 **실행 결과 안**에 있어 특정할 수 없으므로 `bash_opaque`
-# 가 사람에게 묻는다 — 특정할 수 없는 것을 특정한 척하지 않는다.
-BASH_WRITERS_IF = {"sed": ("-i",), "perl": ("-i",)}
+# ## 구조: 판정은 하나, 수집만 둘
+#
+# 갈리는 것은 **무엇을 모으는가**여야 하고, **어떤 판정을 적용하는가**는 갈려서는 안 된다.
+#
+#   바닥값   — 걸리면 대가가 전부다. 토큰을 하나도 빼지 않는다 (`bash_protected_hit`).
+#   단계 규칙 — 과잉 차단은 마찰이고 마찰은 게이트를 끈다. 변경 세그먼트만 본다 (여기).
+#
+# 명령별 표를 두지 않는다. 무엇이 변경인지는 이미 `bash.mutator_pattern` 이 알고,
+# 무엇이 읽기인지는 이미 `bash.readers` 가 안다. 새 어휘를 만들면 그 표가 현실과
+# 어긋나는 자리가 하나 더 생긴다.
+
 REDIRECT_RE = re.compile(r"^\d*(>>?\|?|&>>?)$")
+# 이 명령들은 **마지막 경로만** 바꾼다. `cp src/a.py /tmp/b` 가 src 를 쓴다고 보면
+# 읽기만 하는 명령이 거부되고, 그 오판이 곧 마찰이다. `sed`·`perl` 도 여기 있다 —
+# 앞 인자는 파일이 아니라 식(`s/x/y/`)이다. `mv` 는 없다: 원본도 사라진다.
+BASH_TARGET_LAST = ("cp", "ln", "install", "sed", "perl")
 
 
-def _plausible(root, rel):
-    """이 상대경로가 정말 **이 리포의 파일 자리**인가.
+def _target(root, tok, sure):
+    """이 토큰이 가리키는 리포 안 경로. 아니면 None.
 
-    `sed -i 's/x/y/' a.py` 의 `s/x/y/` 도 문법상 상대경로다. 그것까지 대상으로 세면
-    엉뚱한 클래스로 분류돼 규칙에 걸린다 — 오판은 마찰이다. 있는 파일이거나,
-    부모 디렉터리가 있는 자리(=새로 만들 수 있는 자리)만 대상으로 본다.
-
-    ## 부모가 없는 경로를 빼는 것이 구멍이 아닌 이유
-
-    셸에서 직접 확인했다: 부모 디렉터리가 없으면 리다이렉트·`sed -i`·`tee`·`cp` 가
-    **모두 실패한다.** 즉 여기서 빠지는 경로는 애초에 쓰기가 일어나지 않는 경로다.
-    예외는 부모를 **만드는** 명령(`mkdir -p`, GNU `install -D`)이고, 그 명령들은
-    `BASH_MAKES_PARENTS` 로 이 필터를 건너뛴다.
+    `sure` 는 리다이렉트 피연산자처럼 **문법이 경로임을 증명한** 자리다.
+    나머지는 추측이므로, 있는 파일이거나 `/` 를 포함한 자리만 경로로 본다 —
+    `chmod 755 f` 의 `755`, `sed -i s/a/b/ f` 의 `s/a/b/` 를 거르기 위해서다.
     """
-    p = os.path.join(root, rel)
-    if os.path.lexists(p):
-        return True
-    # 펼쳐지지 않은 glob 은 경로가 아니다. 셸이 펼쳤다면 여기 `*` 가 없다 — 남아 있다는
-    # 것은 아무것도 안 맞았거나 따옴표 안이라는 뜻이고, 어느 쪽이든 해석할 수 없다.
-    # (`find . -name '*.pyc' -delete` 의 `*.pyc` 를 경로로 봤다.)
-    if any(ch in rel for ch in "*?["):
-        return False
-    return os.path.isdir(os.path.dirname(p) or root)
+    tok = tok.strip("\"'")
+    if not tok or any(ch in tok for ch in "*?["):
+        return None          # 펼쳐지지 않은 glob 은 해석할 수 없다
+    for rel in rel_aliases(root, tok):
+        if rel == ".":
+            continue
+        if sure or os.path.lexists(os.path.join(root, rel)) or "/" in rel:
+            return rel
+    return None
 
 
 def bash_writes(cfg, root, cmd):
-    """이 Bash 명령이 **확실히 쓰는** 경로들 (root 기준 상대경로, 순서 보존).
+    """이 명령의 **변경 세그먼트**가 대상으로 삼는 경로들 (순서 보존).
 
-    확실하지 않은 것은 넣지 않는다. 여기 없는 것을 바닥값이 놓치는 것은 아니다 —
-    바닥값은 `bash_protected_hit` 이 토큰 전부를 훑어 따로 지킨다.
+    확실하지 않은 것은 넣지 않는다. 여기서 빠진 것을 바닥값이 놓치지는 않는다.
     """
-    out = []
+    out, mut = [], bash_mutator_re(cfg)
 
-    def add(tok, makes_parents=False):
-        for rel in rel_aliases(root, tok.strip("\"'")):
-            if not rel or rel == "." or rel in out:
-                continue
-            if makes_parents or _plausible(root, rel):
-                out.append(rel)
+    def add(rel):
+        if rel and rel not in out:
+            out.append(rel)
 
     for seg in BASH_SPLIT.split(cmd.replace(">|", "> ")):
         toks = sh_tokens(seg)
-        if not toks:
+        if not toks or not mut.search(seg):
             continue
-        # 1) 리다이렉트 대상은 무엇이 앞에 있든 쓰기다 (`cat a > b`).
-        i = 0
-        while i < len(toks):
-            tok = toks[i]
-            m = REDIRECT_RE.match(tok)
-            if m and i + 1 < len(toks):
-                add(toks[i + 1])
-                i += 2
-                continue
-            # `>b` 처럼 붙여 쓴 형태
-            if tok[:1] in (">", "&") and len(tok) > 1 and not REDIRECT_RE.match(tok):
-                add(tok.lstrip("<>|&"))
-            i += 1
-        # 2) 명령 자신이 쓰는 인자
         head = os.path.basename(toks[0].strip("\"'"))
-        need = BASH_WRITERS_IF.get(head)
-        if head not in BASH_WRITERS and not (need and any(f in toks for f in need)):
-            continue
-        args, j = [], 1
-        while j < len(toks):
-            tk = toks[j]
-            # `< f` 의 f 는 **읽는다.** 예전에는 `tee a < /dev/null` 의 `<` 를 경로로
-            # 봤다. 리다이렉트 토큰과 그 피연산자를 함께 건너뛴다.
-            if tk in ("<", "<<", "<<<") or REDIRECT_RE.match(tk):
-                j += 2
+        # 읽기 명령에 리다이렉트가 붙은 것(`cat a > b`)은 **b 만** 쓴다.
+        reads_only = head in cfg.seq("bash.readers", BASH_READERS_DEFAULT)
+        args, k = [], 1
+        while k < len(toks):
+            tok = toks[k]
+            if REDIRECT_RE.match(tok) and k + 1 < len(toks):
+                add(_target(root, toks[k + 1], True))   # 문법이 경로임을 증명한다
+                k += 2
                 continue
-            if not tk.startswith("-") and not tk.startswith("<"):
-                args.append(tk)
-            j += 1
-        # `dd` 는 `of=` 만 쓴다. `if=` 는 읽는다.
-        if head == "dd":
-            for tk in args:
-                if tk.startswith("of="):
-                    add(tk.split("=", 1)[1])
-            continue
-        where = BASH_WRITE_ARGS.get(head, "all")
-        if where == "last":
+            if tok in ("<", "<<", "<<<"):
+                k += 2                                  # 입력은 읽는다
+                continue
+            if tok.startswith("of="):                   # dd
+                add(_target(root, tok[3:], True))
+            elif "=" not in tok.split("/", 1)[0] \
+                    and not tok.startswith(("-", "<", ">", "&")):
+                args.append(tok)          # `k=v` 는 옵션이지 경로가 아니다
+            k += 1
+        if reads_only:
+            args = []
+        elif head in BASH_TARGET_LAST:
             args = args[-1:]
-        elif where == "rest":
-            args = args[1:]
-        makes = head in BASH_MAKES_PARENTS
-        for tk in args:
-            add(tk, makes)
+        for tok in args:
+            add(_target(root, tok, False))
     return out
 
 
@@ -2492,7 +2474,7 @@ def hook_pre_tool_use(inp, ctx):
 
         # 대상을 특정할 수 없는 파괴는 **모른다고 말하고 넘긴다.** 막으면 정상 정리
         # 작업이 막히고, 통과시키면 구멍이다. 자세한 근거는 `BASH_OPAQUE` 에 적었다.
-        why = bash_opaque(cfg, cmd)
+        why = bash_opaque(cmd)
         if why:
             with con:
                 record_event(con, lid, sid, "ask", "opaque_write", "", cmd[:200])
@@ -2548,16 +2530,16 @@ def hook_post_tool_use(inp, ctx):
                 for kind, sig in signals.items():
                     for pat in (sig.get("write_glob") or []) if isinstance(sig, dict) else []:
                         if glob_match(rel, pat):
-                            record_evidence(con, lid, sid, kind, rel)
+                            record_evidence(con, lid, sid, kind, rel, root)
                             break
         if sid in evidence_stages(cfg) and not tool_failed(inp):
             sig = signals.get("verification_evidence") or {}
             if not isinstance(sig, dict):
                 sig = {}
             if tool == "Bash":
-                pat = sig.get("bash_pattern")
                 cmd = ti.get("command") or ""
-                if pat and re.search(pat, cmd):
+                # 원문 검색이 아니라 **실행 위치**를 본다 (`verification_hit`).
+                if verification_hit(cfg, cmd):
                     record_evidence(con, lid, sid, "verification_evidence",
                                     cmd.strip()[:120])
             if tool in sig.get("tools", []):
@@ -2565,6 +2547,37 @@ def hook_post_tool_use(inp, ctx):
             tp = sig.get("tool_pattern")
             if tp and re.search(tp, tool):
                 record_evidence(con, lid, sid, "verification_evidence", "tool:" + tool)
+
+
+def verification_hit(cfg, cmd):
+    """이 명령이 **검증을 실행하나.** 문자열 어딘가에 이름이 있는 것과 다르다.
+
+    `bash_pattern` 을 명령 전체에 `re.search` 했더니 아래가 전부 증거로 적립됐다.
+
+        echo "npm test"        git commit -m "ran npm test"        cat tsc.log
+
+    패턴이 아니라 **어디에 대고 맞추는가**가 문제였다. 세그먼트로 쪼개고, 따옴표 안은
+    데이터이므로 지우고, 읽기 명령(`bash.readers`)은 아무것도 실행하지 않으므로 건너뛴다.
+    `sh -c "npm test"` 도 이제 증거가 아니다 — 게이트가 잘못 열리는 것보다 `harness
+    verify` 를 한 번 더 치는 편이 낫다.
+    """
+    pat = cfg.at("criteria.verification_evidence.bash_pattern")
+    if not pat:
+        return False
+    try:
+        vre = re.compile(pat)
+    except re.error:
+        return False
+    readers = tuple(cfg.seq("bash.readers", BASH_READERS_DEFAULT)) + ("echo", "printf")
+    for seg in BASH_SPLIT.split(cmd):
+        bare = QUOTED_RE.sub(" ", seg).strip()
+        if not bare:
+            continue
+        if os.path.basename(bare.split()[0].strip("\"'")) in readers:
+            continue
+        if vre.search(bare):
+            return True
+    return False
 
 
 def tool_failed(inp):
@@ -2717,7 +2730,7 @@ def hook_stop(inp, ctx):
     for key in stage.get("stop_requires", []):
         if not criterion_met(con, cfg, root, lid, key):
             problems.append((key, t("%s 단계를 끝낼 수 없다: %s")
-                             % (stage["label"], criterion_help(cfg, key))))
+                             % (stage["label"], criterion_why(con, cfg, root, lid, key))))
     if not problems:
         return continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id)
 
@@ -3088,28 +3101,14 @@ def wrapper_code(body):
 
 
 def wrapper_intact(root):
-    """래퍼가 우리가 쓴 그것인가. 아니면 **복구하고** False 를 준다.
+    """래퍼가 우리가 쓴 그것인가. 아니면 **복구하고** False.
 
-    ## 왜 필요한가 — 사전 승인은 경로에 붙고, 신뢰는 내용에 붙는다
+    `SAFE_PERMS` 는 래퍼를 **경로로** 사전 승인한다. 그런데 그 파일은 프로젝트 안에
+    있어 모델이 쓸 수 있는 자리다. 경로 검사를 우회하는 길이 하나만 남아도 그 즉시
+    승인 없는 임의 코드 실행이 된다. 그래서 **신뢰를 경로가 아니라 내용에 건다** —
+    우회가 성공해도 남의 코드는 실행되지 않는다.
 
-    `SAFE_PERMS` 는 `Bash(.claude/harness/bin/harness <cmd>)` 를 **경로로** 사전
-    승인한다. 그런데 그 경로의 파일은 프로젝트 안에 있고 모델이 쓸 수 있는 자리다.
-    바닥값이 Write·Edit·Bash 대상 검사로 막지만, 경로 문자열을 우회하는 길이 하나만
-    남아도 그 즉시 **승인 없는 임의 코드 실행**이 된다. 5차 리뷰가 두 가지로 재현했다.
-
-        python3 -c "open('.claude/harness/bin/harness','w').write(...)"
-        p=.claude/harness/bin/harness; printf x > $p
-
-    둘 다 경로가 문자열 안이나 셸 변수 안에 있어 토큰으로 보이지 않는다. **인터프리터
-    안의 코드와 셸 변수 확장을 정확히 따라가는 것은 셸을 재구현하는 일이다** — 그
-    방향으로는 근사만 쌓이고, 근사는 이미 두 번 틀렸다.
-
-    그래서 막는 자리를 바꾼다. 우회를 하나씩 잡는 대신 **대가를 없앤다**: 래퍼를
-    실행하기 전에 내용이 우리가 쓴 그것인지 본다. 아니면 실행하지 않고, 복구하고,
-    알린다. 우회가 성공해도 남의 코드는 실행되지 않는다.
-
-    복구까지 하는 이유: 거부만 하면 `harness init` 조차 래퍼를 거치므로 사용자가
-    갇힌다. 복구해 두면 다음 시도가 통한다 — 변조는 실행되지 않고, 사용자는 안다.
+    복구까지 하는 이유: 거부만 하면 `harness init` 조차 래퍼를 거쳐 사용자가 갇힌다.
     """
     path = os.path.join(root, WRAPPER_REL)
     want = t(WRAPPER) % os.path.abspath(__file__)
@@ -3256,7 +3255,11 @@ SELFTEST = (
 # 개수를 세는 요약으로는 안 보였다(Codex Claim C HIGH).
 UNRELATED = ("src/a.py", "README.md", ".claude/settings.json", "Makefile")
 # 검증 증거로 인정되면 안 되는 명령. 텍스트를 읽지 않고 넣어 본다.
-NOT_VERIFICATION = ("ls", "echo hi", "true", "cat README.md", "git status", "pwd")
+# 검증이 **아닌** 명령. 5차 리뷰가 뚫은 모양(문자열 안에 이름만 있는 것)을 넣었다 —
+# 탐침이 실제로 뚫린 자리를 담고 있어야 자기검사가 거짓말을 하지 않는다.
+NOT_VERIFICATION = ("ls", "echo hi", "true", "cat README.md", "git status", "pwd",
+                    'echo "npm test"', 'git commit -m "ran npm test"',
+                    "cat tsc.log", "grep -rn pytest src/", "ls | grep vitest")
 # 이 도구를 썼다는 사실만으로 검증이 됐다고 볼 수 없다. 읽기·탐색은 검증이 아니다.
 INNOCUOUS_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "TodoWrite")
 
@@ -3283,7 +3286,10 @@ def selftest_criteria(cfg):
                 vre = re.compile(pat) if pat else None
             except re.error:
                 vre = None
-            hits = [c for c in NOT_VERIFICATION if vre and vre.search(c)]
+            # **판정 함수에 넣는다.** 예전에는 여기서 정규식을 직접 돌려서,
+            # 엔진이 실제로 쓰는 판정(`verification_hit`)과 다른 것을 검사했다.
+            hits = [c for c in NOT_VERIFICATION
+                    if vre is not None and verification_hit(cfg, c)]
             out.append((t("%s 는 검증 명령만 인정한다") % name, not hits,
                         t("검증이 아닌 명령도 인정: %s") % ", ".join(hits) if hits
                         else t("검증 명령만 인정한다")))
@@ -3643,7 +3649,7 @@ def cli_advance(ctx, argv):
     if missing:
         print(t("advance 거부 — %s 단계의 종료 조건이 남았다:") % stage_obj(cfg, sid)["label"])
         for k in missing:
-            print("  - %s: %s" % (k, criterion_help(cfg, k)))
+            print("  - %s: %s" % (k, criterion_why(con, cfg, root, lid, k)))
         if stage_obj(cfg, sid).get("skippable") is False:
             print(t("이 단계는 건너뛸 수 없다. 조건을 채워야 한다."))
         else:
@@ -3749,7 +3755,7 @@ def cli_skip(ctx, argv):
             # 하라는 말이고, 사용자는 빠져나갈 길이 없다. 실제로 그렇게 막혔다.
             if not criterion_met(con, cfg, root, lid, key):
                 print(t("%s 를 건너뛰더라도 기록은 남겨야 한다: %s")
-                      % (st["label"], criterion_help(cfg, key)))
+                      % (st["label"], criterion_why(con, cfg, root, lid, key)))
                 print(t("먼저 그 기록을 남긴 뒤 다시 시도하라. 승인만 면제된다."))
                 return 1
 
@@ -3826,8 +3832,10 @@ def cli_verify(ctx, argv):
     if set(cmd) & SHELL_META:
         print(t("셸 메타문자가 있는 명령은 거부한다 — 검증 명령 하나만 넘겨라."))
         return 2
-    pat = cfg.at("criteria.verification_evidence.bash_pattern")
-    if pat and not re.search(pat, cmd):
+    # 관측 경로와 **같은 판정**을 쓴다. 두 곳이 갈리면 `verify` 로는 되는데 그냥
+    # 돌리면 안 되는(또는 그 반대) 일이 생긴다.
+    if cfg.at("criteria.verification_evidence.bash_pattern") \
+            and not verification_hit(cfg, cmd):
         print(t("검증 명령으로 보이지 않는다: %s") % cmd)
         print(t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."))
         return 2
@@ -3879,8 +3887,8 @@ def cli_approve_plan(ctx, argv):
         print(t("계획 파일을 찾을 수 없다: %s") % path)
         return 2
     with con:
-        record_evidence(con, lid, sid, "plan_file", rel)
-        record_evidence(con, lid, sid, "plan_approved", rel)
+        record_evidence(con, lid, sid, "plan_file", rel, root)
+        record_evidence(con, lid, sid, "plan_approved", rel, root)
     print(t("계획 승인 기록: %s") % rel)
     return 0
 

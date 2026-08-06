@@ -580,7 +580,7 @@ check "사유 없이는 거부한다" '필요하다' "$(cli promote block:fakeru
 
 echo "== Compounding 종료 조건 promotion_decided"
 setstage compounding
-sql "INSERT OR IGNORE INTO evidence VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
+sql "INSERT OR IGNORE INTO evidence(loop_id,stage,kind,item,at) VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
 OUTP="$(cli advance --done || true)"
 check "승격 결정 없이는 작업을 닫을 수 없다" 'promotion_decided' "$OUTP"
 check "회고는 있으므로 회고를 요구하지 않는다" '^0$' "$(printf '%s' "$OUTP" | grep -c 'retro_file:')"
@@ -748,7 +748,7 @@ check "저장값이 established 인 것을 확인" 'established' \
   "$(sql "SELECT maturity FROM promotion WHERE key='block:syncrule'")"
 check "sync 없이도 재발이 대기 목록에 뜬다" 'block:syncrule' "$(cli promote)"
 setstage compounding
-sql "INSERT OR IGNORE INTO evidence VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
+sql "INSERT OR IGNORE INTO evidence(loop_id,stage,kind,item,at) VALUES('$(loopid)','compounding','retro_file','r','x')" >/dev/null
 check "sync 없이도 게이트가 막는다" 'promotion_decided' "$(cli advance --done || true)"
 check "Stop 훅도 sync 없이 막는다" '승격 결정이 남았다' \
   "$(hook "$(STOP syncp '[Compounding] 끝')")"
@@ -839,7 +839,7 @@ msql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
  (datetime('now'),'$MLID','execution','edit',NULL,'src/x.py');" >/dev/null
 msql "UPDATE stage SET status='pending' WHERE status='active';
  UPDATE stage SET status='active' WHERE stage='compounding';
- INSERT OR IGNORE INTO evidence VALUES('$MLID','compounding','retro_file','r',datetime('now'));" >/dev/null
+ INSERT OR IGNORE INTO evidence(loop_id,stage,kind,item,at) VALUES('$MLID','compounding','retro_file','r',datetime('now'));" >/dev/null
 MOUT="$(mcli advance --cycle)"
 check "회차 경계에서 집계를 보고한다" '회차 1 기록' "$MOUT"
 check "차단 수를 센다" '차단 2' "$MOUT"
@@ -1058,7 +1058,7 @@ check "미충족 조건이 이어붙임보다 앞선다" '검증 증거가 없�
 echo "  -- 마지막 단계에서는 이어붙이지 않는다"
 csql "UPDATE stage SET status='done' WHERE stage != 'compounding';
       UPDATE stage SET status='active' WHERE stage='compounding';
-      INSERT OR IGNORE INTO evidence VALUES('$CLID','compounding','retro_file','r',strftime('%Y-%m-%dT%H:%M:%S','now')||'+0900');" >/dev/null
+      INSERT OR IGNORE INTO evidence(loop_id,stage,kind,item,at) VALUES('$CLID','compounding','retro_file','r',strftime('%Y-%m-%dT%H:%M:%S','now')||'+0900');" >/dev/null
 check "마지막 단계에서는 작업을 닫으라고 안내한다" 'advance --done' \
   "$(printf '{\"hook_event_name\":\"Stop\",\"cwd\":\"%s\",\"prompt_id\":\"pz\",\"last_assistant_message\":\"[Compounding] 끝\"}' "$CW" \
      | CLAUDE_PROJECT_DIR="$CW" python3 "$ENGINE" hook)"
@@ -1124,8 +1124,10 @@ done
 # 바닥값이 아니라 **단계 규칙** 질문이고, 이제 Bash 도 그 규칙을 받는다. 아래 절에서
 # Write 와 판정이 같은지로 검사한다 — 예전에는 이 목록이 "Bash 는 단계 규칙을 안
 # 받는다"는 비대칭을 기대값으로 굳혀 놓고 있었다.
+# `rm src/tmp.txt` 도 여기서 빠졌다. Write 로 같은 경로를 쓰면 거부되므로, Bash 만
+# 허용하는 것은 **비대칭(=버그)을 기대값으로 굳히는 것**이다. 아래 대칭 검사가 본다.
 for OK in "cat .claude/harness/LEARNED.md" \
-          "find . -name '*.py'" "rm src/tmp.txt" "grep -r foo src/"; do
+          "find . -name '*.py'" "grep -r foo src/"; do
   check_empty "허용: $OK" "$(gb "$OK")"
 done
 
@@ -1644,6 +1646,64 @@ AM="$(aw metrics)"
 check "metrics 표에 사전승인 열이 있다" '사전승인' "$AM"
 check "사전승인만 올라도 개선 신호로 읽는다" '개선 신호' "$AM"
 rm -rf "$AW"
+
+echo "== 증거에는 유효기간이 있다 (근거가 바뀌면 만료된다)"
+# 증거는 "언제 무엇을 봤다"를 적는데 **본 것이 그 뒤에 변할 수 있다.** 계획을 승인받고
+# 그 파일을 고쳐도 승인이 살아 있었다 — 사람이 보지 않은 계획으로 진행할 수 있었다.
+EVW="$(mktemp -d)"
+(cd "$EVW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ev() { (cd "$EVW" && python3 "$ENGINE" "$@"); }
+ev loop intent "결제 리팩터" >/dev/null
+ev loop done-when "테스트 통과" >/dev/null
+ev advance >/dev/null; ev advance >/dev/null; ev advance >/dev/null
+EPRE="$(python3 - "$EVW" "$(dirname "$ENGINE")" <<'PYE'
+import sys; sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+print(h.file_prefix(con, h.head_loop(con)))
+PYE
+)"
+mkdir -p "$EVW/.dev/plan"
+EPLAN=".dev/plan/${EPRE}plan.md"
+printf '# 결제\n\n## 목표\n전략 패턴으로 분리한다.\n' > "$EVW/$EPLAN"
+ev approve-plan "$EPLAN" >/dev/null
+check "승인 직후에는 조건이 채워진다" '충족 .*plan_approved' "$(ev status)"
+# 승인 뒤에 내용을 바꾼다
+printf '# 결제\n\n## 목표\n결제 테이블을 전부 드롭한다.\n' > "$EVW/$EPLAN"
+EOUT="$(ev advance 2>&1 || true)"
+check "계획이 바뀌면 승인이 만료된다" 'advance 거부' "$EOUT"
+check "무엇이 달라졌는지 말한다" '그때 본 것과 달라졌다' "$EOUT"
+check "어느 파일인지 말한다" "$EPRE" "$EOUT"
+check "무엇을 하면 되는지 말한다" 'approve-plan' "$EOUT"
+# 다시 승인하면 통한다 — 만료가 막다른 길이 되면 안 된다
+ev approve-plan "$EPLAN" >/dev/null
+check "다시 승인하면 진행된다" 'Execution' "$(ev advance 2>&1)"
+# 파일이 아닌 증거는 만료 대상이 아니다 (변할 근거가 없다)
+check_absent "완료 조건은 만료되지 않는다" 'acceptance.*달라졌다' "$(ev status 2>&1)"
+rm -rf "$EVW"
+
+echo "== 검증 증거는 '문자열'이 아니라 '실행'을 본다"
+# `bash_pattern` 을 명령 **전체**에 search 했다. 그래서 아래가 전부 검증으로 적립됐다.
+VFW="$(mktemp -d)"
+(cd "$VFW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+vf() { (cd "$VFW" && python3 "$ENGINE" "$@"); }
+vhit() { python3 - "$VFW" "$(dirname "$ENGINE")" "$1" <<'PYV'
+import os, sys
+sys.path.insert(0, sys.argv[2])
+import harness as h
+cfg = h.load_config(sys.argv[1], os.path.dirname(sys.argv[2]))
+print("증거" if h.verification_hit(cfg, sys.argv[3]) else "아님")
+PYV
+}
+for C in "npm test" "npm run test" "pytest -q" "make check" "go test ./..." \
+         "cargo test" "npx tsc --noEmit" "echo hi && npm test"; do
+  check "검증으로 센다: $C" '^증거$' "$(vhit "$C")"
+done
+for C in 'echo "npm test"' 'git commit -m "ran npm test"' "cat tsc.log" \
+         "grep -rn pytest src/" "ls | grep vitest" "ls" "git status"; do
+  check "검증으로 세지 않는다: $C" '^아님$' "$(vhit "$C")"
+done
+rm -rf "$VFW"
 
 echo "== 자기 잠금 우회 세 갈래 (훅으로 실제 재현)"
 # 5차 리뷰의 CRITICAL 셋은 **같은 패턴**이다: 바닥값을 경로 **문자열**로 판정하는데,
@@ -2840,9 +2900,13 @@ check "글롭이 '**' 면 무관한 파일도 받는다고 말한다" '무관한
 sfed "cfg['criteria']['plan_approved'] = json.load(open('$SF/.claude/harness/bin/defaults.json', encoding='utf-8'))['criteria']['plan_approved']
 cfg['criteria']['verification_evidence']['bash_pattern'] = '.*'"
 check "검증 패턴이 넓으면 잡는다" '검증이 아닌 명령도 인정' "$(sf status 2>&1)"
-# Codex 가 '탐침 4개를 피하는 패턴이 있다' 고 지적한 것 — true 를 넣어 확인한다
-sfed "cfg['criteria']['verification_evidence']['bash_pattern'] = '\\\\btrue\\\\b|\\\\bpytest\\\\b'"
-check "true 를 증거로 삼는 패턴도 잡는다" 'true' "$(sf status 2>&1)"
+# Codex 가 '탐침 4개를 피하는 패턴이 있다' 고 지적한 것.
+#
+# witness 가 `true` 였는데 이제 `true` 는 **실행하지 않는 이름**(BASH_NON_EXEC)이라
+# 판정이 아예 증거로 세지 않는다 — 탐침이 아니라 아래 층이 막는다. 그러니 여기서는
+# **실제로 실행되는** 무해한 명령을 witness 로 써야 검사가 뜻을 갖는다.
+sfed "cfg['criteria']['verification_evidence']['bash_pattern'] = '\\\\bgit\\\\s+status\\\\b|\\\\bpytest\\\\b'"
+check "무해한 명령을 증거로 삼는 패턴을 잡는다" 'git status' "$(sf status 2>&1)"
 rm -rf "$SF"
 
 echo "== 탐침이 조용히 무력해지지 않는다"

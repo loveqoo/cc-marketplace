@@ -214,45 +214,56 @@ ck("정상 인터프리터로 래퍼를 돌리는 것은 막지 않는다",
    h.bash_protected_hit(cfg, root,
                         "python3 .claude/harness/bin/harness status") is None)
 
-print("리포 루트를 훑는 파괴는 바닥값을 담고 있다")
-# `find . -name harness.db -delete` 는 토큰에 바닥값이 없어 통째로 지나갔다. 대상이
-# 문자열 안이 아니라 **실행 결과 안**에 있는 명령이다.
-for cmd, want in ((("find . -name harness.db -delete"), True),
-                  (("find . -name 'harness*' -delete"), True),
-                  (("find . -delete"), True),
-                  (("find . -not -name '*.pyc' -delete"), True),
-                  (("find . ! -name '*.pyc' -delete"), True),
-                  (("find . -name '*' -delete"), True),
-                  # 정상 정리 작업은 막지 않는다 — 바닥값의 보장은 "하네스 자신은
-                  # 바뀌지 않는다"이지 "리포 루트를 훑지 마라"가 아니다.
-                  (("find . -name '*.pyc' -delete"), False),
-                  (("find . -name '*.pyc' -print"), False),
-                  (("find src -name '*.pyc' -delete"), False)):
-    got = h.bash_protected_hit(cfg, root, cmd) is not None
-    ck("%s%s" % ("막는다  " if want else "안 막는다", cmd), got == want,
-       "실제로는 %s" % ("막았다" if got else "안 막았다"))
+print("Bash 가 무엇을 쓰는지 (표 하나로 판별한다)")
+# 손으로 재던 것을 기계가 재게 한다. 과소는 게이트 구멍이고 과다는 마찰이다 —
+# 양쪽을 같은 표에서 본다.
+os.makedirs(os.path.join(root, "src"), exist_ok=True)
+os.makedirs(os.path.join(root, "docs", "01-x"), exist_ok=True)
+for f in ("src/a.py", "docs/01-x/01-n.md", "README.md"):
+    open(os.path.join(root, f), "a").close()
+for cmd, want in (
+        # 읽기만 하는 명령은 아무것도 만들지 않는다
+        ("ls -la src", ""), ("grep -rn foo src/", ""), ("npm test", ""),
+        ("git commit -m x", ""), ("sed -n '1,5p' src/a.py", ""),
+        # 리다이렉트 대상은 문법이 경로임을 증명한다
+        ("printf x > src/a.py", "src/a.py"),
+        ("printf x > newfile.txt", "newfile.txt"),
+        # 읽기 명령 + 리다이렉트는 **대상만** 쓴다 (README.md 는 읽는다)
+        ("cat README.md > docs/01-x/01-n.md", "docs/01-x/01-n.md"),
+        # 마지막 인자만 바꾸는 명령
+        ("cp src/a.py /tmp/b.py", ""), ("cp /tmp/b.py src/a.py", "src/a.py"),
+        ("sed -i '' 's/x/y/' src/a.py", "src/a.py"),
+        # mv 는 원본도 사라진다
+        ("mv src/a.py src/b.py", "src/a.py, src/b.py"),
+        # 옵션값은 경로가 아니다
+        ("dd if=/dev/zero of=src/a.py", "src/a.py"),
+        ("rm src/a.py", "src/a.py"), ("mkdir -p src/new", "src/new"),
+        ("tee src/a.py < /dev/null", "src/a.py")):
+    got = ", ".join(h.bash_writes(cfg, root, cmd))
+    ck("%-34s -> %s" % (cmd[:34], want or "(없음)"), got == want, "실제: %s" % (got or "-"))
 
 print("대상을 특정할 수 없는 파괴는 사람에게 묻는다")
-# 막으면 정상 정리가 막히고, 통과시키면 구멍이다. 모른다는 사실 자체가 판정이다.
-for cmd, want in (("find . -name '*.pyc' -delete", True),
+# `find . -name harness.db -delete` 는 토큰에 보호 경로가 없어 어떤 문자열 검사도
+# 지나간다. 특정하려 들지 않고 **모른다고 말한다** — 막으면 정상 정리가 막히고,
+# 통과시키면 구멍이다. 경계가 아니라 가시성이다.
+for cmd, want in (("find . -name harness.db -delete", True),
+                  ("find . -delete", True),
                   ("find src -type f -exec rm {} +", True),
+                  ("find . -name '*.pyc' -delete", True),
                   ("ls | xargs rm", True),
-                  ("eval \"$CMD\"", True),
-                  ("python3 -c \"open('src/a.py','w')\"", True),
-                  ("sh -c 'echo x > src/a.py'", True),
                   # 파괴 신호가 없으면 묻지 않는다 — 마찰은 게이트를 끄게 만든다.
-                  ("python3 -c 'print(1)'", False),
-                  ("ls | xargs cat", False),
                   ("find . -name '*.py' -print", False),
+                  ("ls | xargs cat", False),
                   ("npm test", False),
                   ("pytest tests/ -q", False)):
-    got = h.bash_opaque(cfg, cmd) is not None
+    got = h.bash_opaque(cmd) is not None
     ck("%s%s" % ("묻는다  " if want else "안 묻는다", cmd), got == want,
        "실제로는 %s" % ("물었다" if got else "안 물었다"))
-off = h.Cfg(dict(cfg))
-off["bash"] = dict(cfg.obj("bash") or {}, opaque_ask=False)
-ck("opaque_ask: false 로 끌 수 있다 (게이트 전체를 끄는 것보다 낫다)",
-   h.bash_opaque(off, "ls | xargs rm") is None)
+# 대상이 문자열에 있으면 묻지 않고 **막는다** — 그쪽이 언제나 낫다.
+ck("대상이 분명하면 바닥값이 막는다",
+   h.bash_protected_hit(cfg, root, "find .claude/harness -delete") is not None)
+ck("정상 명령은 바닥값에 걸리지 않는다",
+   h.bash_protected_hit(cfg, root, "find . -name '*.pyc' -delete") is None)
 
 print("래퍼는 **내용**이 우리 것일 때만 신뢰한다")
 wp = os.path.join(root, h.WRAPPER_REL)
