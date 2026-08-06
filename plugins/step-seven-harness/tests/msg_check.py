@@ -62,14 +62,65 @@ def stmt_of(node):
     return None
 
 
-# LAZY 상수는 두 형태를 인정한다. 상수 전체를 감싸거나(`t(USAGE)`), 원소를 감싸거나
-# (`{k: t(v) for k, v in PROMOTE_AS_DEFAULT.items()}`). 후자는 상수 이름이 t() 안에
-# 없으므로 **그 상수를 쓰는 문장에 t() 호출이 있는지**로 본다.
-# 한계: 그 문장이 다른 것에 t() 를 쓰고 있어도 통과한다. 정확한 보장은 위의 전수
-# 검사이고 이건 보조 검사다.
-lazy_wrapped = set()
+# LAZY 상수는 **사용 지점마다** 검사한다.
+#
+# 예전에는 상수 단위로 봤다 — 어딘가 한 번 `t(USAGE)` 가 있으면 다른 곳의
+# `print(USAGE)` 가 숨었다. 적대적 리뷰가 지적하고 실증했다. 영어 버전에서 한국어
+# 한 줄이 새어 나오는데 아무도 모르는 상태다.
+#
+# 인정하는 두 형태:
+#   (a) `t(USAGE)`                     — 상수 전체를 감싼다
+#   (b) `{k: t(v) for k, v in X.items()}` — 순회하며 원소를 감싼다
+def in_t_call(node):
+    """조상 중 t(...) 호출의 인자인가. 다른 호출의 인자로 들어가면 거기서 멈춘다."""
+    cur = node
+    for _ in range(8):
+        p = parent.get(id(cur))
+        if p is None:
+            return False
+        if isinstance(p, ast.Call):
+            return isinstance(p.func, ast.Name) and p.func.id == "t"
+        cur = p
+    return False
+
+
+def iterated_with_t(node):
+    """이 이름이 순회 대상이고, 그 순회 본문에서 t() 를 쓰나."""
+    cur = node
+    for _ in range(6):
+        p = parent.get(id(cur))
+        if p is None:
+            return False
+        if isinstance(p, (ast.comprehension, ast.For)) and p.iter is cur:
+            holder = parent.get(id(p))
+            if holder is None:
+                return False
+            for c in ast.walk(holder):
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) \
+                   and c.func.id == "t":
+                    return True
+            return False
+        cur = p
+    return False
+
+
+LAZY_WITH_TEXT = {name for _s, _ln, _ok, name in found if name and name in LAZY}
+
+# **스칼라와 컨테이너를 가른다.** 이 구분이 없으면 검사가 오탐을 낸다.
+#   스칼라(`USAGE = """..."""`)  — 값 자체가 문장이다. raw 사용은 곧 누출이다.
+#   컨테이너(`TREND_KEYS = ((k, "라벨"), ...)`) — **키만 읽는 것이 정상**이다
+#     (`for k, _ in TREND_KEYS`). 그 자리를 지적하면 오탐이고, 오탐이 나는 검사는
+#     아무도 보지 않는다. 그래서 컨테이너는 "그 문장에 t() 가 있는지"만 본다.
+SCALAR_TEXT = set()
 for n in ast.walk(tree):
-    if not (isinstance(n, ast.Name) and n.id in LAZY):
+    if isinstance(n, ast.Assign) and len(n.targets) == 1 \
+       and isinstance(n.targets[0], ast.Name) and n.targets[0].id in LAZY_WITH_TEXT \
+       and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
+        SCALAR_TEXT.add(n.targets[0].id)
+
+for n in ast.walk(tree):
+    if not (isinstance(n, ast.Name) and n.id in LAZY_WITH_TEXT
+            and isinstance(n.ctx, ast.Load)):
         continue
     st = stmt_of(n)
     if st is None:
@@ -77,14 +128,23 @@ for n in ast.walk(tree):
     if isinstance(st, ast.Assign) and any(
             isinstance(tg, ast.Name) and tg.id == n.id for tg in st.targets):
         continue                      # 정의 자체는 세지 않는다
-    for c in ast.walk(st):
-        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "t":
-            lazy_wrapped.add(n.id)
-            break
+    if in_t_call(n) or iterated_with_t(n):
+        continue
+    if n.id in SCALAR_TEXT:
+        bad.append("harness.py:%d 의 %s 사용이 t() 밖에 있다 — 이 자리만 번역이 "
+                   "조용히 빠진다" % (n.lineno, n.id))
 
-for name in sorted(lazy_used - lazy_wrapped):
-    bad.append("%s 는 LAZY_MSG_NAMES 에 있으나 t() 로 감싸는 자리가 없다 "
-               "— 번역이 조용히 빠진다" % name)
+# 컨테이너는 **상수 단위**로만 본다. 어딘가에서 원소를 감싸면 통과다.
+#
+# 한계를 정직하게 적어둔다: `TREND_KEYS` 의 값을 감싸지 않고 출력하는 자리가 새로
+# 생기면 이 검사는 놓친다. 사용 지점마다 보려고 했더니 `for k, _ in TREND_KEYS`
+# (키만 읽는 정상 코드)까지 지적하는 오탐이 났고, 오탐이 나는 검사는 아무도 보지
+# 않는다. 정확한 보장은 위의 리터럴 전수 검사이고 이건 보조 검사다.
+for name in sorted(lazy_used - SCALAR_TEXT):
+    if not any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
+               and (in_t_call(n) or iterated_with_t(n)) for n in ast.walk(tree)):
+        bad.append("%s 는 LAZY_MSG_NAMES 에 있으나 t() 로 감싸는 자리가 없다 "
+                   "— 번역이 조용히 빠진다" % name)
 
 want = {s for s, _, _, _ in found} | set(_msgs.config_strings(STAGES))
 if os.path.isfile(CATALOG):

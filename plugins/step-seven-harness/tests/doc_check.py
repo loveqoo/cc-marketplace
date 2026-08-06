@@ -83,7 +83,13 @@ def main():
             for m in STAGE_RE.finditer(line):
                 got, name = "%s/%s" % (m.group(1), m.group(2)), m.group(3)
                 want = real.get(name)
-                if want and got != want:
+                if want is None:
+                    # 이름 오타는 조용히 통과했다 — `1/7 Selectoin` 이 그 예다.
+                    # 모르는 이름이면 번호를 비교할 수조차 없으니 그것을 말한다.
+                    bad.append("%s:%d: `%s %s` 의 단계 이름이 stages.json 에 없다 "
+                               "(오타이거나 사라진 단계다). 실제: %s"
+                               % (rel, i, got, name, ", ".join(sorted(real))))
+                elif got != want:
                     bad.append("%s:%d: 단계 번호가 stages.json 과 다르다 — "
                                "`%s %s` 라고 적혀 있으나 실제는 %s"
                                % (rel, i, got, name, want))

@@ -48,6 +48,14 @@ jcheck() { # jcheck <label> <json-path> <expected-json> <json-text>
   fi
 }
 
+check_absent() { # check_absent <label> <must-not-appear> <actual>
+  if printf '%s' "$3" | grep -q "$2"; then
+    FAIL=$((FAIL + 1)); printf '  FAIL %s\n     나오면 안 되는 것: %s\n     실제: %s\n' "$1" "$2" "$3"
+  else
+    PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"
+  fi
+}
+
 check_no_prefix_complaint() { # <label> <hook-output>
   if printf '%s' "$2" | grep -q '말머리는'; then
     FAIL=$((FAIL + 1)); printf '  FAIL %s\n     말머리 불만이 나왔다: %s\n' "$1" "$2"
@@ -275,7 +283,11 @@ check "1회차 차단" '검증 증거가 없다' "$(hook "$(STOP pv '[Verificati
 check "2회차 차단 (limit 2)" '"decision": "block"' "$(hook "$(STOP pv '[Verification] 끝')")"
 check "3회차는 우회를 사용자에게 노출" 'systemMessage' "$(hook "$(STOP pv '[Verification] 끝')")"
 hook '{"hook_event_name":"PostToolUse","cwd":"'"$WORK"'","tool_name":"Bash","tool_input":{"command":"npm test"}}' >/dev/null
-check_no_prefix_complaint "증거 적립 후 통과" "$(hook "$(STOP pv2 '[Verification] 끝')")"
+# 이 자리는 '통과' 를 주장했지만 헬퍼는 **말머리 불만만** 봤다. 검증 증거가 없어
+# 막혀도 통과로 세어졌다 — 적대적 리뷰가 지적했다. 무엇이 없어야 하는지 적는다.
+check_no_prefix_complaint "말머리 불만이 없다" "$(hook "$(STOP pv2 '[Verification] 끝')")"
+check_absent "검증 증거로 막히지 않는다" '검증 증거가 없다' \
+  "$(hook "$(STOP pv2 '[Verification] 끝')")"
 
 echo "== docs 예외"
 setstage scaffolding
@@ -834,8 +846,19 @@ check ".dev/ 편집만으로는 근거가 되지 않는다" '변경이 관측되
   "$(mcli promote block:wrule --as hook --note '계획만 썼다')"
 check "그 사실이 event 로 남는다" 'change_seen=no' \
   "$(msql "SELECT detail FROM event WHERE kind='promote_verify' AND target='block:wrule'")"
+# **실제로 rule 승격을 해야** 이 단정이 뜻을 갖는다. 예전에는 픽스처가 `--as hook`
+# 만 써서 개수가 늘 0이었고, rule 승격이 잘못 검증되든 제대로 제외되든 통과했다 —
+# 적대적 리뷰가 지적했다.
+msql "INSERT INTO event(at,loop_id,stage,kind,rule,target) VALUES
+  ('2026-07-02T11:00:00+0900','r1','execution','block','rrule','a'),
+  ('2026-07-02T11:00:00+0900','r2','execution','block','rrule','b'),
+  ('2026-07-02T11:00:00+0900','r3','execution','block','rrule','c');" >/dev/null
+check "rule 승격 자체는 성공한다" '승격 기록' \
+  "$(mcli promote block:rrule --as rule --note 'LEARNED.md 한 줄로 올린다')"
+check "hook 승격은 검증 기록을 남긴다" '^1$' \
+  "$(msql "SELECT COUNT(*) FROM event WHERE kind='promote_verify' AND target='block:wrule'")"
 check "rule 승격은 검증 대상이 아니다" '^0$' \
-  "$(msql "SELECT COUNT(*) FROM event WHERE kind='promote_verify' AND rule='rule'")"
+  "$(msql "SELECT COUNT(*) FROM event WHERE kind='promote_verify' AND target='block:rrule'")"
 rm -rf "$MW"
 
 echo "== --json 은 산문이 아니라 값을 낸다"
@@ -1548,7 +1571,14 @@ print(sqlite3.connect(sys.argv[1]).execute(
 # 반증 둘. 이 둘이 통과하면 게이트가 사람 없이 열린다.
 rm -f "$FW/.dev/plan/${FPRE}plan.md"
 printf '# 남의 계획\n' > "$FW/.dev/plan/250101-aaaaaa-1-plan.md"
-check "다른 작업·회차의 파일로는 열리지 않는다" 'plan_file' "$(fmiss)"
+check "다른 작업의 파일로는 열리지 않는다" 'plan_file' "$(fmiss)"
+# **회차만 다른 경우**를 따로 본다. 위 픽스처는 해시와 회차가 둘 다 달라서, 해시만
+# 보고 회차를 무시하는 구현도 통과했다 — 적대적 리뷰가 지적했다.
+rm -f "$FW/.dev/plan/250101-aaaaaa-1-plan.md"
+FWCYC="$(printf '%s' "$FPRE" | sed 's/-1-$/-2-/')"
+printf '# 다음 회차 계획\n' > "$FW/.dev/plan/${FWCYC}plan.md"
+check "같은 작업이라도 회차가 다르면 열리지 않는다" 'plan_file' "$(fmiss)"
+rm -f "$FW/.dev/plan/${FWCYC}plan.md"
 rm -f "$FW/.dev/plan/"*.md
 printf '# INDEX\n' > "$FW/.dev/plan/INDEX.md"
 check "누적 인덱스로는 열리지 않는다" 'plan_file' "$(fmiss)"
@@ -1943,9 +1973,14 @@ p5 advance >/dev/null
 printf 'check:\n\t@true\n' > "$PW5/Makefile"
 p5 verify -- make check >/dev/null
 p5 advance >/dev/null
-check "설정한 회고 질문이 제시된다" '무엇을 다시 만들 뻔했나' "$(p5 advance 2>&1)"
+# 회고 패널은 **Compounding 에 진입할 때** 한 번 나온다. 두 단정이 각각 advance 를
+# 부르면 두 번째는 이미 Compounding 이어서 패널이 아예 안 나오고, 그러면 "기본 질문이
+# 없다"가 무조건 통과한다 — 적대적 리뷰가 지적했다. 진입 출력을 한 번 담아 둘 다 본다.
+P5ENTER="$(p5 advance 2>&1 || true)"
+check "설정한 회고 질문이 제시된다" '무엇을 다시 만들 뻔했나' "$P5ENTER"
+check "진입 출력에 회고 패널이 있다" '회고에 답할 것' "$P5ENTER"
 check_empty "기본 질문은 더 이상 나오지 않는다" \
-  "$(p5 advance 2>&1 | grep '무엇이 통했나' || true)"
+  "$(printf '%s' "$P5ENTER" | grep '무엇이 통했나' || true)"
 check "질문이 비면 지적한다" '무엇을 물을지가 없다' \
   "$(p5ed 'cfg["retro_questions"] = []'; p5 status 2>&1)"
 
@@ -2353,6 +2388,58 @@ check "낡은 계획서는 조건을 채우지 못한다" 'plan_file' \
 check "낡은 계획서로 스킵도 안 된다" '기록은 남겨야 한다' \
   "$(aw skip planning --reason '구조 선행' 2>&1)"
 rm -rf "$AW2"
+
+echo "== 내장 조건의 판정 방식을 바꾸면 알린다 (이름과 판정의 어긋남)"
+# 적대적 리뷰가 셋을 실증했고 전부 조용했다.
+#   promotion_decided → file      : 미결 승격이 남아도 회차가 닫힌다
+#   plan_approved → file + "**"   : 접두사만 맞으면 아무 파일이 '사람 승인' 이 된다
+#   plan_file → no_pending_promotions : 산출물 없이 통과한다
+# 엔진에 이름을 다시 박아 금지하지 않는다 — 기본값과 대조해 **말한다.**
+DW="$(mktemp -d)"
+(cd "$DW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+dw() { (cd "$DW" && python3 "$ENGINE" "$@"); }
+dwed() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$DW/.claude/harness/stages.json" "$1"; }
+
+check_empty "기본 설정에는 아무 말도 하지 않는다" \
+  "$(dw status 2>&1 | grep '판정 방식을' || true)"
+dwed 'cfg["criteria"]["promotion_decided"]["satisfied_by"] = "file"
+cfg["criteria"]["promotion_decided"]["write_glob"] = [".dev/retrospect/**/*.md"]'
+check "판정 방식 변경을 말한다" "'no_pending_promotions' → 'file'" "$(dw status 2>&1)"
+dwed 'cfg["criteria"]["plan_approved"]["satisfied_by"] = "file"
+cfg["criteria"]["plan_approved"]["write_glob"] = ["**"]'
+check "글롭이 '**' 로 넓어진 것을 말한다" "'\*\*' 로 넓어졌다" "$(dw status 2>&1)"
+dwed 'cfg["criteria"]["plan_approved"].pop("human", None)'
+check "human 을 뗀 것을 말한다" 'human 표시를 뗐다' "$(dw status 2>&1)"
+# 사용자가 새로 만든 조건은 기본값에 없으므로 아무 말도 하지 않아야 한다 (오진 금지)
+dwed 'cfg["criteria"]["my_own"] = {"satisfied_by": "file",
+      "write_glob": [".dev/plan/**/*.md"], "help": "내 조건"}'
+check_empty "사용자가 만든 조건은 지적하지 않는다" \
+  "$(dw status 2>&1 | grep 'my_own' || true)"
+
+echo "  -- 활성 작업이 없어도 세션 시작에서 알린다"
+NW="$(mktemp -d)"
+(cd "$NW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['write_rules'] = []
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$NW/.claude/harness/stages.json"
+python3 -c "
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM meta WHERE k='head'\"); c.commit()
+" "$NW/.claude/harness/harness.db"
+check "head 가 없어도 설정 문제를 알린다" '무시되는 설정' \
+  "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$NW" \
+     | CLAUDE_PROJECT_DIR="$NW" python3 "$ENGINE" hook)"
+rm -rf "$DW" "$NW"
 
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"

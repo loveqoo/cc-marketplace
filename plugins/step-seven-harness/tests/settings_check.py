@@ -135,12 +135,30 @@ for label, body in (("깨진 JSON", "{not json"),
     shutil.rmtree(root)
 
 # 4) 더할 것이 없으면 파일을 건드리지 않는다
+#
+# `before == after` 만 보면 **같은 내용을 다시 써도 통과한다** — 라벨은 "쓰지 않는다"
+# 인데 검사는 "내용이 같다"였다. 적대적 리뷰가 지적했다. 쓰기 모드로 열리는지 센다.
 root, p = fixture(json.dumps({"permissions": {"allow": list(h.SAFE_PERMS)}}))
 before = _real_open(p, encoding="utf-8").read()
-rc = h.ensure_permissions(root)
+writes = {"n": 0}
+
+
+def counting_open(path, *a, **k):
+    mode = str(a[0]) if a else str(k.get("mode", "r"))
+    if path == p and any(c in mode for c in "wax+"):
+        writes["n"] += 1
+    return _real_open(path, *a, **k)
+
+
+builtins.open = counting_open
+try:
+    rc = h.ensure_permissions(root)
+finally:
+    builtins.open = _real_open
 after = _real_open(p, encoding="utf-8").read()
 ck("이미 다 있으면 0 을 돌려준다", rc == 0, rc)
-ck("이미 다 있으면 파일을 쓰지 않는다", before == after)
+ck("이미 다 있으면 내용이 그대로다", before == after)
+ck("이미 다 있으면 쓰기 모드로 열지 않는다", writes["n"] == 0, writes["n"])
 shutil.rmtree(root)
 
 # 5) 계속 경쟁하면 포기한다 (남의 변경을 덮느니 포기가 낫다)

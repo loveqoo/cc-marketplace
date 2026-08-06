@@ -51,9 +51,7 @@ _MESSAGES = {}
 LANG_ENV = "HARNESS_LANG"
 # 정의 시점에 번역할 수 없어 사용 지점에서 감싸는 상수들. 검사기가 이 목록을 안다.
 LAZY_MSG_NAMES = ("USAGE", "AGENTS_BLOCK", "LEARNED_HEAD", "PROMOTE_AS_DEFAULT",
-                  "SELF_LOCK_MSG", "NEVER_READERS", "SELF_LOCK",
-                  "SATISFIED_BY", "WRITE_SELECTORS", "WRITE_TESTS", "SCHEMA",
-                  "EVENT_KINDS", "STOPWORDS", "TREND_KEYS", "VERDICT_TEXT",
+                  "SELF_LOCK_MSG", "TREND_KEYS", "VERDICT_TEXT",
                   "NO_CYCLES", "WRAPPER", "RECALL_DIRS_DEFAULT",
                   "INDEX_NAMES_DEFAULT", "BASH_READERS_DEFAULT",
                   "BASH_INTERPRETERS_DEFAULT", "SHELL_META", "BASH_MUTATORS")
@@ -446,6 +444,44 @@ def bash_mutator_re(cfg):
         return re.compile(pat) if pat else BASH_MUTATORS
     except re.error:
         return BASH_MUTATORS       # 잘못된 정규식으로 게이트를 열지 않는다
+
+
+def drift_problems(cfg, root):
+    """**내장 조건의 판정 방식이 기본값에서 바뀐 것**을 알린다.
+
+    조건의 이름과 판정 방식은 의미상 묶여 있다. `promotion_decided` 를
+    `satisfied_by: file` 로 바꾸면 미결 승격이 남아 있어도 회차가 닫히고,
+    `plan_approved` 를 `file` + `write_glob: ["**"]` 로 바꾸면 아무 파일이 사람의
+    승인이 된다. 둘 다 적대적 리뷰에서 실증했고 아무 경고가 없었다.
+
+    엔진에 이름을 다시 박아 금지하지는 않는다 — 그건 어휘화를 되돌리는 것이다.
+    대신 **기본값과 대조해 달라진 것을 말한다.** 사용자가 정의한 조건은 기본값에
+    없으므로 아무것도 말하지 않는다(오진 없음).
+    """
+    tpl = jload(os.path.join(plugin_root(), "templates", "stages.json")) \
+        or jload(os.path.join(root, DEFAULTS_REL))
+    if not isinstance(tpl, dict):
+        return []
+    base = tpl.get("criteria") or {}
+    out = []
+    for name, spec in sorted((cfg.obj("criteria") or {}).items()):
+        want = base.get(name)
+        if not isinstance(want, dict) or not isinstance(spec, dict):
+            continue
+        if spec.get("satisfied_by") != want.get("satisfied_by"):
+            out.append(t("criteria.%s 의 판정 방식을 '%s' → '%s' 로 바꿨다 "
+                         "— 이 조건의 이름이 뜻하는 것과 판정이 어긋난다. "
+                         "의도한 것이면 그대로 두어라.")
+                       % (name, want.get("satisfied_by"), spec.get("satisfied_by")))
+        if want.get("human") and not spec.get("human"):
+            out.append(t("criteria.%s 에서 human 표시를 뗐다 — 사람만 채울 수 있던 "
+                         "조건이 모델도 채울 수 있게 된다") % name)
+        # 글롭이 모든 경로로 넓어지면 '그 산출물' 이라는 뜻이 사라진다
+        if "**" in cfg.seq("criteria.%s.write_glob" % name) \
+                and "**" not in (want.get("write_glob") or []):
+            out.append(t("criteria.%s.write_glob 이 '**' 로 넓어졌다 — 이 회차 "
+                         "접두사가 붙은 **아무 파일이나** 이 조건을 채운다") % name)
+    return out
 
 
 def language_problems(root):
@@ -1703,7 +1739,8 @@ def hook_session_start(inp, ctx):
                                   "additionalContext": "\n".join(lines)}}
     # 설정 오타는 **사람에게** 알린다. 모델에게 컨텍스트로 주면 모델이 고치려 들고,
     # stages.json 은 사람의 문서다. 조용히 무시되는 설정이 있다는 사실 자체가 정보다.
-    probs = config_problems(cfg) + language_problems(root)
+    probs = (config_problems(cfg) + drift_problems(cfg, root)
+             + language_problems(root))
     if probs:
         out["systemMessage"] = (t("harness: stages.json 에서 무시되는 설정이 %d건 있다\n  - %s")
                                 % (len(probs), "\n  - ".join(probs[:5])))
@@ -2398,6 +2435,16 @@ def run_hook():
         lid = head_loop(con)
         sid = active_stage(con, lid) if lid else None
         if not lid or not sid:
+            # 활성 작업이 없어도 **설정 문제는 알린다.** 설치 직후나 DB를 지운
+            # 직후가 설정이 어긋났는지 가장 중요한 시점인데, 예전에는 여기서 조용히
+            # 빠져나가 아무 말도 하지 않았다. 적대적 리뷰가 지적했다.
+            if inp.get("hook_event_name") == "SessionStart":
+                probs = (config_problems(cfg) + drift_problems(cfg, root)
+                         + language_problems(root))
+                if probs:
+                    emit({"systemMessage":
+                          t("harness: stages.json 에서 무시되는 설정이 %d건 있다\n  - %s")
+                          % (len(probs), "\n  - ".join(probs[:5]))})
             return 0
         pid = inp.get("prompt_id")
         if pid:
@@ -2631,7 +2678,8 @@ def render_status(d, cfg):
 
 def cli_status(ctx, argv):
     data = status_report(ctx)
-    probs = config_problems(ctx.cfg) + language_problems(ctx.root)
+    probs = (config_problems(ctx.cfg) + drift_problems(ctx.cfg, ctx.root)
+             + language_problems(ctx.root))
     if probs:
         data["config_problems"] = probs
     dump_json(data) if "--json" in argv else render_status(data, ctx.cfg)

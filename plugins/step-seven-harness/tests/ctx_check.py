@@ -20,12 +20,36 @@ REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
 SRC = os.path.join(REPO, "plugins/step-seven-harness/scripts/harness.py")
 
 
+def own_scope(fn):
+    """fn 자신의 스코프에 속한 노드만. **중첩 함수 안으로 내려가지 않는다.**
+
+    `ast.walk` 로 전부 훑으면 중첩 함수의 대입을 바깥 함수의 바인딩으로 센다.
+    그러면 아래가 통과했다 — 적대적 리뷰가 지적하고 실증했다.
+
+        def hook_x(inp, ctx):
+            def helper():
+                root = "..."      # 여기서만 대입
+            print(root)           # 바깥은 풀지 않았다 → NameError
+
+    이 검사기가 잡는 것이 바로 그 부류(다섯 번 걸렸다)이므로 이 구멍은 치명적이다.
+    """
+    out = []
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue                      # 별도 스코프다
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
 def names_bound(fn):
-    """그 함수 안에서 이름이 묶이는 것들 (인자 + 대입 + 루프 변수)."""
+    """그 함수 **자신의 스코프**에서 이름이 묶이는 것들 (인자 + 대입 + 루프 변수)."""
     out = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
     if fn.args.vararg:
         out.add(fn.args.vararg.arg)
-    for n in ast.walk(fn):
+    for n in own_scope(fn):
         if isinstance(n, ast.Assign):
             for t in n.targets:
                 if isinstance(t, ast.Name):
