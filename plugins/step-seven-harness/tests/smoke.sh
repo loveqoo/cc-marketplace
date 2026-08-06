@@ -2596,6 +2596,92 @@ sfed "cfg['criteria']['verification_evidence']['bash_pattern'] = '\\\\btrue\\\\b
 check "true 를 증거로 삼는 패턴도 잡는다" 'true' "$(sf status 2>&1)"
 rm -rf "$SF"
 
+echo "== 탐침이 조용히 무력해지지 않는다"
+# 4차 리뷰가 찾은 것. 탐침에 고정한 단계가 없으면 **조용히 현재 단계로 폴백**해
+# 구분력을 잃었다 — stage_write 가 대신 막아 죽은 규칙을 가린 채 통과했다.
+# 그리고 관측 신호 셋(bash_pattern·tools·tool_pattern) 중 하나만 탐침하고 있었다.
+S4W="$(mktemp -d)"
+(cd "$S4W" && git init -q . && python3 "$ENGINE" init >/dev/null)
+s4() { (cd "$S4W" && python3 "$ENGINE" "$@"); }
+s4ed() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$S4W/.claude/harness/stages.json" "$1"; }
+
+check "정상이면 전부 통과" '자기검사: [0-9]*/[0-9]* 통과' "$(s4 status 2>&1)"
+# 고정 단계를 없애면 (단계 id 를 바꾸면) 폴백하지 않고 실패로 보고해야 한다
+s4ed '
+for st in cfg["stages"]:
+    if st["id"] == "scaffolding":
+        st["id"] = "x_scaffolding"
+cfg["folder_rules"]["new_toplevel_dir_stages"] = ["x_scaffolding"]'
+check "고정 단계가 없으면 실패로 보고한다" '탐침을 돌릴 수 없다' "$(s4 status 2>&1)"
+check "어느 단계가 없는지 말한다" "scaffolding" "$(s4 status 2>&1)"
+
+echo "  -- 관측 신호 셋을 전부 탐침한다"
+S4B="$(mktemp -d)"
+(cd "$S4B" && git init -q . && python3 "$ENGINE" init >/dev/null)
+s4b() { (cd "$S4B" && python3 "$ENGINE" "$@"); }
+s4bed() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$S4B/.claude/harness/stages.json" "$1"; }
+s4bed 'cfg["criteria"]["verification_evidence"]["tools"] = ["Read"]'
+check "무해한 도구를 증거로 세면 잡는다" '무해한 도구도 증거: Read' "$(s4b status 2>&1)"
+s4bed 'cfg["criteria"]["verification_evidence"]["tools"] = ["Agent", "Task"]
+cfg["criteria"]["verification_evidence"]["tool_pattern"] = ".*"'
+check "도구 패턴이 너무 넓으면 잡는다" '무해한 도구에도 걸린다' "$(s4b status 2>&1)"
+rm -rf "$S4W" "$S4B"
+
+echo "== 사본은 마지막이다 (플러그인 → 캐시 → 사본)"
+# 고정 경로가 사라진 순간 사본이 먼저 실행되면, 그 사본은 사전 승인돼 있으므로
+# 승인 없는 임의 코드 실행이 된다 — 4차 리뷰가 지적했다. 캐시 탐색이 먼저다.
+WO="$(mktemp -d)"
+(cd "$WO" && git init -q . && python3 "$ENGINE" init >/dev/null)
+check "래퍼가 캐시를 사본보다 먼저 찾는다" '^0$' \
+  "$(python3 -c "
+import sys
+s = open(sys.argv[1], encoding='utf-8').read()
+cache = s.index('plugins/cache')
+copy = s.index('P=\"\$D/harness.py\"')
+print(0 if cache < copy else 1)" "$WO/.claude/harness/bin/harness")"
+rm -rf "$WO"
+
+echo "== 회고 키 확인은 작업 전체를 읽는다 (창을 맞춘다)"
+# 키는 시간창(마지막 회차 종료 이후)에서 오는데 파일은 접두사창(이번 회차)에서 왔다.
+# loop adopt 가 회차만 올리므로 두 창이 갈라져 이미 적어둔 키가 '못 찾음' 이 됐다.
+RK="$(mktemp -d)"
+(cd "$RK" && git init -q . && python3 "$ENGINE" init >/dev/null)
+rk() { (cd "$RK" && python3 "$ENGINE" "$@"); }
+rk loop intent "창 맞추기" >/dev/null
+rk loop done-when "끝" >/dev/null
+RKL="$(rk status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["loop"])')"
+mkdir -p "$RK/.dev/retrospect"
+printf '# 회고\nfakerule 를 이렇게 피했다\n' > "$RK/.dev/retrospect/${RKL}-1-r.md"
+python3 -c "
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1]); n = time.strftime('%Y-%m-%dT%H:%M:%S+0900')
+c.execute('INSERT INTO event(loop_id,stage,kind,rule,target,at) VALUES(?,?,?,?,?,?)',
+          (sys.argv[2], 'execution', 'block', 'fakerule', 'f.py', n))
+c.commit()" "$RK/.claude/harness/harness.db" "$RKL"
+rk loop adopt "$RKL" --reason '재연결' >/dev/null
+check "재연결 후에도 1회차 회고에서 키를 찾는다" '^ok$' \
+  "$(cd "$RK" && python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join('$(cd "$(dirname "$ENGINE")" && pwd)'))
+import harness as h
+root = os.getcwd(); con = h.connect(root); cfg = h.load_config(root)
+lid = h.head_loop(con)
+keys, found, missing = h.retro_key_report(con, cfg, root, lid, h.cycle_window_start(con, lid))
+print('ok' if ('block:fakerule' in found or 'fakerule' in found) else 'missing=%s' % missing)")"
+rm -rf "$RK"
+
 echo "== 검사기를 검사한다: 규칙을 죽이면 자기검사가 알아채야 한다"
 # 자기검사가 주 신뢰 장치가 됐으니, **탐침 누락**이 곧 조용한 구멍이다. 그것을 내
 # 판단으로 지키면 또 놓친다(세 라운드가 그랬다). 규칙마다 죽여 보고 알아채는지

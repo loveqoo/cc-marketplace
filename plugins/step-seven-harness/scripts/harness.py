@@ -52,6 +52,7 @@ LANG_ENV = "HARNESS_LANG"
 # 정의 시점에 번역할 수 없어 사용 지점에서 감싸는 상수들. 검사기가 이 목록을 안다.
 LAZY_MSG_NAMES = ("USAGE", "AGENTS_BLOCK", "LEARNED_HEAD", "PROMOTE_AS_DEFAULT",
                   "SELFTEST", "UNRELATED", "NOT_VERIFICATION",
+                  "INNOCUOUS_TOOLS",
                   "SELF_LOCK_MSG", "TREND_KEYS", "VERDICT_TEXT",
                   "NO_CYCLES", "WRAPPER", "RECALL_DIRS_DEFAULT",
                   "INDEX_NAMES_DEFAULT", "BASH_READERS_DEFAULT",
@@ -465,7 +466,9 @@ def install_problems(root):
         rp = os.path.realpath(root)
     except Exception:
         return []
-    if pr == rp or pr.startswith(rp + os.sep):
+    # macOS·Windows 는 대소문자를 구분하지 않으므로 normcase 로 비교한다.
+    prn, rpn = os.path.normcase(pr), os.path.normcase(rp)
+    if prn == rpn or prn.startswith(rpn + os.sep):
         return [t("플러그인 엔진이 프로젝트 안에 있다 (%s) — 이 설치 형태에서는 "
                   "모델이 훅 엔진을 고칠 수 있으므로 자기 잠금을 신뢰할 수 없다. "
                   "개발 중이면 정상이다.") % os.path.relpath(pr, rp)]
@@ -1159,6 +1162,27 @@ def cycle_search_keys(con, lid, lo, limit=6):
     return keys[:limit]
 
 
+def retro_files_of_loop(con, cfg, root, lid):
+    """이 **작업**의 회고·학습 파일 (회차를 가리지 않는다).
+
+    회차별로 좁히는 것은 `retro_files_of_cycle` 이다. 둘을 구분하는 이유는 질문이
+    다르기 때문이다 — "이번 회차가 회고를 썼나" 와 "이 키가 나중에 찾아지나".
+    """
+    out = []
+    for sub in recall_dirs(cfg):
+        d = os.path.join(root, ".dev", sub)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if n.startswith(lid + "-") and os.path.isfile(os.path.join(d, n)):
+                out.append(os.path.join(d, n))
+    return out
+
+
 def retro_files_of_cycle(con, cfg, root, lid):
     """이 회차가 쓴 회고·학습 파일. 파일명 접두사로 가른다."""
     pre = file_prefix(con, lid)
@@ -1182,8 +1206,12 @@ def retro_key_report(con, cfg, root, lid, lo):
     keys = cycle_search_keys(con, lid, lo)
     if not keys:
         return [], [], []
+    # **검색 키의 창과 파일의 창을 맞춘다.** 키는 시간창(마지막 회차 종료 이후)에서
+    # 오는데 파일은 접두사창(이번 회차)에서 왔다. `loop adopt` 가 회차만 올리고 측정
+    # 창은 건드리지 않으므로 두 창이 갈라져, 이미 적어둔 키가 "못 찾음" 으로 나왔다 —
+    # 4차 리뷰가 지적했다. 이 확인의 질문은 "나중에 찾아지나" 이므로 작업 전체가 맞다.
     hay = ""
-    for path in retro_files_of_cycle(con, cfg, root, lid):
+    for path in retro_files_of_loop(con, cfg, root, lid):
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 hay += "\n" + fh.read(recall_read_bytes(cfg)).lower()
@@ -2608,15 +2636,20 @@ WRAPPER = """#!/bin/sh
 # 사본은 원본이 없을 때의 폴백일 뿐이다 — 모델이 치는 명령은 여전히 작업 디렉터리
 # 안의 이 래퍼이므로 분류기·샌드박스 문제도 생기지 않는다.
 D="$(cd "$(dirname "$0")" && pwd)"
+# 1) 이 래퍼를 쓴 그 엔진. 2) 없으면 플러그인 캐시의 최신 것. 3) 그래도 없으면 사본.
+#
+# **사본은 마지막이다.** 순서를 2와 3 사이에 두면, 플러그인이 업데이트돼 고정 경로가
+# 사라진 순간 사본이 먼저 실행된다 — 그 사본은 사전 승인돼 있으므로 승인 없는 임의
+# 코드 실행이 된다. 4차 리뷰가 지적했고 맞다. 캐시 탐색을 먼저 한다.
 P="%s"
-if [ ! -f "$P" ]; then P="$D/harness.py"; fi
 if [ ! -f "$P" ]; then
   # 정확한 이름을 먼저, 그다음 이름에 덜 묶인 glob. 플러그인 이름이 바뀌어도
-  # (6->7 단계처럼) 마지막 폴백이 살아 있다. 여러 개면 최신 것을 쓴다.
+  # (6->7 단계처럼) 이 폴백이 살아 있다. 여러 개면 최신 것을 쓴다.
   P="$(ls -t "$HOME"/.claude/plugins/cache/*/step-seven-harness/*/scripts/harness.py \
              "$HOME"/.claude/plugins/cache/*/*harness*/*/scripts/harness.py \
              2>/dev/null | head -1)"
 fi
+if [ ! -f "$P" ]; then P="$D/harness.py"; fi
 [ -f "$P" ] || { echo "step-seven-harness: engine not found" >&2; exit 1; }
 exec python3 "$P" "$@"
 """
@@ -2798,6 +2831,8 @@ SELFTEST = (
 UNRELATED = ("src/a.py", "README.md", ".claude/settings.json", "Makefile")
 # 검증 증거로 인정되면 안 되는 명령. 텍스트를 읽지 않고 넣어 본다.
 NOT_VERIFICATION = ("ls", "echo hi", "true", "cat README.md", "git status", "pwd")
+# 이 도구를 썼다는 사실만으로 검증이 됐다고 볼 수 없다. 읽기·탐색은 검증이 아니다.
+INNOCUOUS_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "TodoWrite")
 
 
 def selftest_criteria(cfg):
@@ -2813,16 +2848,33 @@ def selftest_criteria(cfg):
             out.append((t("%s 는 무관한 파일을 받지 않는다") % name, not hits,
                         t("무관한 경로도 받는다: %s") % ", ".join(hits) if hits
                         else t("자기 산출물만 받는다")))
-        if name == "verification_evidence":
+        if spec.get("satisfied_by") == "observed":
+            # 신호는 셋이다 — bash_pattern·tools·tool_pattern. 손으로 하나만
+            # 탐침했더니 `tools: ["Read"]` 로 아무 도구가 증거가 되는 길이 열려
+            # 있었다(4차 리뷰). **설정에 있는 신호를 훑어** 전부 탐침한다.
             pat = spec.get("bash_pattern")
             try:
                 vre = re.compile(pat) if pat else None
             except re.error:
                 vre = None
             hits = [c for c in NOT_VERIFICATION if vre and vre.search(c)]
-            out.append((t("검증 증거는 검증 명령만 인정한다"), not hits,
+            out.append((t("%s 는 검증 명령만 인정한다") % name, not hits,
                         t("검증이 아닌 명령도 인정: %s") % ", ".join(hits) if hits
                         else t("검증 명령만 인정한다")))
+            tools = [x for x in cfg.seq("criteria.%s.tools" % name)
+                     if x in INNOCUOUS_TOOLS]
+            out.append((t("%s 는 무해한 도구를 증거로 세지 않는다") % name, not tools,
+                        t("무해한 도구도 증거: %s") % ", ".join(tools) if tools
+                        else t("검증 도구만 인정한다")))
+            tp = spec.get("tool_pattern")
+            try:
+                tre = re.compile(tp) if tp else None
+            except re.error:
+                tre = None
+            thits = [x for x in INNOCUOUS_TOOLS if tre and tre.search(x)]
+            out.append((t("%s 의 도구 패턴이 너무 넓지 않다") % name, not thits,
+                        t("무해한 도구에도 걸린다: %s") % ", ".join(thits) if thits
+                        else t("검증 도구만 걸린다")))
     return out
 
 
@@ -2840,7 +2892,14 @@ def selftest(ctx):
         tgt = target.replace("<PREFIX>", pre)
         # 단계가 지정됐고 그 단계가 존재하면 그 단계로 판정한다. 없으면 현재 단계.
         probe_ctx = ctx
-        if at_stage and at_stage in ids and at_stage != sid:
+        if at_stage and at_stage not in ids:
+            # **조용히 현재 단계로 떨어지지 않는다.** 그러면 그 탐침이 구분력을 잃고
+            # (stage_write 가 대신 막아) 죽은 규칙을 가린 채 통과한다 — 4차 리뷰가
+            # 지적했다. 돌릴 수 없다는 사실 자체가 결과다.
+            out.append((label, False,
+                        t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % at_stage))
+            continue
+        if at_stage and at_stage != sid:
             probe_ctx = Ctx(con, cfg, root, lid, at_stage)
         try:
             if kind in ("write", "grant"):
