@@ -26,7 +26,7 @@ cfg = h.load_config(root, os.path.join(REPO, "plugins/step-seven-harness"))
 LID = h.head_loop(con)
 OTHER = "260101-aaaaaa"
 
-T0 = "2026-03-01T00:00:00+0900"          # 창 시작
+T0 = "2026-03-01T00:00:00+0900"          # 회차 경계 (cycle_close)
 BEFORE = "2026-02-01T00:00:00+0900"      # 창 이전
 IN = "2026-03-05T00:00:00+0900"          # 창 안
 
@@ -39,9 +39,16 @@ ev(BEFORE, LID, "tool_fail", "Bash", "npm test")
 ev(BEFORE, LID, "block", "old_rule", "z.md")
 ev(BEFORE, OTHER, "tool_fail", "Bash", "go test")   # 다른 작업에서 실패한 이력
 
+# --- 회차 경계. 창은 이제 시각이 아니라 **이 이벤트의 id** 로 나뉜다.
+# 경계 이벤트를 실제로 넣는 것이 예전의 합성 epoch 보다 진짜 동작에 가깝다.
+ev(T0, LID, "cycle_close", "1", "%s-1" % LID)
+# 경계와 **같은 초**에 일어난 다음 회차의 이벤트. 예전에는 +1초 배타 경계 때문에
+# 어느 회차에도 속하지 못하고 영영 사라졌다 (5차 리뷰 MEDIUM).
+ev(T0, LID, "block", "same_second", "s.md")
+
 # --- 창 안, 우리 작업
 for r in ("a", "b", "a"):
-    ev(IN, LID, "block", r, "f.md")                 # blocks 3
+    ev(IN, LID, "block", r, "f.md")                 # blocks 3 (+경계 같은 초 1)
 for _ in range(2):
     ev(IN, LID, "tool_fail", "Bash", "npm test")    # 둘 다 재발(창 이전에 있었음)
 for _ in range(3):
@@ -66,7 +73,7 @@ for _ in range(9):
 con.commit()
 
 EXPECT = {                # 손계산
-    "blocks": 3,
+    "blocks": 4,          # f.md 3 + 경계와 같은 초의 s.md 1
     "fails": 6,           # npm2 + cargo3 + go1
     "refails": 5,         # npm2 + cargo2 + go1
     "churn": 4,           # x.py 4회
@@ -77,8 +84,10 @@ EXPECT = {                # 손계산
     "declines": 2,
     "promotes": 1,
 }
-# cycle_counters 는 이제 epoch 를 받는다 (경계 처리가 cycle_window_start 안에 있다)
-got = h.cycle_counters(con, LID, h.ts_epoch(T0))
+# cycle_counters 는 이제 **event id** 를 받는다 (경계 처리가 cycle_window_start 안에 있다)
+LO = h.cycle_window_start(con, LID)
+assert LO, "회차 경계 이벤트를 찾지 못했다"
+got = h.cycle_counters(con, LID, LO)
 print("cycle_counters")
 bad = []
 for k, want in sorted(EXPECT.items()):

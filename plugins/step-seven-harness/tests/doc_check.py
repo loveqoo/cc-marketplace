@@ -14,6 +14,7 @@
      적혀 있었고, 모델은 그 문장을 **정확히 따라** 틀린 단계를 보고했다. 환각이 아니라
      내가 준 낡은 문서를 읽은 것이다.
 """
+import json
 import os
 import re
 import sys
@@ -56,7 +57,6 @@ def prose_lines(path):
 
 def stage_labels():
     """stages.json 이 말하는 실제 번호. 이것이 단일 출처다."""
-    import json
     cfg = json.load(open(os.path.join(REPO, STAGES_JSON), encoding="utf-8"))
     n = len(cfg["stages"])
     return {s["label"]: "%d/%d" % (i + 1, n) for i, s in enumerate(cfg["stages"])}
@@ -103,6 +103,29 @@ def main():
 
         print("  %-52s 산문 %3d줄, 중복 %d, 링크 %d"
               % (rel, len(prose_lines(path)), len(dups), len(LINK_RE.findall(body))))
+
+    # 훅 예산과 SQLite 잠금 대기가 어긋나면 잠금을 기다리다 프로세스가 강제 종료되고,
+    # 그러면 fail-open 경고조차 나오지 않는다 — 사용자는 게이트가 꺼진 줄도 모른다.
+    # 두 값은 **다른 파일**에 있으므로 여기서 대조한다.
+    sys.path.insert(0, os.path.join(REPO, "plugins/step-seven-harness/scripts"))
+    import harness as eng
+    hooks = json.load(open(os.path.join(REPO, "plugins/step-seven-harness",
+                                        "hooks", "hooks.json"), encoding="utf-8"))
+    touts = [hk.get("timeout") for grp in hooks["hooks"].values()
+             for entry in grp for hk in entry["hooks"]]
+    off = [x for x in touts if x != eng.HOOK_TIMEOUT_S]
+    print("  hooks.json timeout %d개 = HOOK_TIMEOUT_S(%d)   %s"
+          % (len(touts), eng.HOOK_TIMEOUT_S, "ok" if not off else "FAIL %s" % off))
+    if off:
+        bad.append("hooks.json 의 timeout %s 가 HOOK_TIMEOUT_S(%d) 와 다르다"
+                   % (off, eng.HOOK_TIMEOUT_S))
+    fits = eng.DB_WAIT_S * 2 <= eng.HOOK_TIMEOUT_S
+    print("  잠금 대기(%ds)가 훅 예산(%ds) 안에 든다        %s"
+          % (eng.DB_WAIT_S, eng.HOOK_TIMEOUT_S, "ok" if fits else "FAIL"))
+    if not fits:
+        bad.append("DB_WAIT_S(%d) 가 훅 예산(%d)에 비해 크다 — 잠금 대기 중 "
+                   "강제 종료되면 fail-open 경고도 못 낸다"
+                   % (eng.DB_WAIT_S, eng.HOOK_TIMEOUT_S))
 
     if bad:
         print("\n문제 %d건" % len(bad))

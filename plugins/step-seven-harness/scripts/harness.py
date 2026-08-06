@@ -258,7 +258,15 @@ def jload(path, default=None):
 
 
 def find_root(cwd):
-    """harness.db 를 가진 가장 가까운 조상 디렉터리."""
+    """설치된 프로젝트의 루트. **DB 가 없어도 설치는 설치다.**
+
+    예전에는 `harness.db` 만 찾았다. 그래서 DB 파일이 지워지면 하네스는 이 프로젝트를
+    '설치 안 함' 으로 보고 **아무 말 없이 모든 게이트를 껐다.** 설치하지 않은 것과
+    고장 난 것은 다르고, 둘을 같게 다루면 고장이 침묵이 된다.
+
+    설치의 표식은 사람의 문서(`stages.json`)다 — 그것이 있으면 이 프로젝트는 하네스를
+    쓰기로 한 것이고, DB 가 없다는 사실은 `inactive()` 가 소리 내어 말한다.
+    """
     cands = []
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env:
@@ -269,7 +277,7 @@ def find_root(cwd):
     for cand in cands:
         d = os.path.abspath(os.path.expanduser(cand))
         while True:
-            if os.path.isfile(os.path.join(d, DB_REL)):
+            if any(os.path.isfile(os.path.join(d, m)) for m in (DB_REL, CONFIG_REL)):
                 return d
             parent = os.path.dirname(d)
             if parent == d:
@@ -280,6 +288,12 @@ def find_root(cwd):
 
 # 나중에 더해진 열. `CREATE TABLE IF NOT EXISTS` 는 **기존 표에 열을 더하지 못한다.**
 # 여기 적고 연결할 때마다 맞춘다 — "재실행이 곧 스키마 갱신" 이라는 성질을 유지한다.
+# 훅 하나에 허용된 시간. `hooks/hooks.json` 의 timeout 과 같아야 한다 (doc_check 가 본다).
+HOOK_TIMEOUT_S = 10
+# SQLite 잠금 대기. **훅 예산보다 넉넉히 작아야 한다** — 잠금을 기다리다 프로세스가
+# 강제 종료되면 fail-open 경고조차 내지 못하고, 사용자는 게이트가 꺼진 줄도 모른다.
+DB_WAIT_S = 4
+
 ADDED_COLUMNS = (("evidence", "digest", "TEXT"),)
 
 
@@ -296,10 +310,10 @@ def connect(root, create=False):
     if not create and not os.path.isfile(path):
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    con = sqlite3.connect(path, timeout=10.0)
+    con = sqlite3.connect(path, timeout=float(DB_WAIT_S))
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=10000")
+    con.execute("PRAGMA busy_timeout=%d" % (DB_WAIT_S * 1000))
     try:
         migrate(con)
         con.commit()
@@ -798,6 +812,17 @@ def git_branch(root):
         return None
 
 
+def claim(con, sql, params):
+    """조건부 UPDATE 로 **한 번만** 일어나는 일을 차지한다. 이겼으면 True.
+
+    읽고-판단하고-쓰면 병렬 훅이 같은 자원을 여러 번 쓴다. `--uses 1` 예외를 넷이
+    동시에 쓰고 `uses_left` 가 -3 이 되는 것을 재현했고, 같은 모양이 자동 승인 횟수와
+    단계 전이에도 있었다. SQLite 의 조건부 UPDATE 는 원자적이므로 **rowcount 가
+    승자를 정한다** — 판단을 WHERE 절 안으로 옮기는 것이 요점이다.
+    """
+    return con.execute(sql, params).rowcount > 0
+
+
 def get_meta(con, k, default=None):
     row = con.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
     return row["v"] if row else default
@@ -890,15 +915,26 @@ def norm_cmd(cmd):
 
 
 def events_where(con, kinds=None, loop_id=None, rule=None, target=None,
-                 from_epoch=None, to_epoch=None):
-    """이벤트를 고른다. 시각 경계는 **절대 시각**으로만 비교한다.
+                 from_epoch=None, to_epoch=None, after_id=None, upto_id=None):
+    """이벤트를 고른다.
+
+    ## 회차 경계는 시각이 아니라 **id** 로 나눈다
+
+    시각은 초 단위라 같은 초에 일어난 두 사건의 순서를 말하지 못한다. 그래서 회차
+    경계에 `+1초` 를 두었고, 그 1초 안에 일어난 다음 회차의 이벤트는 **어느 회차에도
+    속하지 못하고 영영 사라졌다.** `id` 는 단조 증가하므로 그 문제가 없다 —
+    순서를 시각으로 판정하지 말고 정체성으로 판정한다.
+
+    `from_epoch`/`to_epoch` 는 승격 재발 판정처럼 event 가 아닌 것(promotion.at)을
+    기준으로 삼는 자리에만 남는다.
 
     이 함수가 없을 때는 같은 관용구가 네 곳에 복붙돼 있었고, 그중 두 곳이
     SQL 문자열 비교를 쓰고 있었다. 오프셋 유무나 공백 구분 형식이 섞이면
     사전순과 실제 순서가 어긋나서 창 밖의 이벤트가 안으로 들어온다 —
     두 릴리스에 걸쳐 같은 버그를 두 번 냈다. 경계 판정은 여기 한 곳에만 있다.
     """
-    sql = ["SELECT at, loop_id, stage, kind, rule, target, detail FROM event WHERE 1=1"]
+    sql = ["SELECT id, at, loop_id, stage, kind, rule, target, detail "
+           "FROM event WHERE 1=1"]
     params = []
     if kinds:
         sql.append("AND kind IN (%s)" % ",".join("?" * len(kinds)))
@@ -907,6 +943,13 @@ def events_where(con, kinds=None, loop_id=None, rule=None, target=None,
         if val is not None:
             sql.append("AND IFNULL(%s,'-') = ?" % col)
             params.append(val)
+    if after_id is not None:
+        sql.append("AND id > ?")
+        params.append(after_id)
+    if upto_id is not None:
+        sql.append("AND id <= ?")
+        params.append(upto_id)
+    sql.append("ORDER BY id")
     rows = con.execute(" ".join(sql), params).fetchall()
     if from_epoch is None and to_epoch is None:
         return rows
@@ -1140,28 +1183,30 @@ def pending_promotions(con, cfg, limit=None):
 # "no such column" 으로 하네스가 죽는 일이 없다.
 
 def cycle_window_start(con, lid):
-    """이번 회차 창의 시작 **epoch**. `>=` 로 비교한다.
+    """이번 회차 창의 시작 — **직전 회차 종료 이벤트의 id** (배타적 하한).
 
-    시각 정밀도가 초 단위라 경계 처리가 필요하다. 회차 종료 기록이 있으면 그
-    시각을 **배타적**으로 둔다(+1초) — 같은 초에 남은 이벤트는 앞 회차의 사실이고,
-    포함시키면 한 회차의 마지막 이벤트가 다음 회차 창에 겹쳐 두 번 세어진다.
-    회차 종료 기록이 없으면(1회차) 작업 생성 시각을 포함한다.
+    1회차에는 종료 기록이 없으므로 0 이다 (`loop_id` 로 이미 이 작업만 걸러진다).
     """
     row = con.execute(
-        "SELECT MAX(at) a FROM event WHERE loop_id=? AND kind='cycle_close'",
+        "SELECT MAX(id) i FROM event WHERE loop_id=? AND kind='cycle_close'",
         (lid,)).fetchone()
-    if row and row["a"]:
-        return ts_epoch(row["a"]) + 1
-    row = con.execute("SELECT created_at FROM loop WHERE id=?", (lid,)).fetchone()
-    return ts_epoch(row["created_at"] if row else None)
+    return (row["i"] or 0) if row else 0
+
+
+def cycle_seconds(con, lo):
+    """회차 창이 열린 뒤 흐른 초. 창 시작이 id 가 됐으므로 시각은 그 행에서 읽는다."""
+    if not lo:
+        return 0
+    row = con.execute("SELECT at FROM event WHERE id=?", (lo,)).fetchone()
+    return max(0, int(time.time() - ts_epoch(row["at"]))) if row else 0
 
 
 def cycle_counters(con, lid, lo):
     """이 회차의 마찰 수치. 회피 지표를 반드시 함께 담는다 — 차단만 보면 속는다.
 
-    `lo` 는 cycle_window_start 가 준 epoch 다 (경계 처리가 거기 들어 있다).
+    `lo` 는 cycle_window_start 가 준 event id 다 (배타적 하한).
     """
-    rows = events_where(con, loop_id=lid, from_epoch=lo)
+    rows = events_where(con, loop_id=lid, after_id=lo)
     tally = {}
     for r in rows:
         tally[r["kind"]] = tally.get(r["kind"], 0) + 1
@@ -1178,10 +1223,12 @@ def cycle_counters(con, lid, lo):
         if r["kind"] == "edit":
             edits[r["target"]] = edits.get(r["target"], 0) + 1
 
-    # 반복 실패: 이 회차의 실패 중 그 명령이 **이전에도** 실패한 적 있는 것.
-    # 작업 경계를 넘어 센다 — 지난 작업에서 실패한 명령이 또 실패하는 것이 요점이다.
+    # 반복 실패 = 이 회차의 실패 중, 같은 명령이 **앞서 이미 한 번 실패한** 것.
+    # '앞서' 는 이전 회차·이전 작업뿐 아니라 **이 회차 안의 앞선 실패**도 포함한다.
+    # 같은 명령을 두 번 깨뜨린 것은 회차 경계와 무관하게 반복이기 때문이다.
+    # (설명이 "이전 회차에도" 로 읽혀 오해를 샀다 — 세는 방식이 아니라 말이 틀렸다.)
     seen_before = {r["target"] for r in
-                   events_where(con, kinds=("tool_fail",), to_epoch=lo)}
+                   events_where(con, kinds=("tool_fail",), upto_id=lo)}
     refails, seen_now = 0, set()
     for r in rows:
         if r["kind"] != "tool_fail":
@@ -1191,7 +1238,7 @@ def cycle_counters(con, lid, lo):
         seen_now.add(r["target"])
 
     return {
-        "dur": max(0, int(time.time() - lo)) if lo else 0,
+        "dur": cycle_seconds(con, lo),
         "blocks": tally.get("block", 0),
         "fails": tally.get("tool_fail", 0),
         "refails": refails,
@@ -1236,7 +1283,7 @@ def promote_change_seen(con, cfg, lid, as_kind):
         return None
     excl = cfg.seq("promotion.verify_exclude")
     for r in events_where(con, kinds=("edit",), loop_id=lid,
-                          from_epoch=cycle_window_start(con, lid)):
+                          after_id=cycle_window_start(con, lid)):
         rel = r["target"] or ""
         if any(glob_match(rel, p) for p in excl):
             continue
@@ -1265,7 +1312,7 @@ def cycle_search_keys(con, lid, lo, limit=6):
     """
     keys = []
     for r in events_where(con, kinds=("tool_fail", "block"), loop_id=lid,
-                          from_epoch=lo):
+                          after_id=lo):
         k = r["target"] if r["kind"] == "tool_fail" else r["rule"]
         if k and k not in keys:
             keys.append(k)
@@ -2192,15 +2239,16 @@ def auto_skip_uses_left(con):
 
 
 def consume_auto_skip(con):
-    """자동 승인 1회 소진. 남은 횟수(무제한이면 None)를 돌려준다."""
-    left = auto_skip_uses_left(con)
-    if left is None:
-        return None
-    left = max(0, left - 1)
-    set_meta(con, "auto_skip_uses", str(left))
-    # 플래그는 사용자의 의도를 담고, 실효 상태는 auto_skip_state 가 계산한다.
-    # 여기서 'off' 로 뒤집으면 "왜 꺼졌는지"를 잃는다.
-    return left
+    """자동 승인 1회 소진. (차지했나, 남은 횟수) — 무제한이면 (True, None).
+
+    플래그는 사용자의 의도를 담고 실효 상태는 `auto_skip_state` 가 계산한다.
+    여기서 'off' 로 뒤집으면 "왜 꺼졌는지"를 잃는다.
+    """
+    if auto_skip_uses_left(con) is None:
+        return True, None            # 무제한 — 차지할 것이 없다
+    won = claim(con, "UPDATE meta SET v = CAST(CAST(v AS INTEGER) - 1 AS TEXT) "
+                     "WHERE k='auto_skip_uses' AND CAST(v AS INTEGER) > 0", ())
+    return won, auto_skip_uses_left(con)
 
 
 def auto_skip_scope_note(con):
@@ -2442,16 +2490,20 @@ def hook_pre_tool_use(inp, ctx):
         # 래퍼는 사전 승인돼 있으므로 **내용이 우리 것일 때만** 실행돼야 한다.
         # 이 검사를 모든 Bash 앞에 두는 이유: 변조는 앞선 호출에서 이미 끝나 있고,
         # 이 명령이 래퍼를 부르는지 아닌지를 정확히 아는 것도 셸 파싱이다.
-        if not wrapper_intact(root):
+        wrap = wrapper_intact(root)
+        if wrap is not True:
+            restored = (t("원본으로 복구했다 — 다시 실행하면 통한다.")
+                        if wrap is not None
+                        else t("복구도 하지 못했다 (쓰기 실패). 권한이나 파일시스템을 "
+                               "확인하라 — 고칠 때까지 이 경로는 실행되지 않는다."))
             with con:
                 record_event(con, lid, sid, "block", "wrapper_tampered",
                              WRAPPER_CMD, cmd[:200])
             return emit(pre_decision("deny", (
                 t("`%s` 의 내용이 하네스가 쓴 것과 다르다. 이 경로는 "
                   "`.claude/settings.json` 에 **사전 승인**돼 있어서, 내용이 바뀌면 "
-                  "승인 없이 임의 코드가 실행된다. 그래서 실행하지 않고 원본으로 "
-                  "복구했다 — 다시 실행하면 통한다. 래퍼를 바꿔야 한다면 플러그인의 "
-                  "`WRAPPER` 를 고쳐라.") % WRAPPER_CMD)))
+                  "승인 없이 임의 코드가 실행된다. 그래서 실행하지 않았다. %s")
+                % (WRAPPER_CMD, restored))))
 
         reqs = ctrl_requests(cmd)
         for req_sub, seg in reqs:
@@ -2912,11 +2964,17 @@ def run_hook():
                             % WRAPPER_CMD)
         cfg = load_config(root, plugin_root())
         load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
-        if not isinstance(cfg, dict) or not cfg.get("stages"):
-            # 손상된 문서를 템플릿으로 갈아치우지는 않는다 — 덜어낸 규칙이 되살아난다.
-            return inactive(t("`%s` 를 읽을 수 없다 (JSON 문법을 확인하라)") % CONFIG_REL,
-                            t("`git checkout -- %s`, 또는 그 파일을 지우고 `%s init`")
-                            % (CONFIG_REL, WRAPPER_CMD))
+        # 손상된 문서를 템플릿으로 갈아치우지는 않는다 — 덜어낸 규칙이 되살아난다.
+        fix = (t("`git checkout -- %s`, 또는 그 파일을 지우고 `%s init`")
+               % (CONFIG_REL, WRAPPER_CMD))
+        if not isinstance(cfg, dict):
+            return inactive(t("`%s` 를 읽을 수 없다 (JSON 문법을 확인하라)")
+                            % CONFIG_REL, fix)
+        if not cfg.get("stages"):
+            # 문법은 멀쩡한데 비어 있는 경우다. "문법을 확인하라" 고 하면 없는 오타를
+            # 찾게 만든다 — 무엇이 비었는지 그대로 말한다.
+            return inactive(t("`%s` 의 stages 가 비어 있다 — 단계가 없으면 단계 게이트도, "
+                              "종료 조건도, 단계별 쓰기 규칙도 없다") % CONFIG_REL, fix)
         lid = head_loop(con)
         sid = active_stage(con, lid) if lid else None
         if not lid or not sid:
@@ -3035,6 +3093,11 @@ exec python3 "$P" "$@"
 
 
 def _write_if_changed(path, body, mode=None):
+    """True=썼다, False=이미 같다, **None=쓰지 못했다.**
+
+    셋을 둘로 뭉개면 실패가 "바꿀 것이 없었다" 와 구분되지 않는다. 읽기 전용
+    파일시스템에서 승격이 LEARNED.md 반영에 실패했는데도 성공으로 보고됐다.
+    """
     try:
         if os.path.isfile(path) and open(path, encoding="utf-8").read() == body:
             return False
@@ -3045,7 +3108,7 @@ def _write_if_changed(path, body, mode=None):
             os.chmod(path, mode)
         return True
     except Exception:
-        return False
+        return None
 
 
 def refresh_engine(root):
@@ -3082,9 +3145,10 @@ def refresh_engine(root):
 
 
 def refresh_wrapper(root):
+    """래퍼를 우리 것으로 맞춘다. 쓰지 못했으면 None (그것도 사실이다)."""
     refresh_engine(root)
-    _write_if_changed(os.path.join(root, WRAPPER_REL),
-                      t(WRAPPER) % os.path.abspath(__file__), 0o755)
+    return _write_if_changed(os.path.join(root, WRAPPER_REL),
+                             t(WRAPPER) % os.path.abspath(__file__), 0o755)
 
 
 def wrapper_code(body):
@@ -3118,9 +3182,10 @@ def wrapper_intact(root):
     except Exception:
         have = None
     if have is not None and wrapper_code(have) == wrapper_code(want):
-        return True
-    refresh_wrapper(root)
-    return False
+        return True                              # 온전하다
+    # 변조됐다. 복구까지 됐는지를 구분해서 돌려준다 — "복구했다" 가 거짓말이 되면
+    # 사용자는 다음 실행이 통할 거라 믿고 같은 벽에 다시 부딪힌다.
+    return False if refresh_wrapper(root) is not None else None
 
 
 def status_report(ctx):
@@ -3676,8 +3741,16 @@ def cli_advance(ctx, argv):
 
     snap = None
     with con:
-        con.execute("UPDATE stage SET status='done', left_at=? "
-                    "WHERE loop_id=? AND stage=?", (now(), lid, sid))
+        # **이 단계를 끝내는 것은 한 번뿐이다.** 무조건 UPDATE 였을 때는 병렬 advance
+        # 둘이 모두 성공해 열린 작업이 둘 생기거나 가짜 회차 스냅샷이 남았다.
+        # 판단을 WHERE 절 안으로 옮겨 rowcount 가 승자를 정하게 한다.
+        if not claim(con, "UPDATE stage SET status='done', left_at=? "
+                          "WHERE loop_id=? AND stage=? AND status='active'",
+                     (now(), lid, sid)):
+            print(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
+                    "`harness status` 로 현재 단계를 확인하라.")
+                  % stage_obj(cfg, sid)["label"])
+            return 1
         # 회차 경계에서만 스냅샷을 남긴다. close_loop 이 stage 를 지우기 전에.
         if sid == last:
             snap = record_cycle_close(con, cfg, lid, sid)
@@ -3764,15 +3837,23 @@ def cli_skip(ctx, argv):
     left = None
     skipped = []
     with con:
-        # 현재 단계: 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다
+        # 현재 단계를 벗어나는 것은 **한 번뿐이다.** 이 claim 이 병렬 스킵의 단일
+        # 소비점이다 — 자동 승인 `--uses 1` 을 둘이 동시에 써도 하나만 통과한다.
+        # 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다.
         if dest == cur or exit_blockers(con, cfg, root, lid, sid):
-            con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
-                        "authorized_by=? WHERE loop_id=? AND stage=?",
-                        (now(), reason, by, lid, sid))
+            won = claim(con, "UPDATE stage SET status='skipped', left_at=?, reason=?, "
+                             "authorized_by=? WHERE loop_id=? AND stage=? "
+                             "AND status='active'", (now(), reason, by, lid, sid))
             skipped.append(sid)
         else:
-            con.execute("UPDATE stage SET status='done', left_at=? "
-                        "WHERE loop_id=? AND stage=?", (now(), lid, sid))
+            won = claim(con, "UPDATE stage SET status='done', left_at=? "
+                             "WHERE loop_id=? AND stage=? AND status='active'",
+                        (now(), lid, sid))
+        if not won:
+            print(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
+                    "`harness status` 로 현재 단계를 확인하라.")
+                  % stage_obj(cfg, sid)["label"])
+            return 1
         for i in range(cur + 1, dest + 1):
             con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
                         "authorized_by=? WHERE loop_id=? AND stage=?",
@@ -3781,7 +3862,7 @@ def cli_skip(ctx, argv):
         for s in skipped:
             record_event(con, lid, s, "skip", s, by, reason)
         if by == "auto":
-            left = consume_auto_skip(con)
+            _, left = consume_auto_skip(con)
         nlid, nsid, cycled = _enter(ctx, dest + 1)
     print(t("스킵(%s): %s") % (t("자동 승인") if by == "auto" else t("사용자 승인"),
                             ", ".join(skipped) or t("(없음)")))
@@ -4377,7 +4458,14 @@ def cli_promote(ctx, argv):
     print("%s: %s → %s" % (t("보류 기록") if as_kind == "declined" else t("승격 기록"),
                            key, promote_as(cfg)[as_kind]))
     print("  %s" % note)
-    if wrote:
+    if wrote is None:
+        # 승격은 DB 에 남았지만 **복리가 실제로 도는 곳**은 LEARNED.md 다. 그 반영이
+        # 실패했는데 성공처럼 보고하면, 다음 세션은 배운 것 없이 시작한다.
+        print(t("  ⚠ %s 에 반영하지 못했다 (쓰기 실패 — 권한이나 파일시스템을 확인하라). "
+                "결정은 기록됐지만 다음 세션에 실리지 않는다. 고친 뒤 `%s promote` 를 "
+                "다시 실행하거나 `%s status` 로 확인하라.")
+              % (LEARNED_REL.replace(os.sep, "/"), WRAPPER_CMD, WRAPPER_CMD))
+    elif wrote:
         print(t("  %s 갱신 (%d/%d줄)")
               % (LEARNED_REL.replace(os.sep, "/"), len(learned_lines(con, cfg)),
                  learned_budget(cfg)))

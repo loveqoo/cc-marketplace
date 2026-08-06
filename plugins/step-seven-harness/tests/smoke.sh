@@ -1328,28 +1328,31 @@ check "키가 없는 회고는 recall 에 안 걸린다" '^0$' \
 check "키가 있는 회고는 recall 에 걸린다" '^1$' \
   "$(r2 recall 'npm test' | grep -c "${RPRE2}retro.md")"
 
-# 회차 경계: 종료와 **같은 초**의 이벤트는 앞 회차에 속해야 한다.
-# 포함 경계였을 때 앞 회차의 마지막 이벤트가 다음 회차 창에 겹쳐 두 번 세어졌다.
-check "회차 경계의 같은 초 이벤트는 다음 회차로 새지 않는다" 'ok' \
+# 회차 경계는 **시각이 아니라 id** 로 나뉜다. 예전에는 종료 시각 +1초를 배타 경계로
+# 뒀고, 그래서 종료와 같은 초에 일어난 **다음 회차의** 이벤트가 어느 회차에도 속하지
+# 못하고 영영 사라졌다. 아래는 세 이벤트를 실제 순서대로 넣고 경계가 그 순서를 따르는지
+# 본다 — 세 개 모두 같은 초다.
+check "회차 경계는 시각이 아니라 순서를 따른다" 'ok' \
   "$(rpy <<'PYB'
-import sys, time; sys.path.insert(0, sys.argv[2])
+import sys; sys.path.insert(0, sys.argv[2])
 import harness as h
 con = h.connect(sys.argv[1])
 lid = "260101-bbbbbb"
-close_at = "2026-01-01T12:00:00+0900"
+same = "2026-01-01T12:00:00+0900"       # 셋 다 **같은 초**
 with con:
     con.execute("INSERT OR IGNORE INTO loop(id,created_at) VALUES(?,?)",
                 (lid, "2026-01-01T10:00:00+0900"))
-    # 종료와 같은 초에 남은 이벤트 + 1초 뒤 이벤트
-    for at, tgt in ((close_at, "old cmd"), ("2026-01-01T12:00:01+0900", "new cmd")):
-        con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (at, lid, "execution", "tool_fail", "Bash", tgt))
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                "VALUES(?,?,?,?,?,?)",
+                (same, lid, "execution", "tool_fail", "Bash", "old cmd"))
     con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (close_at, lid, "compounding", "cycle_close", "1", lid + "-1", "{}"))
+                (same, lid, "compounding", "cycle_close", "1", lid + "-1", "{}"))
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                "VALUES(?,?,?,?,?,?)",
+                (same, lid, "execution", "tool_fail", "Bash", "new cmd"))
 keys = h.cycle_search_keys(con, lid, h.cycle_window_start(con, lid))
-assert keys == ["new cmd"], ("앞 회차 이벤트가 새어들었다", keys)
+assert keys == ["new cmd"], ("경계가 순서를 따르지 않는다", keys)
 print("ok")
 PYB
 )"
@@ -1646,6 +1649,86 @@ AM="$(aw metrics)"
 check "metrics 표에 사전승인 열이 있다" '사전승인' "$AM"
 check "사전승인만 올라도 개선 신호로 읽는다" '개선 신호' "$AM"
 rm -rf "$AW"
+
+echo "== 한 번뿐인 일은 조건부 UPDATE 로 차지한다 (병렬)"
+# 읽고-판단하고-쓰면 병렬 훅이 같은 자원을 여러 번 쓴다. 판단을 WHERE 절 안으로
+# 옮기고 rowcount 로 승자를 정한다 — 쓰기 예외가 이미 쓰던 방법을 전이에도 쓴다.
+PLW="$(mktemp -d)"
+(cd "$PLW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+pl() { (cd "$PLW" && python3 "$ENGINE" "$@"); }
+pl loop intent "병렬 검사" >/dev/null
+pl loop done-when "끝" >/dev/null
+for i in 1 2 3 4; do (cd "$PLW" && python3 "$ENGINE" advance > "$PLW/ad$i" 2>&1) & done
+wait
+check "병렬 advance 는 하나만 통과한다" '^1$' \
+  "$(grep -l '→ 단계' "$PLW"/ad[1-4] | wc -l | tr -d ' ')"
+check "나머지는 이유를 듣는다" '^3$' \
+  "$(grep -l '이미 .*단계를 벗어났다' "$PLW"/ad[1-4] | wc -l | tr -d ' ')"
+check "단계는 정확히 하나만 나아갔다" '단계 2/7' "$(pl status)"
+# 자동 승인 1회를 병렬 스킵 넷이 나눠 쓰지 못한다
+pl auto-skip on --reason "검사" --uses 1 >/dev/null
+for i in 1 2 3 4; do (cd "$PLW" && python3 "$ENGINE" skip context --reason "p$i" > "$PLW/sk$i" 2>&1) & done
+wait
+check "병렬 스킵도 하나만 통과한다" '^1$' \
+  "$(grep -l '^스킵' "$PLW"/sk[1-4] | wc -l | tr -d ' ')"
+check "자동 승인 횟수는 1회만 소진된다" '소진' "$(pl auto-skip status)"
+rm -rf "$PLW"
+
+echo "== 게이트가 꺼졌으면 반드시 말한다"
+# 설치하지 않은 것과 고장 난 것은 다르다. 둘을 같게 다루면 고장이 침묵이 된다.
+OFW="$(mktemp -d)"
+(cd "$OFW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ofhook() { printf '{"hook_event_name":"%s","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"x.py","content":"x"}}' \
+  "$1" "$OFW" | CLAUDE_PROJECT_DIR="$OFW" python3 "$ENGINE" hook 2>&1; }
+rm -f "$OFW"/.claude/harness/harness.db*
+DBGONE="$(ofhook PreToolUse)"
+check "DB 파일이 사라지면 침묵하지 않는다" '게이트가 꺼졌다' "$DBGONE"
+check "무엇이 없는지 말한다" '상태 DB' "$DBGONE"
+check "복구 방법을 준다" 'init' "$DBGONE"
+rm -rf "$OFW"
+# 문법은 멀쩡한데 stages 만 빈 경우 — "문법을 확인하라" 는 없는 오타를 찾게 만든다
+EMW="$(mktemp -d)"
+(cd "$EMW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+python3 - "$EMW" <<'PYM'
+import json, os, sys
+p = os.path.join(sys.argv[1], ".claude", "harness", "stages.json")
+d = json.load(open(p, encoding="utf-8"))
+d["stages"], d["consent"], d["promotion"] = [], {}, {}
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PYM
+EMPTY="$(printf '{"hook_event_name":"SessionStart","cwd":"%s","source":"startup"}' "$EMW" \
+  | CLAUDE_PROJECT_DIR="$EMW" python3 "$ENGINE" hook 2>&1)"
+check "단계를 비우면 게이트가 꺼졌다고 말한다" '게이트가 꺼졌다' "$EMPTY"
+check "무엇이 비었는지 말한다" 'stages 가 비어 있다' "$EMPTY"
+check_absent "없는 문법 오류를 찾게 하지 않는다" 'JSON 문법' "$EMPTY"
+rm -rf "$EMW"
+
+echo "== 쓰기 실패를 성공처럼 보고하지 않는다"
+# True=썼다 / False=이미 같다 / None=쓰지 못했다. 셋을 둘로 뭉개면 실패가
+# "바꿀 것이 없었다" 와 구분되지 않는다.
+ROW="$(mktemp -d)"
+(cd "$ROW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+(cd "$ROW" && python3 "$ENGINE" loop intent x >/dev/null && python3 "$ENGINE" loop done-when y >/dev/null)
+python3 - "$ROW" <<'PYR'
+import datetime, os, sqlite3, sys
+c = sqlite3.connect(os.path.join(sys.argv[1], ".claude/harness/harness.db"))
+at = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S+0900")
+for lp in ("260101-aaaaaa", "260102-bbbbbb", "260103-cccccc"):
+    c.execute("INSERT OR IGNORE INTO loop(id,intent,created_at,cycle) VALUES(?,?,?,1)",
+              (lp, "x", at))
+    for _ in range(2):
+        c.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                  "VALUES(?,?,?,?,?,?)",
+                  (at, lp, "execution", "block", "docs_readonly", "docs/a.md"))
+c.commit()
+PYR
+chmod 444 "$ROW/.claude/harness/LEARNED.md"
+ROUT="$(cd "$ROW" && python3 "$ENGINE" promote "block:docs_readonly" --as rule --note "규칙" 2>&1)"
+chmod 644 "$ROW/.claude/harness/LEARNED.md"
+check "반영 실패를 알린다" '반영하지 못했다' "$ROUT"
+check "무엇을 잃는지 말한다" '다음 세션에 실리지 않는다' "$ROUT"
+check_absent "갱신했다고 말하지 않는다" 'LEARNED.md 갱신' "$ROUT"
+rm -rf "$ROW"
 
 echo "== 증거에는 유효기간이 있다 (근거가 바뀌면 만료된다)"
 # 증거는 "언제 무엇을 봤다"를 적는데 **본 것이 그 뒤에 변할 수 있다.** 계획을 승인받고
