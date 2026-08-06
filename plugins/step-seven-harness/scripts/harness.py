@@ -51,6 +51,7 @@ _MESSAGES = {}
 LANG_ENV = "HARNESS_LANG"
 # 정의 시점에 번역할 수 없어 사용 지점에서 감싸는 상수들. 검사기가 이 목록을 안다.
 LAZY_MSG_NAMES = ("USAGE", "AGENTS_BLOCK", "LEARNED_HEAD", "PROMOTE_AS_DEFAULT",
+                  "SELFTEST", "UNRELATED", "NOT_VERIFICATION",
                   "SELF_LOCK_MSG", "TREND_KEYS", "VERDICT_TEXT",
                   "NO_CYCLES", "WRAPPER", "RECALL_DIRS_DEFAULT",
                   "INDEX_NAMES_DEFAULT", "BASH_READERS_DEFAULT",
@@ -2441,6 +2442,24 @@ HOOKS = {
 }
 
 
+def inactive(why, fix=None):
+    """**게이트가 꺼진 채로 빠져나가는 유일한 출구.**
+
+    왜 하나로 모았나: `run_hook` 에 조용한 `return 0` 이 네 개 있었고, 라운드마다
+    새 출구가 발견됐다 — DB 를 못 읽는 경우를 막으면 `stages.json` 손상이 남았고,
+    그걸 막으면 head 없음이 남았다. **출구가 여러 개인 구조에서는 "다음 출구"가
+    항상 남는다.** 하나로 모으면 새 출구를 더할 때 알림이 딸려 온다.
+
+    판정은 열어 준다(세션을 벽돌로 만들지 않는다). 꺼진 사실만 반드시 말한다.
+    """
+    msg = t("harness: %s — **게이트가 꺼졌다.** 단계·쓰기 규칙·종료 조건이 지금 "
+            "아무것도 막지 않는다.") % why
+    if fix:
+        msg += t(" 복구: %s") % fix
+    emit({"systemMessage": msg})
+    return 0
+
+
 def run_hook():
     try:
         inp = json.load(sys.stdin)
@@ -2450,59 +2469,32 @@ def run_hook():
     try:
         root = find_root(inp.get("cwd"))
         if not root:
-            return 0  # 하네스 미설치 프로젝트 — 조용히 종료
+            return 0  # 하네스 미설치 프로젝트 — 조용히 종료 (설치 안 한 것은 고장이 아니다)
         # connect 가 try 밖에 있었다. 손상된 SQLite 파일은 connect 나
         # `PRAGMA journal_mode=WAL` 에서 DatabaseError 를 던지고, 그게
         # fail-open 처리 밖이라 traceback + exit 1 이 됐다 — 재현했다.
         con = connect(root)
         if con is None:
-            # **여기가 하네스의 유일한 진짜 자산이다.**
-            #
-            # 적대적 리뷰 두 차례에서 자기 잠금 우회를 열 가지 넘게 찾았는데, 그
-            # 대상(`.claude/harness/bin/`)은 **게이트가 아니었다.** 훅은 전부
-            # `${CLAUDE_PLUGIN_ROOT}` 의 플러그인 엔진을 실행하므로 프로젝트 사본이
-            # 쓰레기가 되어도 판정은 그대로 돌아간다 — 직접 확인했다. 사본은 CLI
-            # 편의용이고, `refresh_engine` 이 세션마다 다시 덮는다.
-            #
-            # 반면 DB 를 못 읽으면 **모든 게이트가 한꺼번에 꺼진다.** 그런데 예전에는
-            # stderr 한 줄만 남기고 조용히 통과시켰다. 세션을 벽돌로 만들지 않으려는
-            # fail-open 은 맞지만, **꺼진 사실을 숨기는 것은 fail-open 이 아니라
-            # 은폐다.** 판정은 열어 주고 사실은 매번 말한다.
-            emit({"systemMessage":
-                  t("harness: 상태 DB(%s)를 읽을 수 없어 **모든 게이트가 꺼졌다.** "
-                    "단계·쓰기 규칙·종료 조건이 지금 아무것도 막지 않는다. "
-                    "복구: `%s init` (기록은 .dev/ 의 파일에 남아 있다).")
-                  % (DB_REL, WRAPPER_CMD)})
-            return 0
+            # 진짜 자산은 상태 DB 다. 못 읽으면 모든 게이트가 한꺼번에 꺼진다.
+            return inactive(t("상태 DB(%s)를 읽을 수 없다") % DB_REL,
+                            t("`%s init` (기록은 .dev/ 의 파일에 남아 있다)")
+                            % WRAPPER_CMD)
         cfg = load_config(root, plugin_root())
         load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
         if not isinstance(cfg, dict) or not cfg.get("stages"):
-            # 차단하지는 않는다. 다만 **조용히 꺼지지도 않는다** — 설정이 깨진 채로
-            # 하네스가 없는 것처럼 동작하면 사용자는 게이트가 사라진 것을 모른다.
-            # 손상된 문서를 템플릿으로 갈아치우는 것도 답이 아니다(덜어낸 규칙이
-            # 되살아난다). 그래서 끄고, 끈 사실을 세션 시작에 말한다.
-            if inp.get("hook_event_name") == "SessionStart":
-                emit({"systemMessage":
-                      t("harness: `%s` 를 읽을 수 없어 하네스가 비활성 상태다. "
-                      "JSON 문법을 확인하라 — 고치기 전까지 어떤 게이트도 동작하지 "
-                      "않는다. 되돌리려면 `git checkout -- %s` 또는 그 파일을 지우고 "
-                      "`.claude/harness/bin/harness init`.")
-                      % (CONFIG_REL, CONFIG_REL)})
-            return 0
+            # 손상된 문서를 템플릿으로 갈아치우지는 않는다 — 덜어낸 규칙이 되살아난다.
+            return inactive(t("`%s` 를 읽을 수 없다 (JSON 문법을 확인하라)") % CONFIG_REL,
+                            t("`git checkout -- %s`, 또는 그 파일을 지우고 `%s init`")
+                            % (CONFIG_REL, WRAPPER_CMD))
         lid = head_loop(con)
         sid = active_stage(con, lid) if lid else None
         if not lid or not sid:
-            # 활성 작업이 없어도 **설정 문제는 알린다.** 설치 직후나 DB를 지운
-            # 직후가 설정이 어긋났는지 가장 중요한 시점인데, 예전에는 여기서 조용히
-            # 빠져나가 아무 말도 하지 않았다. 적대적 리뷰가 지적했다.
-            if inp.get("hook_event_name") == "SessionStart":
-                probs = (config_problems(cfg) + drift_problems(cfg, root)
-                         + language_problems(root))
-                if probs:
-                    emit({"systemMessage":
-                          t("harness: stages.json 에서 무시되는 설정이 %d건 있다\n  - %s")
-                          % (len(probs), "\n  - ".join(probs[:5]))})
-            return 0
+            probs = (config_problems(cfg) + drift_problems(cfg, root)
+                     + language_problems(root))
+            extra = (t(" 무시되는 설정 %d건: %s")
+                     % (len(probs), "; ".join(probs[:3]))) if probs else ""
+            return inactive(t("활성 작업이 없다 (head 또는 활성 단계 없음)%s") % extra,
+                            t("`%s init` 또는 `%s status`") % (WRAPPER_CMD, WRAPPER_CMD))
         pid = inp.get("prompt_id")
         if pid:
             with con:
@@ -2684,6 +2676,8 @@ def status_report(ctx):
         "promoted": promotion_summary(con, cfg),
         "tidy": tidy_headline(con, cfg, root),
         "enforcing": enforcing_summary(cfg),
+        "selftest": [{"what": w, "ok": o, "got": g}
+                     for w, o, g in selftest(ctx)],
         # 작업이 정해지지 않았을 때만. 정해졌으면 후보는 소음이다.
         "candidates": ([] if (row and row["intent"])
                        else work_candidates(con, cfg, root)),
@@ -2714,6 +2708,103 @@ def rule_reachable(cfg, rule):
     if name and name not in WRITE_PREDICATES:
         return False
     return True
+
+
+# --------------------------------------------------------------------- 자기검사
+#
+# **대리 지표를 버린다.**
+#
+# "강제가 실제로 작동하나" 를 세 번 다른 방식으로 추정했고 세 번 다 거짓말했다.
+#   ① 무력화 모양을 예측해 진단  → 리뷰가 새 모양을 계속 찾았다
+#   ② 규칙·조건 **개수**를 세어 보여줌 → 있지만 죽은 규칙이 7로 세어졌다
+#   ③ "발동 가능" 만 세도록 보정   → 거짓값 조건이 여전히 발동 가능으로 세어졌다
+#
+# 셋 다 설정을 **들여다보고** 결론을 추정한 것이다. 추정은 항상 한 발 늦는다.
+# 이미 두 번 옳은 답을 냈는데 끝까지 밀지 않았다 — `bash_pattern` 은 실제 명령으로
+# **탐침**했고, 스코프는 파이썬의 **실제 분석기**를 썼다.
+#
+# 그 원칙을 여기서 완성한다. **실제 판정 함수에 대표 입력을 넣고 결과를 본다.**
+# 이건 대리 지표가 아니라 강제 그 자체를 돌려 본 것이므로 거짓말할 수 없다.
+
+SELFTEST = (
+    # (설명, 종류, 대상, 막혀야 하나)
+    ("하네스 엔진 사본 쓰기", "write", ".claude/harness/bin/harness.py", True),
+    ("상태 DB 쓰기", "write", ".claude/harness/harness.db", True),
+    ("Bash 로 엔진 삭제", "bash", "rm .claude/harness/bin/harness.py", True),
+    ("Bash 로 .claude 삭제", "bash", "rm -rf .claude", True),
+    ("docs/ 쓰기 (사람의 영역)", "write", "docs/probe.md", True),
+    (".dev/ 하위 폴더 규칙", "write", ".dev/__probe__/a.md", True),
+    (".dev/ 산출물 접두사", "write", ".dev/plan/__probe__.md", True),
+    ("읽기는 통과해야 한다", "bash", "cat .claude/harness/harness.db", False),
+    ("접두사 붙인 산출물은 통과", "write", ".dev/plan/<PREFIX>probe.md", False),
+)
+
+
+# 종료 조건 쪽 탐침. "이 조건이 자기 산출물이 아닌 것도 받아들이나" 를 본다.
+# `write_glob: ["**"]` 로 넓히면 접두사만 맞는 아무 파일이 사람의 승인이 됐다 —
+# 개수를 세는 요약으로는 안 보였다(Codex Claim C HIGH).
+UNRELATED = ("src/a.py", "README.md", ".claude/settings.json", "Makefile")
+# 검증 증거로 인정되면 안 되는 명령. 텍스트를 읽지 않고 넣어 본다.
+NOT_VERIFICATION = ("ls", "echo hi", "true", "cat README.md", "git status", "pwd")
+
+
+def selftest_criteria(cfg):
+    """종료 조건이 **자기 산출물만** 받아들이나. (설명, 통과, 결과)"""
+    out = []
+    for name, spec in sorted((cfg.obj("criteria") or {}).items()):
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("satisfied_by") == "file":
+            pats = cfg.seq("criteria.%s.write_glob" % name)
+            hits = [p for p in UNRELATED
+                    if any(glob_match(p, g) for g in pats)]
+            out.append((t("%s 는 무관한 파일을 받지 않는다") % name, not hits,
+                        t("무관한 경로도 받는다: %s") % ", ".join(hits) if hits
+                        else t("자기 산출물만 받는다")))
+        if name == "verification_evidence":
+            pat = spec.get("bash_pattern")
+            try:
+                vre = re.compile(pat) if pat else None
+            except re.error:
+                vre = None
+            hits = [c for c in NOT_VERIFICATION if vre and vre.search(c)]
+            out.append((t("검증 증거는 검증 명령만 인정한다"), not hits,
+                        t("검증이 아닌 명령도 인정: %s") % ", ".join(hits) if hits
+                        else t("검증 명령만 인정한다")))
+    return out
+
+
+def selftest(ctx):
+    """대표 조작을 **실제 판정 함수**에 넣고 기대와 대조한다.
+
+    반환: [(설명, 통과했나, 실제 결과 설명)]
+    """
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
+    pre = file_prefix(con, lid)
+    out = []
+    for raw_label, kind, target, want_block in SELFTEST:
+        label = t(raw_label)
+        tgt = target.replace("<PREFIX>", pre)
+        try:
+            if kind == "write":
+                # check_write 는 차단을 event 로 적립한다. 자기검사가 통계를 오염시키면
+                # 안 되므로 판정 부분만 직접 부른다.
+                w = WriteReq(ctx, tgt)
+                if self_lock_hit(tgt):
+                    blocked, why = True, t("바닥값")
+                else:
+                    rid, reason = _first_violation(w, write_rules(cfg))
+                    blocked, why = bool(reason), (rid or "")
+            else:
+                hit = bash_protected_hit(cfg, root, tgt)
+                blocked, why = bool(hit), (hit or "")
+        except Exception as exc:                  # 판정이 터지는 것도 결과다
+            out.append((label, False, t("판정 중 예외: %s") % exc))
+            continue
+        ok = (blocked == want_block)
+        got = (t("막힘(%s)") % why if blocked else t("통과"))
+        out.append((label, ok, got))
+    return out + selftest_criteria(cfg)
 
 
 def enforcing_summary(cfg):
@@ -2750,12 +2841,25 @@ def render_status(d, cfg):
         for p in d["config_problems"]:
             print("  - %s" % p)
         print()
+    st = d.get("selftest") or []
+    fails = [x for x in st if not x.get("ok")]
+    if fails:
+        # **개수보다 이것이 먼저다.** 대표 조작이 기대와 다르게 판정된다는 것은
+        # 설정이 어떻게 생겼든 강제가 깨졌다는 직접 증거다.
+        print(t("⚠ 자기검사 %d/%d 실패 — 강제가 기대와 다르게 동작한다:")
+              % (len(fails), len(st)))
+        for x in fails:
+            print("  - %s → %s" % (x["what"], x["got"]))
+        print()
     e = d.get("enforcing") or {}
     if e:
         # 무엇이 실제로 강제되는지 **숫자로** 보여준다. 0 이 보이면 그게 신호다.
         rules_txt = "%d" % e.get("write_rules", 0)
         if e.get("live_rules", 0) != e.get("write_rules", 0):
             rules_txt += t("(발동 가능 %d)") % e.get("live_rules", 0)
+        if st:
+            print(t("자기검사: %d/%d 통과 (대표 조작을 실제 판정에 넣어 확인)")
+                  % (len(st) - len(fails), len(st)))
         print(t("강제 중: 쓰기 규칙 %s · 보호 경로 %d · 종료 조건 %d "
                 "(게이트 있는 단계 %d/%d) · 승인 필요 %d · 언어 %s")
               % (rules_txt, e.get("protected_paths", 0),

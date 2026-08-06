@@ -2249,12 +2249,15 @@ echo 'not json at all {' > "$BW/.claude/harness/stages.json"
 check "CLI 는 크게 실패한다 (exit 1)" '^1$' "$BRC"
 check "무엇이 깨졌는지 말한다" '손상' "$( (cd "$BW" && python3 "$ENGINE" status 2>&1) )"
 BH="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$BW" "$BW" | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook 2>&1)"
-check_empty "훅은 차단하지 않는다 (세션을 벽돌로 만들지 않는다)" "$BH"
+# 출구를 하나로 모았으므로 **모든 훅**이 알린다. 예전에는 세션 시작만 알렸고,
+# 그래서 세션 중간에 깨지면 남은 세션이 조용히 게이트 없이 돌았다.
+check_absent "훅은 차단하지 않는다 (세션을 벽돌로 만들지 않는다)" 'permissionDecision' "$BH"
+check "PreToolUse 도 게이트가 꺼진 사실을 알린다" '게이트가 꺼졌다' "$BH"
 printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$BW" "$BW" \
   | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook >/dev/null 2>&1 && BRC2=0 || BRC2=$?
 check "훅 종료 코드도 0" '^0$' "$BRC2"
 # 조용히 꺼지지도 않아야 한다 — 게이트가 사라진 것을 모르면 그게 최악이다
-check "세션 시작에서 비활성 사실을 알린다" '비활성 상태' \
+check "세션 시작에서 비활성 사실을 알린다" '게이트가 꺼졌다' \
   "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$BW" \
      | CLAUDE_PROJECT_DIR="$BW" python3 "$ENGINE" hook)"
 check "되돌리는 방법을 준다" 'git checkout' \
@@ -2486,6 +2489,53 @@ printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_inp
   | CLAUDE_PROJECT_DIR="$BW2" python3 "$ENGINE" hook >/dev/null 2>&1 && b2rc=0 || b2rc=$?
 check "종료 코드는 여전히 0" '^0$' "$b2rc"
 rm -rf "$BW2"
+
+echo "== 자기검사: 대리 지표가 아니라 실제 판정을 돌린다"
+# 세 번 다르게 추정했고 세 번 다 거짓말했다 — 무력화 모양 예측, 개수 세기,
+# '발동 가능' 세기. 셋 다 설정을 들여다보고 결론을 추정했다. 추정은 한 발 늦는다.
+# 이제 대표 조작을 **실제 판정 함수**에 넣고 결과를 본다. 거짓말할 수 없다.
+SF="$(mktemp -d)"
+(cd "$SF" && git init -q . && python3 "$ENGINE" init >/dev/null)
+sf() { (cd "$SF" && python3 "$ENGINE" "$@"); }
+sfed() { python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+exec(sys.argv[2])
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$SF/.claude/harness/stages.json" "$1"; }
+
+check "정상이면 전부 통과한다" '자기검사: 1[0-9]*/1[0-9]* 통과' "$(sf status 2>&1)"
+check_absent "정상이면 실패를 내지 않는다" '자기검사 .* 실패' "$(sf status 2>&1)"
+check "--json 에도 실린다" 'selftest' "$(sf status --json 2>&1)"
+
+echo "  -- 개수 요약이 놓쳤던 것들을 잡는다"
+# ① 거짓값 조건: Codex 가 'live_rules 보정도 못 잡는다' 고 한 HIGH
+sfed 'for r in cfg["write_rules"]: r["when"] = {"class": "nope"}'
+check "죽은 규칙을 잡는다" '자기검사 .*실패' "$(sf status 2>&1)"
+check "무엇이 통과했는지 말한다" 'docs/ 쓰기' "$(sf status 2>&1)"
+# ② 규칙을 통째로 비움
+sfed "cfg['write_rules'] = json.load(open('$SF/.claude/harness/bin/defaults.json', encoding='utf-8'))['write_rules']"
+check "복구하면 다시 통과한다" '자기검사: 1[0-9]*/1[0-9]* 통과' "$(sf status 2>&1)"
+sfed 'cfg["write_rules"] = []'
+check "규칙을 비우면 잡는다" '자기검사 .*실패' "$(sf status 2>&1)"
+# ③ 바닥값이 버티는 경우는 **통과가 사실**이다 (거짓 경고를 내지 않는다)
+sfed "cfg['write_rules'] = json.load(open('$SF/.claude/harness/bin/defaults.json', encoding='utf-8'))['write_rules']
+cfg['folder_rules']['protected_paths'] = []"
+check "바닥값이 버티면 통과가 사실이다" '자기검사: 1[0-9]*/1[0-9]* 통과' "$(sf status 2>&1)"
+
+echo "  -- 종료 조건도 탐침한다 (Codex Claim C HIGH)"
+sfed "cfg['folder_rules']['protected_paths'] = ['.claude/harness/LEARNED.md']
+cfg['criteria']['plan_approved'] = {'satisfied_by': 'file', 'human': True,
+                                    'write_glob': ['**'], 'help': 'x'}"
+check "글롭이 '**' 면 무관한 파일도 받는다고 말한다" '무관한 경로도 받는다' "$(sf status 2>&1)"
+sfed "cfg['criteria']['plan_approved'] = json.load(open('$SF/.claude/harness/bin/defaults.json', encoding='utf-8'))['criteria']['plan_approved']
+cfg['criteria']['verification_evidence']['bash_pattern'] = '.*'"
+check "검증 패턴이 넓으면 잡는다" '검증이 아닌 명령도 인정' "$(sf status 2>&1)"
+# Codex 가 '탐침 4개를 피하는 패턴이 있다' 고 지적한 것 — true 를 넣어 확인한다
+sfed "cfg['criteria']['verification_evidence']['bash_pattern'] = '\\\\btrue\\\\b|\\\\bpytest\\\\b'"
+check "true 를 증거로 삼는 패턴도 잡는다" 'true' "$(sf status 2>&1)"
+rm -rf "$SF"
 
 echo "== 강제되는 것을 숫자로 보여준다 (예측이 아니라 결과)"
 # 공허한 설정을 모양마다 예측해 진단하려 했더니 끝이 없었다(빈 목록, 아무것도 안 맞는
