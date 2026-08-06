@@ -21,7 +21,25 @@
 **패턴이 보인다: 나는 파이썬의 스코프 규칙을 재구현하고 있었고, 규칙은 내 예상보다
 많다.** 특수 사례를 하나씩 더하는 대신 파이썬에게 물어본다 — `symtable` 은
 컴파일러가 쓰는 그 분석기다. 중첩 함수, comprehension, `global`/`nonlocal`,
-walrus, except 별칭을 전부 정확히 안다.
+walrus, except 별칭의 **스코프**를 전부 정확히 안다.
+
+## 이 검사가 잡지 못하는 것 (정확히 적어둔다)
+
+`symtable` 은 **스코프** 분석기이지 **확정 초기화(definite assignment)** 분석기가
+아니다. `is_assigned()` 는 "이 스코프 어딘가에서 묶인다"는 뜻이지 "쓰기 전에 반드시
+묶인다"가 아니다. 그래서 아래를 놓친다.
+
+    def f(inp, ctx):
+        if inp.get("x"):
+            root = ctx.root      # 조건부로만 묶인다
+        return open(root)        # x 가 없으면 UnboundLocalError
+
+이건 dataflow 분석이 필요하고 stdlib 에는 없다. **근사를 하나 더 얹지 않는다** —
+그게 이 파일이 두 번 틀린 이유였다.
+
+대신 뿌리를 고쳤다. 이 검사가 존재한 이유는 훅의 NameError 가 **조용히** 죽었기
+때문인데, 이제 훅은 내부 오류를 사용자에게 알린다(`inactive()`). 그러니 이 검사는
+'최후의 방어선'이 아니라 **빨리 잡는 도구**다. 못 잡는 것은 실행하면 보인다.
 """
 import os
 import sys

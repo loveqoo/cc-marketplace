@@ -2481,7 +2481,7 @@ rm -f "$BW2/.claude/harness/harness.db-wal" "$BW2/.claude/harness/harness.db-shm
 DBOUT="$(b2w 'docs/x.md' 2>/dev/null)"
 check "차단하지 않는다 (세션을 벽돌로 만들지 않는다)" '^0$' \
   "$(printf '%s' "$DBOUT" | grep -c permissionDecision || true)"
-check "모든 게이트가 꺼졌다고 말한다" '모든 게이트가 꺼졌다' "$DBOUT"
+check "게이트가 꺼졌다고 말한다" '게이트가 꺼졌다' "$DBOUT"
 check "복구 방법을 준다" 'init' "$DBOUT"
 check "PreToolUse 에서도 말한다 (세션 시작뿐이 아니다)" 'systemMessage' "$DBOUT"
 b2rc=0
@@ -2489,6 +2489,65 @@ printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_inp
   | CLAUDE_PROJECT_DIR="$BW2" python3 "$ENGINE" hook >/dev/null 2>&1 && b2rc=0 || b2rc=$?
 check "종료 코드는 여전히 0" '^0$' "$b2rc"
 rm -rf "$BW2"
+
+echo "== 사전 승인된 래퍼는 권위 있는 원본을 먼저 실행한다"
+# `.claude/settings.json` 이 래퍼를 사전 승인한다(SAFE_PERMS). 래퍼가 프로젝트
+# 사본을 먼저 실행하면 **사본을 덮는 것이 곧 승인 없는 임의 코드 실행**이 된다.
+# 3차 리뷰가 지적했고 맞다 — 사본은 게이트가 아니라던 내 판단이 이 점에서 틀렸다.
+PW6="$(mktemp -d)"
+(cd "$PW6" && git init -q . && python3 "$ENGINE" init >/dev/null)
+check "정상 동작" '자기검사' "$( (cd "$PW6" && ./.claude/harness/bin/harness status) )"
+printf 'print("PWNED")\n' > "$PW6/.claude/harness/bin/harness.py"
+check_absent "사본을 덮어도 그 코드가 돌지 않는다" 'PWNED' \
+  "$( (cd "$PW6" && ./.claude/harness/bin/harness status 2>&1) )"
+check "원본이 계속 판정한다" '강제 중' "$( (cd "$PW6" && ./.claude/harness/bin/harness status 2>&1) )"
+rm -rf "$PW6"
+
+echo "== 설치 형태를 주장하지 않고 잰다"
+# "훅은 프로젝트 밖 엔진을 실행한다"는 git 소스에서만 참이다. directory 소스로
+# 등록하면 플러그인 루트가 프로젝트 안이 되고, 그건 README 가 로컬 테스트에 권하는
+# 방식이다. 문서에 주장을 적어두면 설치 형태가 바뀔 때 거짓이 된다.
+IW="$(mktemp -d)"
+(cd "$IW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+check_absent "정상 설치에는 경고하지 않는다" '프로젝트 안에 있다' "$( (cd "$IW" && python3 "$ENGINE" status 2>&1) )"
+IW2="$(mktemp -d)"
+mkdir -p "$IW2/plugins/step-seven-harness"
+cp -r "$(dirname "$ENGINE")" "$IW2/plugins/step-seven-harness/"
+cp -r "$(dirname "$ENGINE")/../templates" "$IW2/plugins/step-seven-harness/"
+(cd "$IW2" && git init -q . && python3 plugins/step-seven-harness/scripts/harness.py init >/dev/null)
+check "엔진이 프로젝트 안이면 그 사실을 말한다" '프로젝트 안에 있다' \
+  "$( (cd "$IW2" && python3 plugins/step-seven-harness/scripts/harness.py status 2>&1) )"
+check "자기 잠금을 신뢰할 수 없다고 말한다" '신뢰할 수 없다' \
+  "$( (cd "$IW2" && python3 plugins/step-seven-harness/scripts/harness.py status 2>&1) )"
+rm -rf "$IW" "$IW2"
+
+echo "== 재연결은 측정을 건드리지 않는다 (종류를 갈랐다)"
+# cycle_close 는 **측정 창 경계**이자 **회차 스냅샷**(detail 을 JSON 으로 파싱)이다.
+# 재연결에 그 종류를 쓰면 이전 회차 측정치가 창에서 빠지면서 기록되지도 않고,
+# 사유가 JSON 처럼 생기면 가짜 회차로 집계된다 — 3차 리뷰가 둘 다 찾았다.
+CW2="$(mktemp -d)"
+(cd "$CW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+cw2() { (cd "$CW2" && python3 "$ENGINE" "$@"); }
+cw2 loop intent x >/dev/null
+cw2 loop done-when y >/dev/null
+CWL="$(cw2 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["loop"])')"
+cw2 loop adopt "$CWL" --reason '{"blocks": 999, "refails": 999}' >/dev/null
+check "cycle_close 를 쓰지 않는다" '^0$' \
+  "$(python3 -c "
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT COUNT(*) FROM event WHERE kind='cycle_close'\").fetchone()[0])" \
+  "$CW2/.claude/harness/harness.db")"
+check "cycle_adopt 로 기록한다" '^1$' \
+  "$(python3 -c "
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT COUNT(*) FROM event WHERE kind='cycle_adopt'\").fetchone()[0])" \
+  "$CW2/.claude/harness/harness.db")"
+check "JSON 사유가 가짜 회차가 되지 않는다" '회차 종료 기록이 없다' "$(cw2 metrics 2>&1)"
+check "그래도 접두사는 바뀐다" '[0-9a-f]-2-' \
+  "$(cw2 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
+rm -rf "$CW2"
 
 echo "== 자기검사: 대리 지표가 아니라 실제 판정을 돌린다"
 # 세 번 다르게 추정했고 세 번 다 거짓말했다 — 무력화 모양 예측, 개수 세기,
@@ -2631,7 +2690,9 @@ c = sqlite3.connect(sys.argv[1])
 r = c.execute('SELECT cycle, closed_at FROM loop WHERE id=?', (sys.argv[2],)).fetchone()
 n = c.execute(\"SELECT COUNT(*) FROM event WHERE loop_id=? AND kind='cycle_close'\",
               (sys.argv[2],)).fetchone()[0]
-print('cycle=%s closed=%s boundaries=%d' % (r[0], r[1] is not None, n))
+a = c.execute(\"SELECT COUNT(*) FROM event WHERE loop_id=? AND kind='cycle_adopt'\",
+              (sys.argv[2],)).fetchone()[0]
+print('cycle=%s closed=%s measure=%d adopt=%d' % (r[0], r[1] is not None, n, a))
 " "$AD/.claude/harness/harness.db" "$1"; }
 # ① 없는 ID 는 새로 만드는 것이므로 회차 1 이어야 한다
 check "없는 ID 는 새로 만들었다고 말한다" '새로 만들었다' \
@@ -2641,9 +2702,14 @@ check "없는 ID 는 회차 1 에서 시작한다" 'cycle=1' "$(adinfo 999999-zz
 ad loop intent x >/dev/null; ad loop done-when y >/dev/null
 ADL="$(ad status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["loop"])')"
 ad loop adopt "$ADL" --reason '1차' >/dev/null
-check "재연결이 회차 경계를 남긴다" 'cycle=2 closed=False boundaries=1' "$(adinfo "$ADL")"
+# 재연결은 접두사를 바꾸는 것이 목적이고 **측정 창은 건드리지 않는다.** 예전에는
+# cycle_close 를 썼는데 그 종류는 측정 창 경계이자 회차 스냅샷이어서, 이전 회차의
+# 측정치가 창에서 빠지면서 기록되지도 않았다 — 적대적 리뷰가 지적했다.
+check "재연결이 회차를 올린다" 'cycle=2 closed=False' "$(adinfo "$ADL")"
+check "측정 창은 건드리지 않는다" 'measure=0 adopt=1' "$(adinfo "$ADL")"
 ad loop adopt "$ADL" --reason '2차' >/dev/null
-check "연속 재연결도 경계를 남긴다" 'cycle=3 closed=False boundaries=2' "$(adinfo "$ADL")"
+check "연속 재연결도 회차만 올린다" 'cycle=3 closed=False measure=0 adopt=2' \
+  "$(adinfo "$ADL")"
 # ③ 닫힌 작업을 재연결하면 closed_at 이 지워져야 한다 (tidy 가 닫힌 것으로 보면 안 된다)
 ad loop new --reason '새 작업' >/dev/null 2>&1 || true
 check "loop new 는 이전 작업을 닫는다" 'closed=True' "$(adinfo "$ADL")"
@@ -2659,7 +2725,8 @@ rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-s
 # 새 계약: 판정은 하지 않되(차단하지 않음) 꺼진 사실은 말한다.
 DBROKEN="$(hook "$(W docs/x.md)" 2>/dev/null)"
 check_absent "DB 손상 시 차단하지 않음" 'permissionDecision' "$DBROKEN"
-check "DB 손상을 사용자에게 알린다" '모든 게이트가 꺼졌다' "$DBROKEN"
+check "DB 손상을 사용자에게 알린다" '게이트가 꺼졌다' "$DBROKEN"
+check "무엇이 문제인지 말한다" 'file is not a database' "$DBROKEN"
 hook "$(W docs/x.md)" >/dev/null 2>&1; CRC=$?
 check "DB 손상 시 종료 코드 0" '^0$' "$CRC"
 check "traceback 을 내지 않는다" '^0$' \

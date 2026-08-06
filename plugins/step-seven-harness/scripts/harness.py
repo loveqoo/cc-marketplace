@@ -168,6 +168,7 @@ EVENT_KINDS = {
     "promote_declined": "승격 보류",
     "promote_verify": "승격 시 변경 관측",
     "cycle_close": "회차 종료",
+    "cycle_adopt": "작업 재연결 (측정 창은 건드리지 않는다)",
     "retro_keys": "회고 검색 키 확인",
     "plan_mode_exit": "plan mode 종료 관측",
     "stop_continue": "턴 이어붙임",
@@ -445,6 +446,30 @@ def bash_mutator_re(cfg):
         return re.compile(pat) if pat else BASH_MUTATORS
     except re.error:
         return BASH_MUTATORS       # 잘못된 정규식으로 게이트를 열지 않는다
+
+
+def install_problems(root):
+    """설치 형태에서 **하네스가 자신을 보호할 수 없는 경우**를 알린다.
+
+    "훅은 프로젝트 밖의 플러그인 엔진을 실행하므로 프로젝트 사본은 게이트가 아니다"
+    라고 문서에 적었는데, 그건 `git`/`github` 소스일 때만 참이다. 마켓플레이스를
+    `directory` 소스로 등록하면(README 가 로컬 테스트에 권하는 방식) 플러그인 루트가
+    **프로젝트 안**이 되고, 그러면 모델이 훅 엔진 자체를 고칠 수 있다.
+
+    주장을 문서에 적어두면 설치 형태가 바뀔 때 거짓이 된다. **런타임에 재어 말한다.**
+    개발 중에는 엔진을 고치는 것이 목적이므로 이것은 고장이 아니다 — 다만 그 상태에서
+    자기 잠금을 신뢰해서는 안 된다는 사실은 보여야 한다.
+    """
+    try:
+        pr = os.path.realpath(plugin_root())
+        rp = os.path.realpath(root)
+    except Exception:
+        return []
+    if pr == rp or pr.startswith(rp + os.sep):
+        return [t("플러그인 엔진이 프로젝트 안에 있다 (%s) — 이 설치 형태에서는 "
+                  "모델이 훅 엔진을 고칠 수 있으므로 자기 잠금을 신뢰할 수 없다. "
+                  "개발 중이면 정상이다.") % os.path.relpath(pr, rp)]
+    return []
 
 
 def drift_problems(cfg, root):
@@ -1781,7 +1806,7 @@ def hook_session_start(inp, ctx):
     # 설정 오타는 **사람에게** 알린다. 모델에게 컨텍스트로 주면 모델이 고치려 들고,
     # stages.json 은 사람의 문서다. 조용히 무시되는 설정이 있다는 사실 자체가 정보다.
     probs = (config_problems(cfg) + drift_problems(cfg, root)
-             + language_problems(root))
+             + install_problems(root) + language_problems(root))
     if probs:
         out["systemMessage"] = (t("harness: stages.json 에서 무시되는 설정이 %d건 있다\n  - %s")
                                 % (len(probs), "\n  - ".join(probs[:5])))
@@ -2331,7 +2356,8 @@ def hook_stop(inp, ctx):
 # 하네스가 **스스로** 남기는 기록은 진전이 아니다. 이걸 빼지 않으면 이어붙임
 # 이벤트가 이벤트 수를 늘려 지문이 매번 바뀌고, 진전 감지가 자기 자신을 진전으로
 # 세면서 영원히 발동하지 않는다 — 실제로 그렇게 만들어서 5회 헛돌았다.
-FP_IGNORE_KINDS = ("stop_continue", "stop_stalled", "stop_gate", "bypass", "cycle_close")
+FP_IGNORE_KINDS = ("stop_continue", "stop_stalled", "stop_gate", "bypass",
+                   "cycle_close", "cycle_adopt")
 
 
 def progress_fingerprint(con, lid, sid):
@@ -2490,7 +2516,7 @@ def run_hook():
         sid = active_stage(con, lid) if lid else None
         if not lid or not sid:
             probs = (config_problems(cfg) + drift_problems(cfg, root)
-                     + language_problems(root))
+                     + install_problems(root) + language_problems(root))
             extra = (t(" 무시되는 설정 %d건: %s")
                      % (len(probs), "; ".join(probs[:3]))) if probs else ""
             return inactive(t("활성 작업이 없다 (head 또는 활성 단계 없음)%s") % extra,
@@ -2512,12 +2538,15 @@ def run_hook():
         # 없었다 — 손상된 DB 는 예외로 오므로 바로 이 경로다. 판정은 열어 주고
         # 사실은 매번 말한다. 소음이 은폐보다 낫다.
         sys.stderr.write("step-seven-harness: %s\n" % exc)
-        emit({"systemMessage":
-              t("harness: 상태를 읽을 수 없어 **모든 게이트가 꺼졌다** (%s). "
-                "단계·쓰기 규칙·종료 조건이 지금 아무것도 막지 않는다. "
-                "복구: `%s init` (기록은 .dev/ 의 파일에 남아 있다).")
-              % (exc, WRAPPER_CMD)})
-        return 0
+        # 여기 오는 것은 대개 **엔진 내부 오류**다(스키마 불일치, NameError 등).
+        # "상태를 읽을 수 없다"고 뭉뚱그리면 사용자가 DB를 의심하며 엉뚱한 곳을 고친다.
+        #
+        # 이 경로가 소리를 내게 만든 것이 `ctx_check` 보다 중요하다. 정적 검사는
+        # 조건부 대입 뒤의 UnboundLocalError 를 잡지 못한다(symtable 의 한계).
+        # 그런 결함의 진짜 방어선은 **실패가 보이는 것**이다.
+        return inactive(t("하네스 내부 오류: %s") % exc,
+                        t("`%s init` 으로 스키마를 갱신하거나, 계속되면 이 메시지를 "
+                          "그대로 보고하라") % WRAPPER_CMD)
     finally:
         if con is not None:
             try:
@@ -2572,9 +2601,15 @@ DEFAULTS_REL = os.path.join(HARNESS_DIR, "bin", "defaults.json")
 # auto-mode 분류기와 샌드박스가 막는다 — 둘 다 실제로 겪은 문제다.
 WRAPPER = """#!/bin/sh
 # step-seven-harness wrapper — 세션 시작마다 갱신된다. 직접 편집하지 마라.
+#
+# **플러그인 원본을 먼저 쓴다.** 프로젝트 사본(`$D/harness.py`)을 먼저 쓰면,
+# 그 사본이 `.claude/settings.json` 에 사전 승인돼 있으므로(SAFE_PERMS) 사본을
+# 덮는 것이 곧 **승인 없는 임의 코드 실행**이 된다. 적대적 리뷰가 지적했고 맞다.
+# 사본은 원본이 없을 때의 폴백일 뿐이다 — 모델이 치는 명령은 여전히 작업 디렉터리
+# 안의 이 래퍼이므로 분류기·샌드박스 문제도 생기지 않는다.
 D="$(cd "$(dirname "$0")" && pwd)"
-P="$D/harness.py"
-if [ ! -f "$P" ]; then P="%s"; fi
+P="%s"
+if [ ! -f "$P" ]; then P="$D/harness.py"; fi
 if [ ! -f "$P" ]; then
   # 정확한 이름을 먼저, 그다음 이름에 덜 묶인 glob. 플러그인 이름이 바뀌어도
   # (6->7 단계처럼) 마지막 폴백이 살아 있다. 여러 개면 최신 것을 쓴다.
@@ -2910,6 +2945,7 @@ def render_status(d, cfg):
 def cli_status(ctx, argv):
     data = status_report(ctx)
     probs = (config_problems(ctx.cfg) + drift_problems(ctx.cfg, ctx.root)
+             + install_problems(ctx.root)
              + language_problems(ctx.root))
     if probs:
         data["config_problems"] = probs
@@ -4111,8 +4147,16 @@ def cli_loop(ctx, argv):
                 # 이어받는다. 회차를 올리고 **경계를 남긴다** — 측정 창이 이전
                 # 회차와 섞이지 않게. 그리고 다시 열린 작업이므로 closed_at 을 지운다.
                 new_cycle = (existed["cycle"] or 1) + 1
-                record_event(con, want, cfg["stages"][0]["id"], "cycle_close",
-                             "adopt", "%s-%s" % (want, existed["cycle"] or 1),
+                # **`cycle_close` 를 쓰지 않는다.** 그 종류는 두 가지로 소비된다 —
+                # 측정 창의 경계(cycle_window_start)와 회차 스냅샷(_cycle_rows 가
+                # detail 을 JSON 으로 파싱한다). 재연결은 회차 스냅샷이 아니므로
+                # 그 종류를 쓰면 이전 회차의 측정치가 창에서 빠지면서 기록되지도
+                # 않고, 사유가 JSON 처럼 생기면 가짜 회차로 집계된다 — 리뷰가
+                # 둘 다 찾았다. 접두사를 바꾸는 것이 목적이었으므로 측정은 건드리지
+                # 않는다. 별개 종류로 기록만 남긴다.
+                record_event(con, want, cfg["stages"][0]["id"], "cycle_adopt",
+                             str(existed["cycle"] or 1),
+                             "%s-%s" % (want, existed["cycle"] or 1),
                              argv_value(argv, "reason") or "")
                 con.execute("UPDATE loop SET cycle=?, closed_at=NULL WHERE id=?",
                             (new_cycle, want))
