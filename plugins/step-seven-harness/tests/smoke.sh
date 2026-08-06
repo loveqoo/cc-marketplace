@@ -2653,6 +2653,33 @@ copy = s.index('P=\"\$D/harness.py\"')
 print(0 if cache < copy else 1)" "$WO/.claude/harness/bin/harness")"
 rm -rf "$WO"
 
+echo "== 래퍼의 고정 경로는 세션 시작마다 갱신된다 (구버전 고정이 지속되지 않는다)"
+# 4차 리뷰가 "구버전 캐시가 남아 있으면 래퍼가 계속 구 엔진을 쓴다" 고 지적했다.
+# 추론으로 '세션 시작이 다시 쓰니 한 세션에 한정된다' 고 넘겼는데, 추론이 이 세션에서
+# 세 번 틀렸으므로 재현해 고정한다.
+SW2="$(mktemp -d)"
+mkdir -p "$SW2/fake/old/scripts" "$SW2/fake/new/scripts" "$SW2/w"
+for V in old new; do
+  cp "$ENGINE" "$SW2/fake/$V/scripts/harness.py"
+  cp -r "$(cd "$(dirname "$ENGINE")/../templates" && pwd)" "$SW2/fake/$V/"
+  python3 -c "
+import sys
+p, v = sys.argv[1], sys.argv[2]
+s = open(p, encoding='utf-8').read()
+s = s.replace('def cli_status(ctx, argv):',
+              'def cli_status(ctx, argv):\n    print(\'ENGINE=%s\' % v), ' .replace('%s', v).replace(' % v', '') + 'None', 1)
+open(p, 'w', encoding='utf-8').write(s)
+" "$SW2/fake/$V/scripts/harness.py" "$V"
+done
+(cd "$SW2/w" && git init -q . && python3 "$SW2/fake/old/scripts/harness.py" init >/dev/null)
+check "래퍼가 자기를 쓴 엔진을 고정한다" 'fake/old'   "$(grep -oE 'P="[^"]*harness\.py"' "$SW2/w/.claude/harness/bin/harness" | head -1)"
+check "그 엔진이 실행된다" 'ENGINE=old'   "$( (cd "$SW2/w" && ./.claude/harness/bin/harness status 2>&1) )"
+# 새 엔진으로 세션이 시작되면 래퍼가 다시 쓰여야 한다
+printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$SW2/w"   | CLAUDE_PROJECT_DIR="$SW2/w" python3 "$SW2/fake/new/scripts/harness.py" hook >/dev/null 2>&1
+check "세션 시작이 고정 경로를 갱신한다" 'fake/new'   "$(grep -oE 'P="[^"]*harness\.py"' "$SW2/w/.claude/harness/bin/harness" | head -1)"
+check "이후 CLI 는 새 엔진을 쓴다" 'ENGINE=new'   "$( (cd "$SW2/w" && ./.claude/harness/bin/harness status 2>&1) )"
+rm -rf "$SW2"
+
 echo "== 회고 키 확인은 작업 전체를 읽는다 (창을 맞춘다)"
 # 키는 시간창(마지막 회차 종료 이후)에서 오는데 파일은 접두사창(이번 회차)에서 왔다.
 # loop adopt 가 회차만 올리므로 두 창이 갈라져 이미 적어둔 키가 '못 찾음' 이 됐다.
