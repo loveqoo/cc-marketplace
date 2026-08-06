@@ -131,7 +131,7 @@ echo "== 엔진 사본이 프로젝트 안에 있다"
 check "엔진 사본 생성" 'harness\.py' "$(ls "$WORK/.claude/harness/bin/")"
 check "래퍼가 사본을 먼저 가리킨다" 'P="\$D/harness\.py"' "$(cat "$WORK/.claude/harness/bin/harness")"
 check "사본으로 실행된다" '단계 1/7 Selection' \
-  "$(cd "$WORK" && ./.claude/harness/bin/harness status | head -1)"
+  "$(cd "$WORK" && ./.claude/harness/bin/harness status | grep '단계')"
 
 echo "== 하네스 자신은 수정할 수 없다"
 check "엔진 사본 쓰기 차단" '하네스 자신은 수정할 수 없다' \
@@ -201,7 +201,7 @@ check "거부 시 대안을 제시한다" 'skip until:compounding' \
   "$(cli skip compounding --reason '회고 생략' || true)"
 check "compounding 을 지나치는 +N 도 거부" '건너뛸 수 없다' \
   "$(cli skip +6 --reason '전부 생략' || true)"
-check "단계가 유지된다" 'Planning' "$(cli status | head -1)"
+check "단계가 유지된다" 'Planning' "$(cli status | grep '단계')"
 
 echo "== 스킵은 승인을 면제하지만 기록을 면제하지 않는다"
 check "계획 없이 Planning 스킵 거부" '기록은 남겨야 한다' \
@@ -1329,7 +1329,7 @@ echo "== Ctx 언팩 누락 (AST 전수)"
 COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)"; CRC2=$?
 check "ctx 를 풀지 않고 쓰는 함수가 없다" '^0$' "$CRC2"
 # `[0-9]*` 는 `함수 0개` 에도 맞았다 — 0개를 훑고도 '훑었다'가 통과했다.
-check "검사가 실제로 함수를 훑었다" '함수 [1-9][0-9]* *개' "$COUT"
+check "검사가 실제로 함수를 훑었다" '함수 스코프 [1-9][0-9]* *개' "$COUT"
 
 echo "== 계획 승인 다이얼로그가 계획을 보여준다"
 # auto-mode(acceptEdits)에서도 계획 승인은 물어야 한다 — "편집 자동 수락" 이지
@@ -2317,12 +2317,27 @@ for F in ".claude/harness/bin/harness.py" ".claude/harness/bin/harness" \
 done
 check "allow 로도 stages.json 으로도 못 연다고 말한다" 'stages.json` 을 고쳐서도 열 수 없다' \
   "$(slw '.claude/harness/harness.db')"
+
 check "차단이 self_lock 으로 적립된다" '^self_lock$' \
   "$(python3 -c "
 import sqlite3, sys
 r = sqlite3.connect(sys.argv[1]).execute(
   \"SELECT rule FROM event WHERE kind='block' ORDER BY rowid DESC LIMIT 1\").fetchone()
 print(r[0] if r else '(없음)')" "$SLW/.claude/harness/harness.db")"
+echo "  -- 경로 표기를 바꿔 우회할 수 없다"
+# macOS·Windows 기본 파일시스템은 대소문자를 구분하지 않는다. `BIN/harness.py` 는
+# `bin/harness.py` 와 **같은 파일**인데 glob_match 는 대소문자를 구분해서 Write·Bash
+# 양쪽에서 통과했다 — 2차 리뷰 준비 중 직접 확인했다.
+for F in ".claude/harness/BIN/harness.py" ".claude/harness/Bin/Harness.PY" \
+         ".claude/harness/bin" ".claude/harness/harness.db-journal" \
+         ".claude/harness/bin/messages.ko.json" ".claude/harness/bin/./harness.py" \
+         ".claude/harness/bin/../bin/harness.py"; do
+  check "표기를 바꿔도 막힌다: $F" '하네스 자신은 수정할 수 없다' "$(slw "$F")"
+done
+for C in "rm .claude/harness/BIN/harness.py" "rm .claude/harness/harness.db-journal" \
+         "rm -rf .claude/HARNESS"; do
+  check "Bash 도 표기와 무관하게 막힌다: $C" '하네스 자신' "$(slb "$C")"
+done
 for C in "rm .claude/harness/bin/harness.py" "rm -rf .claude" \
          "dd if=/dev/null of=.claude/harness/harness.db" \
          "find .claude/harness -delete" "printf x >|.claude/harness/harness.db"; do
@@ -2441,10 +2456,127 @@ check "head 가 없어도 설정 문제를 알린다" '무시되는 설정' \
      | CLAUDE_PROJECT_DIR="$NW" python3 "$ENGINE" hook)"
 rm -rf "$DW" "$NW"
 
+echo "== 진짜 경계는 어디인가 (엔진 사본이 아니라 DB 다)"
+# 적대적 리뷰 두 차례가 자기 잠금 우회를 열 가지 넘게 찾았는데, 그 대상인
+# `.claude/harness/bin/` 은 **게이트가 아니었다.** 훅은 전부 플러그인 엔진을
+# 실행하므로 사본이 쓰레기가 되어도 판정은 그대로다. 반면 DB 를 못 읽으면
+# 모든 게이트가 한꺼번에 꺼진다. 무엇을 지켜야 하는지가 뒤바뀌어 있었다.
+BW2="$(mktemp -d)"
+(cd "$BW2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+b2w() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/%s"}}' "$BW2" "$BW2" "$1" \
+  | CLAUDE_PROJECT_DIR="$BW2" python3 "$ENGINE" hook; }
+echo 'garbage not python' > "$BW2/.claude/harness/bin/harness.py"
+check "엔진 사본이 쓰레기여도 훅은 판정한다" '"permissionDecision": "deny"' "$(b2w 'docs/x.md')"
+check "사본은 세션마다 복원된다" 'step-seven-harness engine' \
+  "$(printf '{"hook_event_name":"SessionStart","cwd":"%s"}' "$BW2" \
+     | CLAUDE_PROJECT_DIR="$BW2" python3 "$ENGINE" hook >/dev/null; \
+     head -3 "$BW2/.claude/harness/bin/harness.py")"
+
+echo "  -- DB 를 못 읽으면 게이트가 꺼진다. 그 사실을 **매번** 말한다."
+echo 'not a database' > "$BW2/.claude/harness/harness.db"
+rm -f "$BW2/.claude/harness/harness.db-wal" "$BW2/.claude/harness/harness.db-shm"
+DBOUT="$(b2w 'docs/x.md' 2>/dev/null)"
+check "차단하지 않는다 (세션을 벽돌로 만들지 않는다)" '^0$' \
+  "$(printf '%s' "$DBOUT" | grep -c permissionDecision || true)"
+check "모든 게이트가 꺼졌다고 말한다" '모든 게이트가 꺼졌다' "$DBOUT"
+check "복구 방법을 준다" 'init' "$DBOUT"
+check "PreToolUse 에서도 말한다 (세션 시작뿐이 아니다)" 'systemMessage' "$DBOUT"
+b2rc=0
+printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$BW2" "$BW2" \
+  | CLAUDE_PROJECT_DIR="$BW2" python3 "$ENGINE" hook >/dev/null 2>&1 && b2rc=0 || b2rc=$?
+check "종료 코드는 여전히 0" '^0$' "$b2rc"
+rm -rf "$BW2"
+
+echo "== 강제되는 것을 숫자로 보여준다 (예측이 아니라 결과)"
+# 공허한 설정을 모양마다 예측해 진단하려 했더니 끝이 없었다(빈 목록, 아무것도 안 맞는
+# 정규식, 이름 바꾸기, 조건 배열 비우기…). 대신 **결과를 보여준다.**
+EF="$(mktemp -d)"
+(cd "$EF" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ef() { (cd "$EF" && python3 "$ENGINE" "$@"); }
+check "정상 상태를 숫자로 보여준다" '쓰기 규칙 7 · 보호 경로 7' "$(ef status 2>&1)"
+check "게이트 있는 단계 수를 보여준다" '게이트 있는 단계 4/7' "$(ef status 2>&1)"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+# Codex 가 진단을 빠져나간 모양들: 이름 바꾸기 + 게이트 제거
+cfg['criteria']['approval'] = cfg['criteria'].pop('plan_approved')
+for st in cfg['stages']:
+    if st['id'] == 'planning':
+        st['exit_criteria'] = ['plan_file', 'approval']
+    if st['id'] == 'compounding':
+        st['exit_criteria'] = []; st['stop_requires'] = []
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$EF/.claude/harness/stages.json"
+check "게이트를 지우면 숫자가 줄어 보인다" '게이트 있는 단계 3/7' "$(ef status 2>&1)"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['write_rules'] = []; cfg['consent'] = {}
+cfg['folder_rules']['protected_paths'] = []
+for st in cfg['stages']:
+    st['exit_criteria'] = []; st['stop_requires'] = []
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$EF/.claude/harness/stages.json"
+check "전부 비우면 0 으로 보인다" '쓰기 규칙 0' "$(ef status 2>&1)"
+check "게이트 있는 단계도 0" '게이트 있는 단계 0/7' "$(ef status 2>&1)"
+check "승인 필요도 0" '승인 필요 0' "$(ef status 2>&1)"
+check "바닥값은 남아 있다 (보호 경로 3)" '보호 경로 3' "$(ef status 2>&1)"
+check "--json 에도 실린다" 'enforcing' "$(ef status --json 2>&1)"
+
+echo "  -- 검증 패턴은 탐침으로 본다 (텍스트를 읽지 않는다)"
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['criteria']['verification_evidence']['bash_pattern'] = '.*'
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$EF/.claude/harness/stages.json"
+check "검증이 아닌 명령도 인정하면 지적한다" '검증이 아닌 명령도 증거로 인정한다' \
+  "$(ef status 2>&1)"
+check "어떤 명령이 걸렸는지 보여준다" 'echo hi' "$(ef status 2>&1)"
+rm -rf "$EF"
+
+echo "== 재연결은 상태 전이다 (INSERT OR IGNORE 가 아니다)"
+AD="$(mktemp -d)"
+(cd "$AD" && git init -q . && python3 "$ENGINE" init >/dev/null)
+ad() { (cd "$AD" && python3 "$ENGINE" "$@"); }
+adinfo() { python3 -c "
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+r = c.execute('SELECT cycle, closed_at FROM loop WHERE id=?', (sys.argv[2],)).fetchone()
+n = c.execute(\"SELECT COUNT(*) FROM event WHERE loop_id=? AND kind='cycle_close'\",
+              (sys.argv[2],)).fetchone()[0]
+print('cycle=%s closed=%s boundaries=%d' % (r[0], r[1] is not None, n))
+" "$AD/.claude/harness/harness.db" "$1"; }
+# ① 없는 ID 는 새로 만드는 것이므로 회차 1 이어야 한다
+check "없는 ID 는 새로 만들었다고 말한다" '새로 만들었다' \
+  "$(ad loop adopt 999999-zzzzzz --reason '없는 ID' 2>&1)"
+check "없는 ID 는 회차 1 에서 시작한다" 'cycle=1' "$(adinfo 999999-zzzzzz)"
+# ② 연속 재연결은 회차마다 **경계**를 남겨야 한다 (측정 창이 섞이지 않게)
+ad loop intent x >/dev/null; ad loop done-when y >/dev/null
+ADL="$(ad status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["loop"])')"
+ad loop adopt "$ADL" --reason '1차' >/dev/null
+check "재연결이 회차 경계를 남긴다" 'cycle=2 closed=False boundaries=1' "$(adinfo "$ADL")"
+ad loop adopt "$ADL" --reason '2차' >/dev/null
+check "연속 재연결도 경계를 남긴다" 'cycle=3 closed=False boundaries=2' "$(adinfo "$ADL")"
+# ③ 닫힌 작업을 재연결하면 closed_at 이 지워져야 한다 (tidy 가 닫힌 것으로 보면 안 된다)
+ad loop new --reason '새 작업' >/dev/null 2>&1 || true
+check "loop new 는 이전 작업을 닫는다" 'closed=True' "$(adinfo "$ADL")"
+ad loop adopt "$ADL" --reason '부활' >/dev/null
+check "재연결은 다시 열린 작업으로 만든다" 'closed=False' "$(adinfo "$ADL")"
+rm -rf "$AD"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"
-check_empty "DB 손상 시 차단하지 않음" "$(hook "$(W docs/x.md)" 2>/dev/null)"
+# 예전 계약은 "출력 없음" 이었다. 그건 **게이트가 꺼진 사실의 은폐**였다 —
+# 세션 중간에 DB가 깨지면 남은 세션 전체가 게이트 없이 돌면서 아무 말이 없었다.
+# 새 계약: 판정은 하지 않되(차단하지 않음) 꺼진 사실은 말한다.
+DBROKEN="$(hook "$(W docs/x.md)" 2>/dev/null)"
+check_absent "DB 손상 시 차단하지 않음" 'permissionDecision' "$DBROKEN"
+check "DB 손상을 사용자에게 알린다" '모든 게이트가 꺼졌다' "$DBROKEN"
 hook "$(W docs/x.md)" >/dev/null 2>&1; CRC=$?
 check "DB 손상 시 종료 코드 0" '^0$' "$CRC"
 check "traceback 을 내지 않는다" '^0$' \

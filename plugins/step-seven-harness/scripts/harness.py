@@ -621,6 +621,22 @@ def config_problems(cfg):
                                          ("rm x", "mv a b", "echo x > y", "sed -i s/a/b/ f")):
             out.append(t("bash.mutator_pattern 이 흔한 변경 명령을 하나도 잡지 못한다 "
                          "— 문법은 맞지만 사실상 꺼진 것이다"))
+    # 검증 증거 패턴을 **탐침한다.** 설정 텍스트를 읽어 "이게 너무 넓은가"를 판단하는
+    # 것은 끝이 없다(`.*`, `.+`, `[\s\S]*`, `|`…). 대신 **증거가 되면 안 되는 명령**을
+    # 넣어 보고 걸리는지 본다. 파싱이 아니라 실험이다.
+    vpat = cfg.at("criteria.verification_evidence.bash_pattern")
+    if vpat:
+        try:
+            vre = re.compile(vpat)
+        except re.error:
+            vre = None
+        if vre is not None:
+            hits = [c for c in ("ls", "echo hi", "cat README.md", "git status")
+                    if vre.search(c)]
+            if hits:
+                out.append(t("criteria.verification_evidence.bash_pattern 이 검증이 "
+                             "아닌 명령도 증거로 인정한다 (%s) — 성공한 아무 명령이나 "
+                             "Verification 을 통과시킨다") % ", ".join(hits))
     bad_readers = [r for r in cfg.seq("bash.readers") if r in NEVER_READERS]
     if bad_readers:
         out.append(t("bash.readers 의 %s 는 변경 명령이라 읽기로 선언할 수 없다 "
@@ -1535,10 +1551,9 @@ def _first_violation(w, rules):
 # "규칙이 틀렸으면 stages.json 을 고쳐라"는 그대로 유지된다. 단 하나, **잠금을 푸는
 # 방향으로는** 고칠 수 없다. 근거 문서가 이미 "이 차단은 allow 로도 열리지 않는다"고
 # 못박은 그 예외를 설정에도 적용하는 것이다.
-SELF_LOCK = (".claude/harness/bin/**",
-             ".claude/harness/harness.db",
-             ".claude/harness/harness.db-wal",
-             ".claude/harness/harness.db-shm")
+SELF_LOCK = (".claude/harness/bin",
+             ".claude/harness/bin/**",
+             ".claude/harness/harness.db*")
 SELF_LOCK_MSG = ("하네스 자신은 수정할 수 없다 (%s). 이 차단은 `allow` 로도, "
                  "`stages.json` 을 고쳐서도 열 수 없다 — 엔진과 상태를 바꿀 수 있으면 "
                  "모든 게이트가 무의미해진다. 규칙을 바꾸려면 `stages.json` 의 "
@@ -1546,9 +1561,17 @@ SELF_LOCK_MSG = ("하네스 자신은 수정할 수 없다 (%s). 이 차단은 `
 
 
 def self_lock_hit(rel):
-    """바닥값에 걸리나. 설정을 보지 않는다 — 그게 요점이다."""
+    """바닥값에 걸리나. 설정을 보지 않는다 — 그게 요점이다.
+
+    **대소문자를 무시하고 본다.** macOS·Windows 의 기본 파일시스템은 대소문자를
+    구분하지 않으므로 `.claude/harness/BIN/harness.py` 는 `bin/harness.py` 와
+    **같은 파일**이다. glob_match 는 대소문자를 구분해서 그 경로가 Write·Bash 양쪽에서
+    통과했다 — 직접 확인했다. 대소문자만 다른 경로를 하네스 자기 영역에 만드는
+    정당한 이유는 없으므로, 구분하는 파일시스템에서 과잉 차단이 되는 것을 받아들인다.
+    """
+    low = rel.lower()
     for pat in SELF_LOCK:
-        if glob_match(rel, pat):
+        if glob_match(rel, pat) or glob_match(low, pat.lower()):
             return True
     return False
 
@@ -1644,12 +1667,16 @@ def bash_protected_hit(cfg, root, cmd):
                 continue
             if any(glob_match(rel, p) for p in use):
                 return rel
+            # 바닥값은 대소문자를 무시하고도 본다 (macOS 에서 BIN == bin 이다).
+            if self_lock_hit(rel):
+                return rel
             # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
             # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
             # 바닥값에 대해서는 mutating 판정을 믿지 않는다 — `mutator_pattern` 을
             # `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이 검사가
             # 통째로 꺼졌다. 설정으로 잠금을 푸는 방향은 막는다.
-            if any(p.startswith(rel + "/") for p in floor):
+            low = rel.lower()
+            if any(p.lower().startswith(low + "/") for p in floor):
                 return rel
             if mutating and any(p.startswith(rel + "/") for p in use):
                 return rel
@@ -2416,6 +2443,23 @@ def run_hook():
         # fail-open 처리 밖이라 traceback + exit 1 이 됐다 — 재현했다.
         con = connect(root)
         if con is None:
+            # **여기가 하네스의 유일한 진짜 자산이다.**
+            #
+            # 적대적 리뷰 두 차례에서 자기 잠금 우회를 열 가지 넘게 찾았는데, 그
+            # 대상(`.claude/harness/bin/`)은 **게이트가 아니었다.** 훅은 전부
+            # `${CLAUDE_PLUGIN_ROOT}` 의 플러그인 엔진을 실행하므로 프로젝트 사본이
+            # 쓰레기가 되어도 판정은 그대로 돌아간다 — 직접 확인했다. 사본은 CLI
+            # 편의용이고, `refresh_engine` 이 세션마다 다시 덮는다.
+            #
+            # 반면 DB 를 못 읽으면 **모든 게이트가 한꺼번에 꺼진다.** 그런데 예전에는
+            # stderr 한 줄만 남기고 조용히 통과시켰다. 세션을 벽돌로 만들지 않으려는
+            # fail-open 은 맞지만, **꺼진 사실을 숨기는 것은 fail-open 이 아니라
+            # 은폐다.** 판정은 열어 주고 사실은 매번 말한다.
+            emit({"systemMessage":
+                  t("harness: 상태 DB(%s)를 읽을 수 없어 **모든 게이트가 꺼졌다.** "
+                    "단계·쓰기 규칙·종료 조건이 지금 아무것도 막지 않는다. "
+                    "복구: `%s init` (기록은 .dev/ 의 파일에 남아 있다).")
+                  % (DB_REL, WRAPPER_CMD)})
             return 0
         cfg = load_config(root, plugin_root())
         load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
@@ -2457,12 +2501,17 @@ def run_hook():
     except Exception as exc:
         # 차단하지 않는다. exit 1 은 Claude Code 가 훅 오류로 표면화하므로,
         # 무력해지더라도 조용히 빠진다 — 세션을 벽돌로 만드는 것보다 낫다.
-        # 단 세션 시작 때는 한 번 알린다. 조용히 죽으면 고장을 모른다.
+        #
+        # **그러나 조용히 빠지지도 않는다.** 예전에는 세션 시작에서만 알렸고, 그래서
+        # 세션 중간에 상태가 깨지면 남은 세션 전체가 게이트 없이 돌면서 아무 말이
+        # 없었다 — 손상된 DB 는 예외로 오므로 바로 이 경로다. 판정은 열어 주고
+        # 사실은 매번 말한다. 소음이 은폐보다 낫다.
         sys.stderr.write("step-seven-harness: %s\n" % exc)
-        if inp.get("hook_event_name") == "SessionStart":
-            emit({"systemMessage":
-                  t("harness: 하네스가 오류로 비활성 상태다 (%s). 스키마가 오래됐으면 "
-                  "`.claude/harness/bin/harness init` 을 다시 실행하라.") % exc})
+        emit({"systemMessage":
+              t("harness: 상태를 읽을 수 없어 **모든 게이트가 꺼졌다** (%s). "
+                "단계·쓰기 규칙·종료 조건이 지금 아무것도 막지 않는다. "
+                "복구: `%s init` (기록은 .dev/ 의 파일에 남아 있다).")
+              % (exc, WRAPPER_CMD)})
         return 0
     finally:
         if con is not None:
@@ -2621,9 +2670,32 @@ def status_report(ctx):
         "pending_promotions": [it["key"] for it in pending_promotions(con, cfg)],
         "promoted": promotion_summary(con, cfg),
         "tidy": tidy_headline(con, cfg, root),
+        "enforcing": enforcing_summary(cfg),
         # 작업이 정해지지 않았을 때만. 정해졌으면 후보는 소음이다.
         "candidates": ([] if (row and row["intent"])
                        else work_candidates(con, cfg, root)),
+    }
+
+
+def enforcing_summary(cfg):
+    """**지금 실제로 강제되고 있는 것.**
+
+    왜 세는가: 공허한 설정을 하나하나 예측해 진단하려 했더니 모양마다 새 규칙이
+    필요했고(빈 목록, 아무것도 안 맞는 정규식, 이름 바꾸기, 조건 배열 비우기…),
+    그래도 계속 새어나갔다. 예측은 끝이 없다. 대신 **결과를 보여준다** — 규칙이
+    0개면 그 숫자가 보이고, 조건이 사라지면 그 숫자가 보인다. 어떤 방식으로
+    비웠는지는 알 필요가 없다.
+    """
+    stages = cfg.get("stages") or []
+    return {
+        "write_rules": len(write_rules(cfg)),
+        "protected_paths": len(protected_pats(cfg)),
+        "criteria": len(cfg.obj("criteria") or {}),
+        "gated_stages": sum(1 for st in stages
+                            if isinstance(st, dict) and (st.get("exit_criteria") or [])),
+        "stages": len(stages),
+        "consent": len(consent_map(cfg)),
+        "language": cfg.at("language") or "ko",
     }
 
 
@@ -2634,6 +2706,14 @@ def render_status(d, cfg):
         for p in d["config_problems"]:
             print("  - %s" % p)
         print()
+    e = d.get("enforcing") or {}
+    if e:
+        # 무엇이 실제로 강제되는지 **숫자로** 보여준다. 0 이 보이면 그게 신호다.
+        print(t("강제 중: 쓰기 규칙 %d · 보호 경로 %d · 종료 조건 %d "
+                "(게이트 있는 단계 %d/%d) · 승인 필요 %d · 언어 %s")
+              % (e.get("write_rules", 0), e.get("protected_paths", 0),
+                 e.get("criteria", 0), e.get("gated_stages", 0), e.get("stages", 0),
+                 e.get("consent", 0), e.get("language", "ko")))
     print(t("작업 %s · 회차 %d · 단계 %s") % (d["loop"], d["cycle"], d["stage_label"]))
     if d["intent"]:
         print(t("  작업 내용: %s") % d["intent"])
@@ -3862,19 +3942,41 @@ def cli_loop(ctx, argv):
         if not want:
             print(t("사용법: harness loop adopt <loop-id> --reason \"...\""))
             return 2
+        # **재연결은 상태 전이다.** 예전에는 `create_loop`(INSERT OR IGNORE)에
+        # 회차 +1 을 얹었고, 그래서 세 가지가 어긋났다 — 적대적 리뷰가 전부 찾았다.
+        #   ① 없는 ID 를 adopt 하면 cycle=1 행을 만든 뒤 올려 **첫 상태가 회차 2**
+        #   ② 연속 adopt 하면 `cycle_close` 없이 회차만 올라 **측정 창에 이전
+        #      회차의 이벤트가 섞인다**
+        #   ③ 닫힌 작업을 adopt 해도 `closed_at` 이 남아 tidy 가 닫힌 작업으로 본다
+        #
+        # 뿌리는 하나다. `INSERT OR IGNORE` 가 "만들기"와 "이어받기"를 뭉갰고,
+        # `cycle` 이 **접두사 구분자**와 **측정 창 번호** 두 일을 겸했다.
+        # 그래서 둘을 갈라 명시적으로 처리한다.
+        existed = con.execute("SELECT cycle, closed_at FROM loop WHERE id=?",
+                              (want,)).fetchone()
         with con:
             close_loop(con, lid)
-            create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
-            # **회차를 올린다.** 올리지 않으면 접두사가 그대로여서 지난 회차의
-            # 계획서·회고가 이번 회차의 종료 조건을 채운다 — `criterion_met` 이
-            # 디스크를 보기 때문이다. 실제로 그렇게 Planning 을 계획 없이 통과하고
-            # 스킵까지 되는 것을 확인했다. 재연결은 "1단계부터 다시"이므로 새 회차가
-            # 정직한 표현이고, 앞단 해시는 그대로라 과거 산출물은 여전히 grep 된다.
-            con.execute("UPDATE loop SET cycle=? WHERE id=?",
-                        (cycle_of(con, want) + 1, want))
-        print(t("작업 %s 재연결(사용자 승인). 단계는 1단계부터, 회차 %d 로 다시 "
-                "추적한다 — 지난 회차의 산출물은 이번 조건을 채우지 않는다.")
-              % (want, cycle_of(con, want)))
+            if existed:
+                # 이어받는다. 회차를 올리고 **경계를 남긴다** — 측정 창이 이전
+                # 회차와 섞이지 않게. 그리고 다시 열린 작업이므로 closed_at 을 지운다.
+                new_cycle = (existed["cycle"] or 1) + 1
+                record_event(con, want, cfg["stages"][0]["id"], "cycle_close",
+                             "adopt", "%s-%s" % (want, existed["cycle"] or 1),
+                             argv_value(argv, "reason") or "")
+                con.execute("UPDATE loop SET cycle=?, closed_at=NULL WHERE id=?",
+                            (new_cycle, want))
+                create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
+            else:
+                # 없던 ID 다. 새로 만드는 것이므로 1회차에서 시작한다.
+                new_cycle = 1
+                create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
+        if existed:
+            print(t("작업 %s 재연결(사용자 승인). 단계는 1단계부터, 회차 %d 로 다시 "
+                    "추적한다 — 지난 회차의 산출물은 이번 조건을 채우지 않는다.")
+                  % (want, new_cycle))
+        else:
+            print(t("작업 %s 는 기록에 없어 **새로 만들었다**(사용자 승인). "
+                    "회차 1 · 단계 1부터 시작한다.") % want)
         return 0
     row = con.execute("SELECT * FROM loop WHERE id=?", (lid,)).fetchone()
     print("loop %s · branch %s · created %s"
