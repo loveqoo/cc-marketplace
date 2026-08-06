@@ -2761,17 +2761,34 @@ def rule_reachable(cfg, rule):
 # 그 원칙을 여기서 완성한다. **실제 판정 함수에 대표 입력을 넣고 결과를 본다.**
 # 이건 대리 지표가 아니라 강제 그 자체를 돌려 본 것이므로 거짓말할 수 없다.
 
+# **탐침마다 단계를 고정한다.** 고정하지 않으면 결과가 "지금 어느 단계인가"에
+# 좌우된다 — 예컨대 Selection 에서는 `stage_write` 가 거의 전부를 막아, 다른 규칙이
+# 죽어도 탐침이 통과한다(막히긴 하되 **다른 이유로**). 규칙마다 그 규칙이 유일한
+# 차단자인 단계를 골라야 "이 규칙이 살아 있나"를 실제로 묻게 된다.
+#
+# (설명, 종류, 대상, 막혀야 하나, 어느 단계에서 볼까 — None 이면 현재 단계)
 SELFTEST = (
-    # (설명, 종류, 대상, 막혀야 하나)
-    ("하네스 엔진 사본 쓰기", "write", ".claude/harness/bin/harness.py", True),
-    ("상태 DB 쓰기", "write", ".claude/harness/harness.db", True),
-    ("Bash 로 엔진 삭제", "bash", "rm .claude/harness/bin/harness.py", True),
-    ("Bash 로 .claude 삭제", "bash", "rm -rf .claude", True),
-    ("docs/ 쓰기 (사람의 영역)", "write", "docs/probe.md", True),
-    (".dev/ 하위 폴더 규칙", "write", ".dev/__probe__/a.md", True),
-    (".dev/ 산출물 접두사", "write", ".dev/plan/__probe__.md", True),
-    ("읽기는 통과해야 한다", "bash", "cat .claude/harness/harness.db", False),
-    ("접두사 붙인 산출물은 통과", "write", ".dev/plan/<PREFIX>probe.md", False),
+    ("하네스 엔진 사본 쓰기", "write", ".claude/harness/bin/harness.py", True, None),
+    ("상태 DB 쓰기", "write", ".claude/harness/harness.db", True, None),
+    ("Bash 로 엔진 삭제", "bash", "rm .claude/harness/bin/harness.py", True, None),
+    ("Bash 로 .claude 삭제", "bash", "rm -rf .claude", True, None),
+    # 설정이 정한 보호 경로. context 쓰기가 허용된 단계라야 `protected` 가 유일한
+    # 차단자가 된다 — 아니면 stage_write 가 먼저 막아 구분이 안 된다.
+    ("설정의 보호 경로", "write", ".claude/harness/LEARNED.md", True, "scaffolding"),
+    ("docs/ 쓰기 (사람의 영역)", "write", "docs/probe.md", True, None),
+    # 단계별 쓰기 허용. context 가 허용되지 않는 단계에서 context 경로를 친다.
+    ("단계별 쓰기 허용", "write", ".claude/settings.json", True, "selection"),
+    # 신규 최상위 폴더. source 가 허용된 단계라야 new_toplevel 이 유일한 차단자다.
+    ("신규 최상위 폴더", "write", "__probe_top__/a.py", True, "execution"),
+    (".dev/ 하위 폴더 규칙", "write", ".dev/__probe__/a.md", True, None),
+    (".dev/ 산출물 접두사", "write", ".dev/plan/__probe__.md", True, None),
+    # 예외(`allow`)가 걸린 상태에서만 도달하는 규칙들. DB를 건드리지 않으려고
+    # 가짜 grant 를 끼워 판정만 돌린다 — 실제 예외를 등록하면 자기검사가 상태를
+    # 바꾸게 되고, 그러면 "보기만 하는 명령" 이라는 계약이 깨진다.
+    ("예외가 있어도 docs 명명 규칙", "grant", "docs/spec/__probe__.md", True, "scaffolding"),
+    ("예외가 있으면 docs 에 쓸 수 있다", "grant", "docs/spec/001-probe.md", False, "scaffolding"),
+    ("읽기는 통과해야 한다", "bash", "cat .claude/harness/harness.db", False, None),
+    ("접두사 붙인 산출물은 통과", "write", ".dev/plan/<PREFIX>probe.md", False, None),
 )
 
 
@@ -2817,14 +2834,23 @@ def selftest(ctx):
     con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     pre = file_prefix(con, lid)
     out = []
-    for raw_label, kind, target, want_block in SELFTEST:
+    ids = stage_ids(cfg)
+    for raw_label, kind, target, want_block, at_stage in SELFTEST:
         label = t(raw_label)
         tgt = target.replace("<PREFIX>", pre)
+        # 단계가 지정됐고 그 단계가 존재하면 그 단계로 판정한다. 없으면 현재 단계.
+        probe_ctx = ctx
+        if at_stage and at_stage in ids and at_stage != sid:
+            probe_ctx = Ctx(con, cfg, root, lid, at_stage)
         try:
-            if kind == "write":
+            if kind in ("write", "grant"):
                 # check_write 는 차단을 event 로 적립한다. 자기검사가 통계를 오염시키면
                 # 안 되므로 판정 부분만 직접 부른다.
-                w = WriteReq(ctx, tgt)
+                w = WriteReq(probe_ctx, tgt)
+                if kind == "grant" and not w.grant:
+                    # 예외가 걸린 상태를 흉내낸다. 소비하지 않으므로 상태는 그대로다.
+                    w.grant = {"id": -1, "glob": tgt, "uses_left": 1,
+                               "reason": "selftest"}
                 if self_lock_hit(tgt):
                     blocked, why = True, t("바닥값")
                 else:

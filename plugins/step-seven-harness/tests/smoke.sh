@@ -2596,6 +2596,56 @@ sfed "cfg['criteria']['verification_evidence']['bash_pattern'] = '\\\\btrue\\\\b
 check "true 를 증거로 삼는 패턴도 잡는다" 'true' "$(sf status 2>&1)"
 rm -rf "$SF"
 
+echo "== 검사기를 검사한다: 규칙을 죽이면 자기검사가 알아채야 한다"
+# 자기검사가 주 신뢰 장치가 됐으니, **탐침 누락**이 곧 조용한 구멍이다. 그것을 내
+# 판단으로 지키면 또 놓친다(세 라운드가 그랬다). 규칙마다 죽여 보고 알아채는지
+# 기계가 확인한다. 규칙을 새로 더할 때 탐침을 잊으면 여기서 실패한다.
+#
+# 탐침은 **단계를 고정한다.** 고정하지 않으면 Selection 에서 stage_write 가 거의
+# 전부를 막아 다른 규칙이 죽어도 통과한다 — 막히긴 하되 다른 이유로. 직접 확인했다.
+MT="$(mktemp -d)"
+mtkill() { # mtkill <rule-id> ; 그 규칙만 뺀 프로젝트를 만든다
+  rm -rf "$MT/w"; mkdir -p "$MT/w"
+  (cd "$MT/w" && git init -q . && python3 "$ENGINE" init >/dev/null)
+  [ -n "$1" ] && python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+cfg['write_rules'] = [r for r in cfg['write_rules'] if r.get('id') != sys.argv[2]]
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$MT/w/.claude/harness/stages.json" "$1"
+  (cd "$MT/w" && python3 "$ENGINE" status 2>&1); }
+
+check "정상이면 전부 통과" '자기검사: [0-9]*/[0-9]* 통과' "$(mtkill '')"
+# docs_readonly 를 뺀 나머지 여섯은 죽이면 반드시 잡혀야 한다
+for R in protected stage_write new_toplevel dev_subdir loop_prefix docs_naming; do
+  check "$R 를 죽이면 자기검사가 잡는다" '자기검사 [0-9]*/[0-9]* 실패' "$(mtkill "$R")"
+done
+# docs_readonly 만 예외다 — **기본 설정에서는 진짜 중복**이기 때문이다.
+# 어떤 단계도 docs 쓰기를 허용하지 않으므로 stage_write 가 먼저 막고, grant 가 있으면
+# 둘 다 grant_opens 라 함께 열린다. 지워도 결과가 바뀌는 상태가 없다.
+check "docs_readonly 는 기본 설정에서 중복이다" '자기검사: [0-9]*/[0-9]* 통과' \
+  "$(mtkill docs_readonly)"
+# 그런데 **죽은 코드는 아니다.** docs 쓰기를 허용하는 단계를 만들면 유일한 차단자가
+# 된다. 그 상태를 만들어 확인한다 — 예외를 '중복이다' 한마디로 넘기지 않는다.
+rm -rf "$MT/w2"; mkdir -p "$MT/w2"
+(cd "$MT/w2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+python3 -c "
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p, encoding='utf-8'))
+for st in cfg['stages']:
+    if st['id'] == 'scaffolding':
+        st['write'].append('docs')
+json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+" "$MT/w2/.claude/harness/stages.json"
+MTW2="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"%s/docs/x.md"}}' "$MT/w2" "$MT/w2")"
+(cd "$MT/w2" && python3 "$ENGINE" loop intent x >/dev/null \
+  && python3 "$ENGINE" loop done-when y >/dev/null && python3 "$ENGINE" advance >/dev/null)
+check "docs 를 허용하면 docs_readonly 가 유일한 차단자다" '사람이 기록하는 영역' \
+  "$(printf '%s' "$MTW2" | CLAUDE_PROJECT_DIR="$MT/w2" python3 "$ENGINE" hook)"
+rm -rf "$MT"
+
 echo "== 강제되는 것을 숫자로 보여준다 (예측이 아니라 결과)"
 # 공허한 설정을 모양마다 예측해 진단하려 했더니 끝이 없었다(빈 목록, 아무것도 안 맞는
 # 정규식, 이름 바꾸기, 조건 배열 비우기…). 대신 **결과를 보여준다.**
