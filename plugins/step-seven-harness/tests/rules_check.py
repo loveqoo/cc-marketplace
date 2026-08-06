@@ -265,6 +265,31 @@ ck("대상이 분명하면 바닥값이 막는다",
 ck("정상 명령은 바닥값에 걸리지 않는다",
    h.bash_protected_hit(cfg, root, "find . -name '*.pyc' -delete") is None)
 
+print("측정 창과 회고 창은 다른 질문이다")
+# 재연결(`cycle_adopt`)은 **측정 창만** 새로 연다. 측정 창이 안 열리면 버려진 회차의
+# 마찰이 다음 회차 기록으로 흡수되고, 회고 창까지 열리면 이미 적어 둔 회고가
+# '못 찾음' 이 된다. 한 창으로는 둘 중 하나가 늘 틀린다.
+with con:
+    h.record_event(con, lid, ctx.sid, "block", "wr", "w.md", "창 검사")
+    h.record_event(con, lid, ctx.sid, "cycle_adopt", "2", "%s-2" % lid, "재연결")
+mw, rw = h.cycle_window_start(con, lid), h.retro_window_start(con, lid)
+ck("재연결이 측정 창을 새로 연다", mw > rw, "측정=%s 회고=%s" % (mw, rw))
+ck("재연결이 회고 창은 건드리지 않는다",
+   rw == 0 or rw < mw, "회고=%s" % rw)
+ck("재연결 전 이벤트가 측정에서 빠진다",
+   not [r for r in h.events_where(con, loop_id=lid, after_id=mw) if r["rule"] == "wr"])
+ck("재연결 전 이벤트가 회고 범위에는 남는다",
+   [r for r in h.events_where(con, loop_id=lid, after_id=rw) if r["rule"] == "wr"] != [])
+
+# 사본은 세션마다 원본으로 다시 맞춰진다 (미검사였다).
+_copy = os.path.join(root, h.ENGINE_REL)
+ck("엔진 사본이 만들어진다", os.path.isfile(_copy))
+_before = open(_copy, encoding="utf-8").read()
+with open(_copy, "a", encoding="utf-8") as fh:
+    fh.write("\n# 사람이 남긴 표시\n")
+h.refresh_engine(root)
+ck("사본은 원본으로 다시 맞춰진다", open(_copy, encoding="utf-8").read() == _before)
+
 print("한 번뿐인 일은 조건부 UPDATE 로 차지한다")
 # 단계 전이가 유일 소비점이지만, 카운터 자체도 **차지하지 못하면 False** 여야 한다.
 # 읽고-쓰면 진 쪽도 True 를 받고 값이 음수로 내려간다.
@@ -297,15 +322,34 @@ ck("주석만 다른 것은 변조가 아니다 (오판은 마찰이다)", h.wra
 os.unlink(wp)
 ck("래퍼가 없으면 실행하지 않고 복구한다", h.wrapper_intact(root) is False)
 ck("복구 뒤에는 통한다", h.wrapper_intact(root) is True)
-# 복구조차 못 하면 그 사실을 구분해 돌려준다 — 거짓 안내가 더 나쁘다.
-os.chmod(os.path.dirname(wp), 0o500)
+# 셰방은 **인터프리터를 정한다.** 이 한 줄만 바꿔도 사전 승인된 경로가 남의
+# 인터프리터를 돌린다 — `wrapper_code` 가 1행을 남기는 이유가 그것인데, 그 문장을
+# 지키는 검사가 없어서 1행을 버리는 뮤테이션이 그대로 초록이었다.
+body = open(wp, encoding="utf-8").read()
+with open(wp, "w", encoding="utf-8") as fh:
+    fh.write(body.replace("#!/bin/sh", "#!/tmp/evil", 1))
+ck("셰방만 바뀌어도 변조로 본다", h.wrapper_intact(root) is False)
+ck("그리고 복구된다", h.wrapper_intact(root) is True)
+# 엔진 경로만 다른 것은 **변조가 아니라 낡은 것**이다 (플러그인 업데이트).
+body = open(wp, encoding="utf-8").read()
+import re as _re
+with open(wp, "w", encoding="utf-8") as fh:
+    fh.write(_re.sub(r'^P="[^"]*"$', 'P="/other/plugin/scripts/harness.py"',
+                     body, count=1, flags=_re.M))
+ck("엔진 경로만 다르면 변조로 보지 않는다", h.wrapper_intact(root) is True)
+ck("그래도 우리 경로로 맞춰 둔다",
+   'P="%s"' % os.path.abspath(h.__file__) in open(wp, encoding="utf-8").read())
+
+# 복구조차 못 하면 그 사실을 **구분해** 돌려준다 — 거짓 안내가 더 나쁘다.
+# (예전에는 상황만 만들고 단정을 하나도 하지 않아 이 분기가 통째로 미검사였다.)
+with open(wp, "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\necho PWNED\n")           # 먼저 변조해 둔다
+os.chmod(wp, 0o400)                                # 그 다음 쓰기를 막는다
 try:
-    os.chmod(wp, 0o400)
-    with open(wp + ".tmp", "w") as fh:
-        fh.write("x")
-except OSError:
-    pass
-os.chmod(os.path.dirname(wp), 0o700)
+    ck("복구도 못 하면 None 을 돌려준다", h.wrapper_intact(root) is None)
+finally:
+    os.chmod(wp, 0o755)
+ck("쓸 수 있게 되면 복구한다", h.wrapper_intact(root) is False)
 
 print("\n실패 %d개: %s" % (len(FAILS), FAILS or "없음"))
 con.close()

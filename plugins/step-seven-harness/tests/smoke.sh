@@ -793,7 +793,7 @@ IW="$(mktemp -d)"
   && printf '{"permissions":[]}\n' > .claude/settings.json \
   && printf '# 내 프로젝트\n\n예시: `@.claude/harness/LEARNED.md` 는 하네스가 만든다\n' > CLAUDE.md \
   && printf '# step-seven-harness (런타임 상태)\nnode_modules\n' > .gitignore)
-IOUT="$( (cd "$IW" && python3 "$ENGINE" init) 2>&1 )"; IRC=$?
+IRC=0; IOUT="$( (cd "$IW" && python3 "$ENGINE" init) 2>&1 )" || IRC=$?
 check "permissions 가 리스트여도 init 이 완주한다" '^0$' "$IRC"
 check "설치 완료를 보고한다" '하네스 설치 완료' "$IOUT"
 check "설명문 속 문자열은 앵커로 세지 않는다" '^2$' \
@@ -1402,7 +1402,8 @@ check "Compounding 스킵 거부는 until:compounding 을 안내한다" 'until:c
   "$(sb "$SH_ skip compounding --reason x")"
 check "정상 스킵은 여전히 승인을 받는다" '"permissionDecision": "ask"' \
   "$(sb "$SH_ skip context --reason '불필요'")"
-check "until:compounding 도 승인을 받는다" '"permissionDecision": "ask"' \
+check "기록이 남지 않았으면 훅도 미리 거부한다 (승인 뒤 거부 금지)" \
+  '"permissionDecision": "deny"' \
   "$(sb "$SH_ skip until:compounding --reason '구조 선행'")"
 check "안내받은 명령이 실제로 실행된다 (거부 이유가 다르다)" '기록은 남겨야 한다' \
   "$(sw skip until:compounding --reason '구조 선행')"
@@ -1483,7 +1484,7 @@ check "intent 가 있으면 후보를 숨긴다" '^0$' \
 rm -rf "$CW3"
 
 echo "== Ctx 언팩 누락 (AST 전수)"
-COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)"; CRC2=$?
+CRC2=0; COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)" || CRC2=$?
 check "ctx 를 풀지 않고 쓰는 함수가 없다" '^0$' "$CRC2"
 # `[0-9]*` 는 `함수 0개` 에도 맞았다 — 0개를 훑고도 '훑었다'가 통과했다.
 check "검사가 실제로 함수를 훑었다" '함수 스코프 [1-9][0-9]* *개' "$COUT"
@@ -1660,18 +1661,32 @@ pl loop intent "병렬 검사" >/dev/null
 pl loop done-when "끝" >/dev/null
 for i in 1 2 3 4; do (cd "$PLW" && python3 "$ENGINE" advance > "$PLW/ad$i" 2>&1) & done
 wait
-check "병렬 advance 는 하나만 통과한다" '^1$' \
-  "$(grep -l '→ 단계' "$PLW"/ad[1-4] | wc -l | tr -d ' ')"
-check "나머지는 이유를 듣는다" '^3$' \
-  "$(grep -l '이미 .*단계를 벗어났다' "$PLW"/ad[1-4] | wc -l | tr -d ' ')"
-check "단계는 정확히 하나만 나아갔다" '단계 2/7' "$(pl status)"
+# **경합의 결과를 기대값으로 박지 않는다.** 넷이 실제로 겹치는지는 스케줄러가 정하고,
+# 안 겹치면 넷 다 정상적으로 한 단계씩 나아간다(그것도 옳다). 검사할 것은 불변식이다:
+#   성공 + 거절 = 4  (아무도 조용히 사라지지 않는다)
+#   활성 단계 = 1     (전이가 겹쳐도 상태는 하나다)
+#   나아간 칸수 = 성공 수
+PLOK="$(grep -l '→ 단계' "$PLW"/ad[1-4] | wc -l | tr -d ' ')"
+PLNO="$(grep -l '이미 .*단계를 벗어났다' "$PLW"/ad[1-4] | wc -l | tr -d ' ')"
+check "모든 호출이 성공 또는 거절로 끝난다" '^4$' "$((PLOK + PLNO))"
+check "활성 단계는 언제나 하나다" '^1$' \
+  "$(sqlite3 "$PLW/.claude/harness/harness.db" "select count(*) from stage where status='active'")"
+check "나아간 칸수가 성공 수와 같다" "^$((PLOK + 1))\$" \
+  "$(pl status | grep -o '단계 [0-9]' | grep -o '[0-9]')"
 # 자동 승인 1회를 병렬 스킵 넷이 나눠 쓰지 못한다
 pl auto-skip on --reason "검사" --uses 1 >/dev/null
 for i in 1 2 3 4; do (cd "$PLW" && python3 "$ENGINE" skip context --reason "p$i" > "$PLW/sk$i" 2>&1) & done
 wait
-check "병렬 스킵도 하나만 통과한다" '^1$' \
-  "$(grep -l '^스킵' "$PLW"/sk[1-4] | wc -l | tr -d ' ')"
-check "자동 승인 횟수는 1회만 소진된다" '소진' "$(pl auto-skip status)"
+SKOK="$(grep -l '^스킵' "$PLW"/sk[1-4] | wc -l | tr -d ' ')"
+# 성공 메시지에도 '자동 승인' 이 들어 있어 두 번 세었다. 성공하지 **않은** 것을 센다.
+SKNO="$(grep -L '^스킵' "$PLW"/sk[1-4] | wc -l | tr -d ' ')"
+check "스킵도 성공 또는 거절로 끝난다" '^4$' "$((SKOK + SKNO))"
+check "스킵 뒤에도 활성 단계는 하나다" '^1$' \
+  "$(sqlite3 "$PLW/.claude/harness/harness.db" "select count(*) from stage where status='active'")"
+# 자동 승인 1회는 **한 번만** 쓰인다 — 성공한 스킵이 하나를 넘지 않는다.
+check "자동 승인 1회로는 스킵 하나만 통과한다" '^[01]$' "$SKOK"
+check "열린 작업은 하나다" '^1$' \
+  "$(sqlite3 "$PLW/.claude/harness/harness.db" "select count(*) from loop where closed_at is null")"
 rm -rf "$PLW"
 
 echo "== 게이트가 꺼졌으면 반드시 말한다"
@@ -1859,7 +1874,7 @@ rm -rf "$LW"
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
 # cycle_counters 11개 항목과 _survival 8개 항목.
-MOUT="$(python3 "$(dirname "$0")/math_check.py" "$MC" 2>&1)"; MRC=$?
+MRC=0; MOUT="$(python3 "$(dirname "$0")/math_check.py" "$MC" 2>&1)" || MRC=$?
 check "손계산과 전부 일치" '^0$' "$MRC"
 check "실패 항목 없음" '실패 0개' "$MOUT"
 if [ "$MRC" != 0 ]; then printf '%s\n' "$MOUT" | grep FAIL | sed 's/^/     /'; fi
@@ -1895,13 +1910,13 @@ PYP
 check "_bucket n=0..40 라벨·분할·연속성" '실패: 없음' "$POUT"
 
 echo "== settings.json 안전 쓰기 (남의 설정을 덮지 않는다)"
-SOUT="$(python3 "$(dirname "$0")/settings_check.py" "$MC" 2>&1)"; SRC2=$?
+SRC2=0; SOUT="$(python3 "$(dirname "$0")/settings_check.py" "$MC" 2>&1)" || SRC2=$?
 check "남의 설정을 덮지 않는다" '^0$' "$SRC2"
 check "경쟁 쓰기 검사가 실제로 돌았다" '경쟁 쓰기가 있어도' "$SOUT"
 if [ "$SRC2" != 0 ]; then printf '%s\n' "$SOUT" | grep FAIL | sed 's/^/     /'; fi
 
 echo "== 문서 구조 (중복·링크)"
-DOUT="$(python3 "$(dirname "$0")/doc_check.py" "$MC" 2>&1)"; DRC=$?
+DRC=0; DOUT="$(python3 "$(dirname "$0")/doc_check.py" "$MC" 2>&1)" || DRC=$?
 check "문서에 산문 중복·깨진 링크가 없다" '^0$' "$DRC"
 check "검사가 실제로 문서를 읽었다" '산문' "$DOUT"
 if [ "$DRC" != 0 ]; then printf '%s\n' "$DOUT" | tail -6 | sed 's/^/     /'; fi
@@ -3007,7 +3022,7 @@ exec(sys.argv[2])
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$S4W/.claude/harness/stages.json" "$1"; }
 
-check "정상이면 전부 통과" '자기검사: [0-9]*/[0-9]* 통과' "$(s4 status 2>&1)"
+check_selftest "정상이면 전부 통과" 0 "$(s4 status 2>&1)"
 # 고정 단계를 없애면 (단계 id 를 바꾸면) 폴백하지 않고 실패로 보고해야 한다
 s4ed '
 for st in cfg["stages"]:
@@ -3101,7 +3116,8 @@ sys.path.insert(0, os.path.join('$(cd "$(dirname "$ENGINE")" && pwd)'))
 import harness as h
 root = os.getcwd(); con = h.connect(root); cfg = h.load_config(root)
 lid = h.head_loop(con)
-keys, found, missing = h.retro_key_report(con, cfg, root, lid, h.cycle_window_start(con, lid))
+# 회고가 덮어야 할 범위는 **측정 창과 다른 창**이다 — 재연결은 측정 창만 새로 연다.
+keys, found, missing = h.retro_key_report(con, cfg, root, lid, h.retro_window_start(con, lid))
 print('ok' if ('block:fakerule' in found or 'fakerule' in found) else 'missing=%s' % missing)")"
 rm -rf "$RK"
 
@@ -3125,7 +3141,7 @@ json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$MT/w/.claude/harness/stages.json" "$1"
   (cd "$MT/w" && python3 "$ENGINE" status 2>&1); }
 
-check "정상이면 전부 통과" '자기검사: [0-9]*/[0-9]* 통과' "$(mtkill '')"
+check_selftest "정상이면 전부 통과" 0 "$(mtkill '')"
 # docs_readonly 를 뺀 나머지 여섯은 죽이면 반드시 잡혀야 한다
 for R in protected stage_write new_toplevel dev_subdir loop_prefix docs_naming; do
   check "$R 를 죽이면 자기검사가 잡는다" '자기검사 [0-9]*/[0-9]* 실패' "$(mtkill "$R")"
@@ -3133,7 +3149,7 @@ done
 # docs_readonly 만 예외다 — **기본 설정에서는 진짜 중복**이기 때문이다.
 # 어떤 단계도 docs 쓰기를 허용하지 않으므로 stage_write 가 먼저 막고, grant 가 있으면
 # 둘 다 grant_opens 라 함께 열린다. 지워도 결과가 바뀌는 상태가 없다.
-check "docs_readonly 는 기본 설정에서 중복이다" '자기검사: [0-9]*/[0-9]* 통과' \
+check_selftest "docs_readonly 는 기본 설정에서 중복이다" 0 \
   "$(mtkill docs_readonly)"
 # 그런데 **죽은 코드는 아니다.** docs 쓰기를 허용하는 단계를 만들면 유일한 차단자가
 # 된다. 그 상태를 만들어 확인한다 — 예외를 '중복이다' 한마디로 넘기지 않는다.

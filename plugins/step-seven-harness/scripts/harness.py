@@ -312,8 +312,10 @@ def connect(root, create=False):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     con = sqlite3.connect(path, timeout=float(DB_WAIT_S))
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout 이 **먼저**여야 한다. SQLite 는 journal mode 전환에 busy handler 를
+    # 부르지 않으므로, 순서가 뒤면 동시 init 이 `database is locked` 로 죽는다.
     con.execute("PRAGMA busy_timeout=%d" % (DB_WAIT_S * 1000))
+    con.execute("PRAGMA journal_mode=WAL")
     try:
         migrate(con)
         con.commit()
@@ -744,6 +746,15 @@ def config_problems(cfg):
             out.append(t("bash.%s 의 %s 는 변경 명령이라 %s로 선언할 수 없다 "
                          "— 무시된다") % (key, ", ".join(sorted(bad)), what))
 
+    known = set(CLI) | {"loop new", "loop adopt"}
+    unknown = [k for k in consent_map(cfg) if k not in known]
+    if unknown:
+        out.append(t("consent 의 %s 는 실제 명령 이름이 아니다 — 그 항목은 아무것도 "
+                     "막지 않는다 (이름: %s)")
+                   % (", ".join(sorted(unknown)), ", ".join(sorted(known))))
+    if not cfg.seq("promotion.kinds"):
+        out.append(t("promotion.kinds 가 비어 있다 — 반복 항목을 하나도 모으지 않으므로 "
+                     "Compounding 의 승격 게이트가 늘 충족된 상태가 된다"))
     kinds = promote_as(cfg)
     if not [k for k in kinds if k != "declined"]:
         out.append(t("promotion.as_kinds 에 승격 종류가 없다 — 보류밖에 할 수 없다"))
@@ -783,8 +794,19 @@ def stage_ids(cfg):
 
 
 def stage_index(cfg, sid):
+    """설정에서의 자리. **모르는 id 는 0 이 아니다** — 호출 전에 걸러야 한다.
+
+    예전에는 `else 0` 이었다. `stages.json` 에서 단계 id 하나만 바꾸면 DB 의 활성
+    단계가 조용히 1단계로 읽혔고, 그 단계의 종료 조건(사람만 채울 수 있는
+    `plan_approved` 포함)이 **아무 경고 없이 사라졌다.** 자기검사도 22/22 를 냈다.
+    이제 그 상태는 `stage_known` 으로 미리 걸러 `inactive()` 가 소리 내어 말한다.
+    """
     ids = stage_ids(cfg)
     return ids.index(sid) if sid in ids else 0
+
+
+def stage_known(cfg, sid):
+    return bool(sid) and sid in stage_ids(cfg)
 
 
 def stage_obj(cfg, sid):
@@ -851,17 +873,47 @@ def file_prefix(con, lid):
     return "%s-%d-" % (lid, cycle_of(con, lid))
 
 
-def create_loop(con, cfg, root, intent=None, loop_id=None):
+def create_loop(con, cfg, root, intent=None, loop_id=None, only_if_none=False):
+    """작업 하나와 그 단계들을 만든다. 만들어진(또는 이미 있던) 작업 id.
+
+    `only_if_none` 은 **열린 작업이 없을 때만** 만든다. 읽고-판단하고-쓰면 병렬
+    호출이 각자 하나씩 만든다 — 보기만 하는 `status` 넷을 동시에 돌렸더니 열린
+    작업이 넷 생겼다. 판단을 INSERT 의 WHERE 안으로 옮겨 승자만 만들게 한다.
+    """
     lid = loop_id or new_loop_id()
-    con.execute("INSERT OR IGNORE INTO loop(id,intent,branch,created_at) VALUES(?,?,?,?)",
-                (lid, intent, git_branch(root), now()))
-    for i, s in enumerate(cfg["stages"]):
+    sql, args = ("INSERT OR IGNORE INTO loop(id,intent,branch,created_at) "
+                 "VALUES(?,?,?,?)", (lid, intent, git_branch(root), now()))
+    if only_if_none:
+        sql = ("INSERT INTO loop(id,intent,branch,created_at) SELECT ?,?,?,? "
+               "WHERE NOT EXISTS (SELECT 1 FROM loop WHERE closed_at IS NULL)")
+        if not claim(con, sql, args):
+            row = con.execute("SELECT id FROM loop WHERE closed_at IS NULL "
+                              "ORDER BY created_at DESC, id DESC LIMIT 1").fetchone()
+            if row:
+                return row["id"]
+    else:
+        con.execute(sql, args)
+    for i, st in enumerate(cfg["stages"]):
         con.execute("INSERT OR IGNORE INTO stage(loop_id,stage,status,entered_at) "
                     "VALUES(?,?,?,?)",
-                    (lid, s["id"], "active" if i == 0 else "pending",
+                    (lid, st["id"], "active" if i == 0 else "pending",
                      now() if i == 0 else None))
     set_meta(con, "head", lid)
     return lid
+
+
+def rotate_loop(con, cfg, root, lid, intent=None):
+    """이 작업을 닫고 다음을 연다. **닫기를 차지한 쪽만 연다** (진 쪽에는 None).
+
+    닫기와 열기가 두 걸음이면 병렬 호출이 각자 하나씩 연다 — `loop new` 넷을
+    동시에 돌렸더니 열린 작업이 셋 남았다.
+    """
+    if not claim(con, "UPDATE loop SET closed_at=? WHERE id=? AND closed_at IS NULL",
+                 (now(), lid)):
+        return None
+    for tbl in ("stage", "evidence", "wgrant"):
+        con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
+    return create_loop(con, cfg, root, intent)
 
 
 def close_loop(con, lid):
@@ -992,7 +1044,11 @@ def evidence_digest(root, item):
     파일이 아닌 증거(완료 조건 문장, `agent:Task`, 명령 문자열)는 지문이 없고,
     지문이 없는 증거는 늘 유효하다 — 변할 근거가 없다.
     """
-    if not item or "/" not in item or root is None:
+    # 예전에는 `"/" not in item` 으로 걸렀다 — 명령 문자열을 빼려던 것인데,
+    # **리포 루트의 파일은 상대경로에 슬래시가 없다.** `README.md` 를 승인하면
+    # 지문이 안 붙어 만료 기능이 통째로 꺼졌다. 조건을 지운다. 파일이 아닌 것은
+    # 아래 `isfile` 이 이미 걸러낸다.
+    if not item or root is None:
         return None
     rel = rel_to_root(root, item)
     if not rel:
@@ -1188,7 +1244,10 @@ def cycle_window_start(con, lid):
     1회차에는 종료 기록이 없으므로 0 이다 (`loop_id` 로 이미 이 작업만 걸러진다).
     """
     row = con.execute(
-        "SELECT MAX(id) i FROM event WHERE loop_id=? AND kind='cycle_close'",
+        # `cycle_adopt` 도 경계다. 빠뜨렸더니 재연결 뒤 창이 옛 위치에 고정돼
+        # **버려진 회차의 마찰이 다음 회차 기록으로 흡수**됐다 ("회차 2: 차단 5").
+        "SELECT MAX(id) i FROM event WHERE loop_id=? "
+        "AND kind IN ('cycle_close','cycle_adopt')",
         (lid,)).fetchone()
     return (row["i"] or 0) if row else 0
 
@@ -1199,6 +1258,22 @@ def cycle_seconds(con, lo):
         return 0
     row = con.execute("SELECT at FROM event WHERE id=?", (lo,)).fetchone()
     return max(0, int(time.time() - ts_epoch(row["at"]))) if row else 0
+
+
+def retro_window_start(con, lid):
+    """**회고가 덮어야 할 범위**의 시작. 측정 창과 다른 질문이다.
+
+    측정 창은 `cycle_adopt` 에서 새로 열려야 한다 — 그러지 않으면 버려진 회차의
+    마찰이 다음 회차 기록으로 흡수돼 "회차 2: 차단 5" 같은 거짓 문장이 나온다.
+    반대로 회고는 **이어받은 작업의 앞선 사실까지 덮어야** 한다 — 재연결했다고 해서
+    이미 적어 둔 회고가 '못 찾음' 이 되면 안 된다.
+
+    한 창이 두 뜻을 갖고 있어서 둘 중 하나가 늘 틀렸다. 뜻이 둘이면 창도 둘이다.
+    """
+    row = con.execute(
+        "SELECT MAX(id) i FROM event WHERE loop_id=? AND kind='cycle_close'",
+        (lid,)).fetchone()
+    return (row["i"] or 0) if row else 0
 
 
 def cycle_counters(con, lid, lo):
@@ -1227,8 +1302,16 @@ def cycle_counters(con, lid, lo):
     # '앞서' 는 이전 회차·이전 작업뿐 아니라 **이 회차 안의 앞선 실패**도 포함한다.
     # 같은 명령을 두 번 깨뜨린 것은 회차 경계와 무관하게 반복이기 때문이다.
     # (설명이 "이전 회차에도" 로 읽혀 오해를 샀다 — 세는 방식이 아니라 말이 틀렸다.)
+    # 첫 회차는 `lo == 0` 이라 `id <= 0` 이 늘 공집합이었다 — **이전 작업의 실패를
+    # 하나도 세지 않았다.** 대부분의 작업이 1회차로 끝나므로 반복 실패 지표가 구조적으로
+    # 낮게 나왔다. 창이 없으면 '이 작업의 첫 이벤트 이전' 을 경계로 쓴다.
+    before = lo
+    if not before:
+        row = con.execute("SELECT MIN(id) i FROM event WHERE loop_id=?",
+                          (lid,)).fetchone()
+        before = (row["i"] - 1) if row and row["i"] else 0
     seen_before = {r["target"] for r in
-                   events_where(con, kinds=("tool_fail",), upto_id=lo)}
+                   events_where(con, kinds=("tool_fail",), upto_id=before)}
     refails, seen_now = 0, set()
     for r in rows:
         if r["kind"] != "tool_fail":
@@ -1943,6 +2026,7 @@ def check_write(ctx, rel):
 
 
 BASH_SPLIT = re.compile(r"\|\||&&|[;&|\n]")
+ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # 이 프로그램들에 넘긴 경로는 '실행 대상'이다. 하네스 래퍼를 python3 로 돌리는 것은
 # 정상 동작이므로 변경 시도로 오인해서는 안 된다.
 # 읽기만 하는 명령은 막지 않는다. 과잉 차단은 마찰이 되고, 마찰은 게이트를 끄게 만든다.
@@ -2032,6 +2116,11 @@ def bash_protected_hit(cfg, root, cmd):
         toks = re.findall(r"\S+", seg)
         if not toks:
             continue
+        # 앞의 `VAR=값` 은 명령이 아니라 대입이다. 건너뛰면 그 값에 든 경로를 놓친다
+        # (`X=.claude/harness/bin; rm $X/harness`). 대입은 검사 대상으로 남기고,
+        # 머리는 그 뒤의 진짜 명령으로 잡는다.
+        while len(toks) > 1 and ASSIGN_RE.match(toks[0]):
+            toks = toks[1:]
         head = os.path.basename(toks[0].strip("\"'"))
         # 리다이렉트가 있으면 읽기 명령도 쓰기가 된다 (`cat x > 엔진`).
         # `readers` 에 `rm` 을 넣어 잠금을 우회한 것을 확인했으므로, 읽기로 분류된
@@ -2110,7 +2199,11 @@ def bash_writes(cfg, root, cmd):
 
     for seg in BASH_SPLIT.split(cmd.replace(">|", "> ")):
         toks = sh_tokens(seg)
-        if not toks or not mut.search(seg):
+        # **정규화해서 넘긴다.** `mutator_pattern` 은 명령 **전체**에 대해 정의됐고
+        # `(^|[;&|]\s*)` 로 앵커돼 있다. BASH_SPLIT 은 구분자를 지우므로 세그먼트 앞에
+        # 공백이 남고, 그러면 `^` 가 안 맞아 `a && touch x` 의 touch 가 통째로 샜다.
+        # 어휘를 재사용하는 것은 옳았지만 **정의된 형태로 주어야** 한다.
+        if not toks or not mut.search(seg.strip()):
             continue
         head = os.path.basename(toks[0].strip("\"'"))
         # 읽기 명령에 리다이렉트가 붙은 것(`cat a > b`)은 **b 만** 쓴다.
@@ -2262,7 +2355,7 @@ def auto_skip_scope_note(con):
     return ", ".join(bits) or t("무제한")
 
 
-def skip_block_reason(cfg, sid, target):
+def skip_block_reason(cfg, sid, target, con=None, root=None, lid=None):
     """skip 이 **불가능한** 이유. 가능하면 None.
 
     훅과 CLI 가 같은 함수를 쓴다. 다른 규칙을 쓰면 사용자가 승인한 뒤에 거부되고,
@@ -2294,6 +2387,19 @@ def skip_block_reason(cfg, sid, target):
     locked = [ids[i] for i in range(cur, dest + 1)
               if cfg["stages"][i].get("skippable") is False]
     if not locked:
+        # 여기까지 왔으면 이동 자체는 가능하다. 남은 것은 **CLI 가 실제로 요구하는
+        # 기록**이다. 훅이 이것을 모르면 사용자가 승인한 **뒤에** CLI 가 거부하고,
+        # 모델은 안내받은 명령을 다시 시도해 다이얼로그가 무한 반복된다 — 이 함수가
+        # 존재하는 이유가 바로 그것인데 정작 이 축을 안 보고 있었다.
+        if con is not None:
+            for i in range(cur, dest + 1):
+                for key in cfg["stages"][i].get("skip_requires") or []:
+                    if not criterion_met(con, cfg, root, lid, key):
+                        return (t("%s 를 건너뛰더라도 기록은 남겨야 한다: %s "
+                                  "먼저 그 기록을 남긴 뒤 다시 시도하라 — 승인만 "
+                                  "면제된다.")
+                                % (cfg["stages"][i]["label"],
+                                   criterion_why(con, cfg, root, lid, key)))
         return None
 
     names = ", ".join(stage_obj(cfg, x)["label"] for x in locked)
@@ -2307,6 +2413,13 @@ def skip_block_reason(cfg, sid, target):
                 "`harness loop intent \"...\"` 와 `harness loop done-when \"...\"` 로 "
                 "기록하고 진행하라. 그 후보들까지 정말 필요 없으면 그렇다고 말하고 "
                 "멈춰라 — 그건 교착이 아니라 정상 종료다.") % names)
+    if cur >= len(ids) - 1:
+        # 마지막 단계에서 `until:<last>` 는 dest = index-1 이라 **항상 실패한다.**
+        # Selection 쪽에서 고친 것과 같은 막다른 길이 반대편 끝에 남아 있었다.
+        return (t("%s 단계는 건너뛸 수 없다 — 여기가 마지막이므로 건너뛸 곳이 없다. "
+                  "이 회차를 닫는 것이 다음 행동이다: 중단 사유를 회고로 남기고 "
+                  "`harness advance --cycle` (후속 회차) 또는 `harness advance --done` "
+                  "(작업 종료) 을 실행하라.") % names)
     return (t("%s 단계는 건너뛸 수 없다. 이 회차를 중단하려면 "
             "`harness skip until:%s --reason \"...\"` 로 %s 까지 이동한 뒤, 중단 사유를 "
             "회고로 남기고 `harness advance --cycle` (또는 `--done`) 으로 닫아라.")
@@ -2352,31 +2465,42 @@ def plan_preview(root, cmd):
     return "%s%s\n%s" % (path, tail, text)
 
 
+# 하네스 호출을 **원문에서** 찾는다. 경로 부분은 있어도 없어도 된다.
+CTRL_CALL_RE = re.compile(r"(?:^|[\s'\"=;&|(])(?:[\w./\\-]*[/\\])?"
+                          r"(?:harness\.py|harness)(?=[\s\"\']|$)([^;&|\n]*)")
+
+
 def ctrl_requests(cmd):
     """명령 문자열의 하네스 제어 호출을 **전부** 찾아 (subcommand, 세그먼트) 로 준다.
 
-    두 결함을 함께 고친다.
-    1. 이전에는 `CTRL_RE.search` 로 **첫 매치만** 봤다. `harness status;
-       harness loop new` 는 status 로 판정되고 뒤의 loop new 는 검사되지 않았다.
-    2. 훅은 정규식의 두 번째 토큰을 subcommand 로 봤고 CLI 는 플래그를 걷어낸
-       위치 인자를 봤다. 두 파서가 다른 답을 내서 `loop --reason=x new` 가
-       게이트를 지나쳤다. 이제 훅도 `argv_positional` 과 같은 규칙을 쓴다.
+    ## 토큰으로 쪼개지 않는다
+
+    이 판정은 두 번 뚫렸고 **두 번 다 토큰화가 원인**이었다.
+
+      따옴표를 지웠더니   실행 경로가 사라져 게이트가 안 걸렸다 (0.41.0)
+      shlex 로 쪼갰더니   `sh -c '... harness auto-skip on'` 이 **한 토큰**이 되어
+                          basename 이 안 맞았다 — 동의 게이트 여섯 개가 그 한 줄로 사라졌다
+
+    쪼개는 방식을 또 고르는 대신 쪼개지 않는다. "이 명령이 하네스를 부르는가" 는
+    셸이 어떻게 감쌌든 **원문에 그 이름이 있는가**의 문제다. 감싸면 감쌀수록 더 걸린다.
+
+    대가는 오탐이다 — `git commit -m "harness skip 구현"` 도 동의를 묻는다. 동의
+    게이트에서 오탐은 다이얼로그 한 번이고, 누락은 게이트가 사라지는 것이다.
     """
     out = []
     for seg in BASH_SPLIT.split(cmd):
-        toks = sh_tokens(seg)
-        for i, tok in enumerate(toks):
-            if os.path.basename(tok.strip("\"'")) not in CTRL_NAMES:
-                continue
+        for tail in CTRL_CALL_RE.findall(seg):
             pos, skip = [], False
-            for a in toks[i + 1:]:
+            for a in tail.split():
+                a = a.strip("\"'")
                 if skip:
                     skip = False
                     continue
                 if a.startswith("--"):
                     skip = "=" not in a  # `--flag value` 는 값도 건너뛴다
                     continue
-                pos.append(a)
+                if a:
+                    pos.append(a)
             if pos:
                 sub = pos[0]
                 if len(pos) > 1 and pos[1] in CTRL_SUB2.get(sub, ()):
@@ -2411,7 +2535,7 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
                 tgt = pos[i + 1]
                 break
         if tgt:
-            why = skip_block_reason(cfg, sid, tgt)
+            why = skip_block_reason(cfg, sid, tgt, con, root, lid)
             if why:
                 record_event(con, lid, sid, "block", "skip_impossible", tgt, why)
                 return pre_decision("deny", why)
@@ -2580,7 +2704,12 @@ def hook_post_tool_use(inp, ctx):
                 record_event(con, lid, sid, "edit", None, rel)
                 # write_glob 이 없는 조건(cli·observed·no_pending)은 그냥 지나간다.
                 for kind, sig in signals.items():
-                    for pat in (sig.get("write_glob") or []) if isinstance(sig, dict) else []:
+                    # `write_glob` 은 `satisfied_by: file` 의 어휘다. 방식을 보지 않고
+                    # glob 만 보면, `human: true` 인 조건에 glob 을 더하는 것만으로
+                    # **파일을 쓰는 행위가 사람의 승인이 된다.**
+                    if not isinstance(sig, dict) or sig.get("satisfied_by") != "file":
+                        continue
+                    for pat in sig.get("write_glob") or []:
                         if glob_match(rel, pat):
                             record_evidence(con, lid, sid, kind, rel, root)
                             break
@@ -2627,7 +2756,12 @@ def verification_hit(cfg, cmd):
             continue
         if os.path.basename(bare.split()[0].strip("\"'")) in readers:
             continue
-        if vre.search(bare):
+        # **머리에서부터** 맞아야 한다. `search` 였을 때 `true npm test` 가 통과했다 —
+        # 실행되는 프로그램은 `true` 인데 인정된 것은 `npm test` 였다. `# npm test`,
+        # `false npm test`, `sleep 0 npm test` 도 같았다. 무해한 머리 이름을 목록으로
+        # 모으는 것은 끝이 없다(`time`·`env`·`nice` 는 정상이다). 대신 패턴이
+        # **프로그램 자리**를 가리키게 한다 — 그것이 패턴의 원래 뜻이다.
+        if vre.match(bare):
             return True
     return False
 
@@ -2789,13 +2923,15 @@ def hook_stop(inp, ctx):
     blocked, exhausted = [], []
     with con:
         for key, text in problems:
-            n = con.execute("SELECT COUNT(*) c FROM stop_block "
-                            "WHERE prompt_id=? AND key=?", (prompt_id, key)).fetchone()["c"]
-            if n >= int(limits.get(key, 1)):
+            # 세고-넣으면 동시에 뜬 Stop 훅 넷이 상한 1 을 넷 다 쓴다. 세는 것을
+            # INSERT 의 WHERE 안으로 옮겨 rowcount 가 승자를 정하게 한다.
+            if not claim(con, "INSERT INTO stop_block(prompt_id,key,at) "
+                              "SELECT ?,?,? WHERE (SELECT COUNT(*) FROM stop_block "
+                              "WHERE prompt_id=? AND key=?) < ?",
+                         (prompt_id, key, now(), prompt_id, key,
+                          int(limits.get(key, 1)))):
                 exhausted.append(key)
                 continue
-            con.execute("INSERT INTO stop_block(prompt_id,key,at) VALUES(?,?,?)",
-                        (prompt_id, key, now()))
             record_event(con, lid, sid, "stop_gate", key, stage["id"], text)
             blocked.append(text)
         for key in exhausted:
@@ -2925,6 +3061,18 @@ HOOKS = {
 }
 
 
+def init_hint(root):
+    """`init` 을 어떻게 부를지. **있는 명령만 안내한다.**
+
+    설치 표식이 커밋되는 `stages.json` 이 되면서 새 클론·`git worktree add` 도
+    "게이트가 꺼졌다" 를 내게 됐다. 그런데 그 상태에는 `.claude/harness/bin/` 이
+    없다(gitignore). 없는 명령을 안내하면 그것이 막다른 길이다.
+    """
+    if os.path.isfile(os.path.join(root, WRAPPER_REL)):
+        return "%s init" % WRAPPER_CMD
+    return "python3 %s init" % os.path.abspath(__file__)
+
+
 def inactive(why, fix=None):
     """**게이트가 꺼진 채로 빠져나가는 유일한 출구.**
 
@@ -2960,13 +3108,13 @@ def run_hook():
         if con is None:
             # 진짜 자산은 상태 DB 다. 못 읽으면 모든 게이트가 한꺼번에 꺼진다.
             return inactive(t("상태 DB(%s)를 읽을 수 없다") % DB_REL,
-                            t("`%s init` (기록은 .dev/ 의 파일에 남아 있다)")
-                            % WRAPPER_CMD)
+                            t("`%s` (기록은 .dev/ 의 파일에 남아 있다)")
+                            % init_hint(root))
         cfg = load_config(root, plugin_root())
         load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
         # 손상된 문서를 템플릿으로 갈아치우지는 않는다 — 덜어낸 규칙이 되살아난다.
-        fix = (t("`git checkout -- %s`, 또는 그 파일을 지우고 `%s init`")
-               % (CONFIG_REL, WRAPPER_CMD))
+        fix = (t("`git checkout -- %s`, 또는 그 파일을 지우고 `%s`")
+               % (CONFIG_REL, init_hint(root)))
         if not isinstance(cfg, dict):
             return inactive(t("`%s` 를 읽을 수 없다 (JSON 문법을 확인하라)")
                             % CONFIG_REL, fix)
@@ -2977,13 +3125,21 @@ def run_hook():
                               "종료 조건도, 단계별 쓰기 규칙도 없다") % CONFIG_REL, fix)
         lid = head_loop(con)
         sid = active_stage(con, lid) if lid else None
+        if lid and sid and not stage_known(cfg, sid):
+            # DB 의 활성 단계가 `stages.json` 에 없다. 예전에는 `stage_index` 가 0 을
+            # 돌려줘 **1단계로 조용히 읽혔고** 그 단계의 종료 조건이 통째로 사라졌다.
+            return inactive(
+                t("활성 단계 '%s' 가 `%s` 에 없다 — 상태와 설정이 어긋났다. "
+                  "그 단계의 종료 조건이 아무것도 확인되지 않는다") % (sid, CONFIG_REL),
+                t("단계 id 를 되돌리거나, 새 구성으로 작업을 다시 시작하라 "
+                  "(`%s loop new --reason \"단계 구성 변경\"`)") % WRAPPER_CMD)
         if not lid or not sid:
             probs = (config_problems(cfg) + drift_problems(cfg, root)
                      + install_problems(root) + language_problems(root))
             extra = (t(" 무시되는 설정 %d건: %s")
                      % (len(probs), "; ".join(probs[:3]))) if probs else ""
             return inactive(t("활성 작업이 없다 (head 또는 활성 단계 없음)%s") % extra,
-                            t("`%s init` 또는 `%s status`") % (WRAPPER_CMD, WRAPPER_CMD))
+                            t("`%s` 또는 `%s status`") % (init_hint(root), WRAPPER_CMD))
         pid = inp.get("prompt_id")
         if pid:
             with con:
@@ -3151,6 +3307,9 @@ def refresh_wrapper(root):
                              t(WRAPPER) % os.path.abspath(__file__), 0o755)
 
 
+ENGINE_LINE_RE = re.compile(r'^P="[^"]*"$', re.M)
+
+
 def wrapper_code(body):
     """래퍼에서 **실행되는 줄만** 남긴다.
 
@@ -3162,6 +3321,11 @@ def wrapper_code(body):
     keep = lines[:1] + [ln for ln in lines[1:]
                         if ln.strip() and not ln.strip().startswith("#")]
     return "\n".join(keep)
+
+
+def wrapper_shape(body):
+    """엔진 경로를 지운 래퍼 코드. 플러그인이 업데이트되면 그 경로만 바뀐다."""
+    return ENGINE_LINE_RE.sub('P=""', wrapper_code(body))
 
 
 def wrapper_intact(root):
@@ -3183,9 +3347,14 @@ def wrapper_intact(root):
         have = None
     if have is not None and wrapper_code(have) == wrapper_code(want):
         return True                              # 온전하다
-    # 변조됐다. 복구까지 됐는지를 구분해서 돌려준다 — "복구했다" 가 거짓말이 되면
-    # 사용자는 다음 실행이 통할 거라 믿고 같은 벽에 다시 부딪힌다.
-    return False if refresh_wrapper(root) is not None else None
+    # **엔진 경로만 다르면 변조가 아니라 낡은 것이다.** 플러그인을 업데이트하면 캐시
+    # 디렉터리 이름이 바뀌어 그 줄이 달라진다 — 아무도 손대지 않았는데 보안 경고가
+    # 뜨고 `wrapper_tampered` 가 통계를 오염시켰다. 조용히 맞춰 놓는다.
+    stale = have is not None and wrapper_shape(have) == wrapper_shape(want)
+    ok = refresh_wrapper(root) is not None
+    if not ok:
+        return None                              # 복구도 못 했다
+    return True if stale else False              # 갱신했다 / 변조를 되돌렸다
 
 
 def status_report(ctx):
@@ -3311,6 +3480,16 @@ SELFTEST = (
     # 과잉 수집도 결함이다 — 읽기 명령이 쓰기로 잡히면 마찰이고, 마찰은 게이트를 끈다.
     ("읽기 명령은 쓰기 대상을 만들지 않는다", "bashrule",
      "grep -rn foo .claude/settings.json", False, "selection"),
+    # 동의 게이트. 셸이 어떻게 감싸든 하네스 호출은 하네스 호출이다.
+    ("동의 명령을 알아본다", "consent", "<WRAP> auto-skip on", True, None),
+    ("따옴표로 감싼 호출도 알아본다", "consent",
+     "\"<WRAP>\" skip context --reason x", True, None),
+    ("sh -c 로 감싼 호출도 알아본다", "consent",
+     "sh -c '<WRAP> approve-plan p.md'", True, None),
+    ("중첩 셸 안의 loop new 도 알아본다", "consent",
+     "bash -lc \"<WRAP> loop new --reason r\"", True, None),
+    # 동의가 필요 없는 명령까지 묻지는 않는다 — 과잉은 마찰이다.
+    ("조회 명령은 동의를 묻지 않는다", "consent", "<WRAP> status", False, None),
     ("접두사 붙인 산출물은 통과", "write", ".dev/plan/<PREFIX>probe.md", False, None),
 )
 
@@ -3342,6 +3521,18 @@ def selftest_criteria(cfg):
             out.append((t("%s 는 무관한 파일을 받지 않는다") % name, not hits,
                         t("무관한 경로도 받는다: %s") % ", ".join(hits) if hits
                         else t("자기 산출물만 받는다")))
+        if spec.get("satisfied_by") in ("cli", "no_pending_promotions") \
+                and spec.get("write_glob"):
+            # `write_glob` 은 `satisfied_by: file` 의 어휘다. 다른 방식에 붙어 있으면
+            # 아무도 그것으로 판정하지 않거나(죽은 설정), 관측이 그것을 인정해
+            # **사람만 채울 수 있는 조건이 파일 쓰기로 채워진다.**
+            out.append((t("%s 의 write_glob 이 방식과 맞지 않는다") % name, False,
+                        t("satisfied_by=%s 인데 write_glob 이 있다")
+                        % spec.get("satisfied_by")))
+        if spec.get("satisfied_by") == "no_pending_promotions" \
+                and not cfg.seq("promotion.kinds"):
+            out.append((t("%s 가 실제로 무언가를 모은다") % name, False,
+                        t("promotion.kinds 가 비어 있어 늘 충족된다")))
         if spec.get("satisfied_by") == "observed":
             # 신호는 셋이다 — bash_pattern·tools·tool_pattern. 손으로 하나만
             # 탐침했더니 `tools: ["Read"]` 로 아무 도구가 증거가 되는 길이 열려
@@ -3386,7 +3577,7 @@ def selftest(ctx):
     ids = stage_ids(cfg)
     for raw_label, kind, target, want_block, at_stage in SELFTEST:
         label = t(raw_label)
-        tgt = target.replace("<PREFIX>", pre)
+        tgt = target.replace("<PREFIX>", pre).replace("<WRAP>", WRAPPER_CMD)
         # 단계가 지정됐고 그 단계가 존재하면 그 단계로 판정한다. 없으면 현재 단계.
         probe_ctx = ctx
         if at_stage and at_stage not in ids:
@@ -3412,6 +3603,15 @@ def selftest(ctx):
                 else:
                     rid, reason = _first_violation(w, write_rules(cfg))
                     blocked, why = bool(reason), (rid or "")
+            elif kind == "consent":
+                # **동의 게이트도 탐침한다.** 예전에는 자기검사가 쓰기 규칙만 돌았고,
+                # 그래서 `sh -c '... harness auto-skip on'` 으로 동의 게이트 여섯 개가
+                # 통째로 사라진 것을 22/22 라는 숫자가 가려 줬다. 탐침 목록이 게이트
+                # 목록보다 좁으면, 그 숫자는 강제가 온전하다고 거짓말을 한다.
+                subs = [sub for sub, _ in ctrl_requests(tgt)]
+                need = consent_map(cfg)
+                blocked = any(sub in need for sub in subs)
+                why = ",".join(subs) or t("제어 명령으로 안 보임")
             elif kind == "bashrule":
                 # Bash 가 모으는 쓰기 대상을 **같은 규칙 엔진**에 넣는다.
                 blocked, why = False, ""
@@ -3431,6 +3631,10 @@ def selftest(ctx):
         got = (t("막힘(%s)") % why if blocked else t("통과"))
         out.append((label, ok, got))
     return out + selftest_criteria(cfg)
+
+
+CONSENT_FLOOR = ("skip", "allow", "approve-plan", "auto-skip",
+                 "loop new", "loop adopt")
 
 
 def enforcing_summary(cfg):
@@ -3455,7 +3659,12 @@ def enforcing_summary(cfg):
         "gated_stages": sum(1 for st in stages
                             if isinstance(st, dict) and (st.get("exit_criteria") or [])),
         "stages": len(stages),
-        "consent": len(consent_map(cfg)),
+        "consent": sum(1 for k in CONSENT_FLOOR if k in consent_map(cfg)),
+        "consent_floor": len(CONSENT_FLOOR),
+        # 턴 종료 게이트를 세는 자리가 없었다. `stop_requires` 를 전부 비우면 검증
+        # 증거·회고·승격 결정의 강제가 통째로 사라지는데 요약이 **한 글자도** 안 바뀌었다.
+        "stop_gates": sum(1 for st in stages
+                          if isinstance(st, dict) and (st.get("stop_requires") or [])),
         "language": cfg.at("language") or "ko",
     }
 
@@ -3487,10 +3696,13 @@ def render_status(d, cfg):
             print(t("자기검사: %d/%d 통과 (대표 조작을 실제 판정에 넣어 확인)")
                   % (len(st) - len(fails), len(st)))
         print(t("강제 중: 쓰기 규칙 %s · 보호 경로 %d · 종료 조건 %d "
-                "(게이트 있는 단계 %d/%d) · 승인 필요 %d · 언어 %s")
+                "(게이트 있는 단계 %d/%d) · 턴 종료 게이트 %d/%d · 승인 필요 %d/%d "
+                "· 언어 %s")
               % (rules_txt, e.get("protected_paths", 0),
                  e.get("criteria", 0), e.get("gated_stages", 0), e.get("stages", 0),
-                 e.get("consent", 0), e.get("language", "ko")))
+                 e.get("stop_gates", 0), e.get("stages", 0),
+                 e.get("consent", 0), e.get("consent_floor", 0),
+                 e.get("language", "ko")))
     print(t("작업 %s · 회차 %d · 단계 %s") % (d["loop"], d["cycle"], d["stage_label"]))
     if d["intent"]:
         print(t("  작업 내용: %s") % d["intent"])
@@ -3551,8 +3763,12 @@ def _enter(ctx, dest_idx):
         close_loop(con, lid)
         return create_loop(con, cfg, root), cfg["stages"][0]["id"], True
     sid = cfg["stages"][dest_idx]["id"]
-    con.execute("UPDATE stage SET status='active', entered_at=? "
-                "WHERE loop_id=? AND stage=?", (now(), lid, sid))
+    # **들어가는 쪽도 차지해야 한다.** 떠나는 쪽에만 claim 을 붙였더니, 대상 단계 행이
+    # 없을 때(설정에서 id 가 바뀐 경우) 0행 갱신인데도 "→ 단계 N" 이라고 말하고
+    # 활성 단계가 0개인 루프가 남았다. 다음 명령이 그 작업을 말없이 버렸다.
+    if not claim(con, "UPDATE stage SET status='active', entered_at=? "
+                      "WHERE loop_id=? AND stage=?", (now(), lid, sid)):
+        return lid, None, False
     return lid, sid, False
 
 
@@ -3620,7 +3836,7 @@ def _hint_on_enter(ctx, lid, sid):
     for i, (q, why) in enumerate(retro_questions(cfg), 1):
         print("  %d. **%s** — %s" % (i, q, why))
 
-    keys = cycle_search_keys(con, lid, cycle_window_start(con, lid))
+    keys = cycle_search_keys(con, lid, retro_window_start(con, lid))
     if keys:
         print(t("\n이 회차의 검색 키 — 회고 **앞부분**에 이 문자열을 그대로 넣어라:"))
         print("  " + "  ".join("`%s`" % k for k in keys))
@@ -3728,7 +3944,7 @@ def cli_advance(ctx, argv):
     if sid == last:
         try:
             keys, found, missing = retro_key_report(
-                con, cfg, root, lid, cycle_window_start(con, lid))
+                con, cfg, root, lid, retro_window_start(con, lid))
             if keys:
                 retro_note = (keys, found, missing)
                 with con:
@@ -3755,8 +3971,9 @@ def cli_advance(ctx, argv):
         if sid == last:
             snap = record_cycle_close(con, cfg, lid, sid)
         if sid == last and want_done:
-            close_loop(con, lid)
-            nlid = create_loop(con, cfg, root)
+            nlid = rotate_loop(con, cfg, root, lid)
+            if nlid is None:
+                raise RuntimeError(t("다른 호출이 먼저 이 작업을 닫았다"))
             nsid = cfg["stages"][0]["id"]
             done_task = True
         elif sid == last:
@@ -3764,6 +3981,8 @@ def cli_advance(ctx, argv):
         else:
             nlid, nsid, _ = _enter(ctx, stage_index(cfg, sid) + 1)
             done_task = False
+            if nsid is None:
+                raise RuntimeError(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"))
 
     if retro_note:
         keys, found, missing = retro_note
@@ -3804,7 +4023,7 @@ def cli_skip(ctx, argv):
         return 2
     # 훅과 **같은 함수**로 판정한다. 훅이 이미 막았으므로 보통 여기 오지 않지만,
     # 셸 간접 호출로 훅을 우회해 들어온 경우에도 같은 답을 내야 한다.
-    why = skip_block_reason(cfg, sid, target)
+    why = skip_block_reason(cfg, sid, target, con, root, lid)
     if why:
         print(why)
         return 1
@@ -3864,6 +4083,8 @@ def cli_skip(ctx, argv):
         if by == "auto":
             _, left = consume_auto_skip(con)
         nlid, nsid, cycled = _enter(ctx, dest + 1)
+        if nsid is None:
+            raise RuntimeError(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"))
     print(t("스킵(%s): %s") % (t("자동 승인") if by == "auto" else t("사용자 승인"),
                             ", ".join(skipped) or t("(없음)")))
     print(t("사유: %s") % reason)
@@ -3940,7 +4161,7 @@ def cli_verify(ctx, argv):
 
 
 def cli_allow(ctx, argv):
-    con, lid = ctx.con, ctx.lid
+    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
     pos = argv_positional(argv)
     glob = pos[0] if pos else None
     reason = argv_value(argv, "reason")
@@ -3952,12 +4173,15 @@ def cli_allow(ctx, argv):
         con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
                     "VALUES(?,?,?,?,?)",
                     (lid, glob, reason, int(uses) if uses else 3, now()))
-    print(t("예외 등록(사용자 승인): %s — %s") % (glob, reason))
+    # 예전에는 무조건 "사용자 승인" 이라고 적었다. `consent.allow` 를 빼면 아무도
+    # 승인하지 않았는데 그렇게 출력됐다 — 기록이 거짓말을 하면 감사가 무의미하다.
+    print(t("예외 등록%s: %s — %s")
+          % (t(" (사용자 승인)") if "allow" in consent_map(cfg) else "", glob, reason))
     return 0
 
 
 def cli_approve_plan(ctx, argv):
-    con, root, lid, sid = ctx.con, ctx.root, ctx.lid, ctx.sid
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     pos = argv_positional(argv)
     path = pos[0] if pos else None
     if not path:
@@ -3966,6 +4190,17 @@ def cli_approve_plan(ctx, argv):
     rel = rel_to_root(root, path)
     if not rel or not os.path.isfile(os.path.join(root, rel)):
         print(t("계획 파일을 찾을 수 없다: %s") % path)
+        return 2
+    # 승인 대상은 **이 회차의 계획 파일**이어야 한다. 예전에는 아무 파일이나 받아서
+    # `README.md` 를 승인하면 `plan_file` 게이트까지 함께 열렸고, 지난 회차의 계획서로도
+    # 열렸다. 판정은 `fs_evidence` 가 이미 하고 있으므로 그 규칙을 그대로 쓴다.
+    want = cfg.seq("criteria.plan_file.write_glob")
+    pre = file_prefix(con, lid)
+    if want and not (any(glob_match(rel, g) for g in want)
+                     and os.path.basename(rel).startswith(pre)):
+        print(t("계획 파일이 아니다: %s") % rel)
+        print(t("이 회차의 계획은 %s 아래에 `%s` 로 시작하는 이름이어야 한다.")
+              % (", ".join(want), pre))
         return 2
     with con:
         record_evidence(con, lid, sid, "plan_file", rel, root)
@@ -4633,7 +4868,7 @@ def cli_stats(ctx, argv):
 
 def cli_auto_skip(ctx, argv):
     """스킵 자동 승인 토글. on 은 PreToolUse 가 사람의 동의를 받은 뒤에만 도달한다."""
-    con, lid = ctx.con, ctx.lid
+    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
     pos = argv_positional(argv)
     mode = pos[0] if pos else "status"
     if mode == "off":
@@ -4669,7 +4904,8 @@ def cli_auto_skip(ctx, argv):
             set_meta(con, "auto_skip_at", now())
             set_meta(con, "auto_skip_uses", str(int(uses)) if uses else "")
             set_meta(con, "auto_skip_loop", lid if scope == "loop" else "")
-        print(t("스킵 자동 승인 ON (사용자 승인) — 사유: %s") % reason)
+        print(t("스킵 자동 승인 ON%s — 사유: %s")
+              % (t(" (사용자 승인)") if "auto-skip" in consent_map(cfg) else "", reason))
         print(t("범위: %s") % auto_skip_scope_note(con))
         print(t("사유는 계속 필수이고 기록에는 authorized_by=auto 로 남는다. "
               "끄려면 `harness auto-skip off`."))
@@ -4699,10 +4935,13 @@ def cli_loop(ctx, argv):
     if sub == "new":
         intent = argv_value(argv, "intent")
         with con:
-            close_loop(con, lid)
-            nlid = create_loop(con, cfg, root, intent)
-            if intent:
+            nlid = rotate_loop(con, cfg, root, lid, intent)
+            if nlid and intent:
                 record_evidence(con, nlid, cfg["stages"][0]["id"], "intent_set", intent)
+        if not nlid:
+            print(t("이미 %s 는 닫혔다 — 다른 호출이 먼저 새 작업을 시작했다. "
+                    "`harness status` 로 확인하라.") % lid)
+            return 1
         print(t("작업 %s 종료 → 새 작업 %s, 단계 %s")
               % (lid, nlid, label_of(cfg, cfg["stages"][0]["id"])))
         return 0
@@ -4823,21 +5062,32 @@ def run_cli(argv):
         print(t("이 프로젝트에는 하네스가 설치되지 않았다. `harness init` 또는 "
               "/step-seven-harness:install 을 실행하라."), file=sys.stderr)
         return 1
-    con = connect(root)
+    try:
+        con = connect(root)
+    except sqlite3.Error as exc:
+        # 훅은 "복구: init" 이라고 안내한다. 그 안내가 가리키는 CLI 가 여기서
+        # traceback 으로 죽으면 게이트가 **영구히** 꺼진다.
+        print(t("상태 DB를 열 수 없다 (%s). `%s` 로 복구하라 — 읽을 수 없는 파일은 "
+                "지우지 않고 옆으로 옮긴다.") % (exc, init_hint(root)), file=sys.stderr)
+        return 1
     cfg = load_config(root, plugin_root())
     load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
     if con is None or not isinstance(cfg, dict) or not cfg.get("stages"):
-        print(t("DB 또는 설정이 손상되었다: %s") % os.path.join(root, HARNESS_DIR),
-              file=sys.stderr)
+        print(t("DB 또는 설정이 손상되었다: %s\n복구: `%s`")
+              % (os.path.join(root, HARNESS_DIR), init_hint(root)), file=sys.stderr)
         return 1
     try:
         lid = head_loop(con)
         sid = active_stage(con, lid) if lid else None
         if not lid or not sid:
             with con:
-                lid = create_loop(con, cfg, root)
-            sid = cfg["stages"][0]["id"]
-            print(t("활성 루프가 없어 새로 만들었다: %s") % lid)
+                lid = create_loop(con, cfg, root, only_if_none=True)
+            sid = active_stage(con, lid) or cfg["stages"][0]["id"]
+        if not stage_known(cfg, sid):
+            print(t("활성 단계 '%s' 가 `%s` 에 없다 — 상태와 설정이 어긋났다. "
+                    "단계 id 를 되돌리거나 `harness loop new --reason \"...\"` 로 "
+                    "새 구성에서 다시 시작하라.") % (sid, CONFIG_REL), file=sys.stderr)
+            return 1
         fn = CLI.get(cmd)
         if not fn:
             print(t("알 수 없는 명령: %s\n사용 가능: %s\n전체 사용법은 `harness help`.")
@@ -4959,11 +5209,48 @@ def install_templates(root, pr):
     return made
 
 
+def quarantine_db(root):
+    """DB 를 열 수 없으면 옆으로 치우고 그 경로를 돌려준다. 멀쩡하면 None."""
+    path = os.path.join(root, DB_REL)
+    if not os.path.isfile(path):
+        return None
+    try:
+        probe = sqlite3.connect(path)
+        try:
+            probe.execute("PRAGMA schema_version").fetchone()
+        finally:
+            probe.close()
+        return None
+    except sqlite3.Error:
+        pass
+    for n in range(1, 100):
+        dst = "%s.corrupt-%d" % (path, n)
+        if not os.path.exists(dst):
+            try:
+                os.replace(path, dst)
+            except OSError:
+                return None
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+            return dst
+    return None
+
+
 def install_db(root, cfg):
     """스키마를 적용하고 활성 작업을 보장한다. 업그레이드 경로가 이 함수다 —
     `CREATE TABLE IF NOT EXISTS` 라서 재실행이 곧 스키마 갱신이다."""
     made = []
     fresh = not os.path.isfile(os.path.join(root, DB_REL))
+    # **`init` 은 복구 경로다.** 훅이 "복구: harness init" 이라고 안내하는데 정작
+    # 손상된 DB 앞에서 traceback 으로 죽으면 게이트가 영구히 꺼진다. 읽을 수 없으면
+    # 지우지 않고 **옆으로 치운다** — 사람이 나중에 열어볼 수 있어야 한다.
+    moved = quarantine_db(root)
+    if moved:
+        made.append(t("%s (읽을 수 없어 %s 로 옮겼다)") % (DB_REL, os.path.basename(moved)))
+        fresh = True
     con = connect(root, create=True)
     try:
         con.executescript(SCHEMA)

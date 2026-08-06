@@ -414,7 +414,7 @@
         "execution",
         "verification"
       ],
-      "bash_pattern": "\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?test\\b|\\bpytest\\b|\\bgo\\s+test\\b|\\bcargo\\s+test\\b|\\bmake\\s+(test|check|lint)\\b|\\bvitest\\b|\\bjest\\b|\\bruff\\b|\\bmypy\\b|\\btsc\\b|--dry-run\\b",
+      "bash_pattern": "(npm|pnpm|yarn|bun)\\s+(run\\s+)?test\\b|pytest\\b|go\\s+test\\b|cargo\\s+test\\b|make\\s+(test|check|lint)\\b|(npx\\s+|pnpm\\s+dlx\\s+|yarn\\s+dlx\\s+|uvx?\\s+|poetry\\s+run\\s+)?(vitest|jest|tsc|ruff|mypy)\\b|.*--dry-run\\b",
       "tools": [
         "Agent",
         "Task"
