@@ -2522,11 +2522,17 @@ check "자기 잠금을 신뢰할 수 없다고 말한다" '신뢰할 수 없다
 # 대소문자만 다른 접두사로 실행해도 담김을 알아채야 한다. `normcase` 는 POSIX 에서
 # 항등이고 `realpath` 도 표기를 정규화하지 않으므로(확인했다), macOS 에서
 # `/Private/…` 로 실행하고 root 가 `/private/…` 이면 경고가 사라졌다.
+# **경로에서 실제로 표기를 바꿔야 한다.** 앞서 `/private/`·`/tmp/` 치환을 썼더니
+# mktemp 가 `/var/folders/…` 를 주는 환경에서 아무것도 바뀌지 않아, 같은 경로를 두 번
+# 검사하는 공허한 테스트가 됐다 — 변이를 넣어도 통과했다. 두 번째 구성요소를 대문자로
+# 바꿔 반드시 다른 표기를 만든다.
 IWUP="$(python3 -c "
 import sys
-p = sys.argv[1]
-print(p.replace('/private/', '/Private/', 1) if p.startswith('/private/')
-      else p.replace('/tmp/', '/TMP/', 1))" "$IW2")"
+parts = sys.argv[1].strip('/').split('/')
+if len(parts) > 1:
+    parts[1] = parts[1].upper()
+print('/' + '/'.join(parts))" "$IW2")"
+check "표기가 실제로 달라졌다" '^1$' "$([ "$IWUP" != "$IW2" ] && echo 1 || echo 0)"
 if [ -d "$IWUP" ]; then
   check "대소문자가 다른 접두사로 실행해도 알아챈다" '프로젝트 안에 있다' \
     "$( (cd "$IW2" && python3 "$IWUP/plugins/step-seven-harness/scripts/harness.py" status 2>&1) )"
