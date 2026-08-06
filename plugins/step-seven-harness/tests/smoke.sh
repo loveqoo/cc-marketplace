@@ -5,6 +5,11 @@
 set -e
 
 ENGINE="$(cd "$(dirname "$0")/.." && pwd)/scripts/harness.py"
+# 리포 루트. **여기서 정의한다** — 예전에는 첫 사용(ctx_check)보다 170줄 뒤에
+# 정의돼 있어서 그때까지는 빈 문자열이었다. 빈 인자를 받은 검사기는 cwd 를 리포
+# 루트로 삼았으므로, **리포 루트에서 실행할 때만 우연히 통했다.** 다른 디렉터리에서
+# 돌리면 검사기가 통째로 죽고 `set -e` 가 스위트를 끊었다 — 5차 리뷰 도중 발견했다.
+MC="$(cd "$(dirname "$0")/../../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 PASS=0
@@ -117,8 +122,60 @@ check "status 에 작업이 보인다" '작업 내용: src/auth.ts' "$(cli statu
 check "사유 없는 intent 는 사용법 안내" '사용법' "$(cli loop intent || true)"
 check "조회 명령이 미리 허용된다" 'harness recall' \
   "$(python3 -c "import json;print(json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'])")"
-check "동의 필요 명령은 허용하지 않는다" '^0$' \
-  "$(python3 -c "import json;a=json.load(open('$WORK/.claude/settings.json'))['permissions']['allow'];print(sum(1 for x in a if 'harness skip' in x or 'auto-skip on' in x))")"
+# 예전에는 `harness skip` 과 `auto-skip on` **둘만** 셌다 — 동의 명령은 여섯 종류인데
+# 넷은 세지 않았으므로, 그 넷이 사전 승인 목록에 새어 들어가도 통과했다(5차 리뷰).
+# 목록을 이 파일에 박지 않고 **설정에서 읽어** 전수로 센다. 종류가 늘면 자동으로 센다.
+CONSENT_LEAK="$(python3 - "$WORK" "$(dirname "$ENGINE")" <<'PYC'
+import json, os, sys
+sys.path.insert(0, sys.argv[2])
+import harness as h
+root = sys.argv[1]
+cfg = h.load_config(root, os.path.dirname(sys.argv[2]))
+
+# 동의 명령의 **위험한 실제 호출**. 부분 문자열로 세면 `auto-skip status`(읽기 전용,
+# 의도적으로 허용) 가 `auto-skip` 에 걸려 오탐한다. 그래서 무엇이 허용되면 안 되는지를
+# 호출 형태로 적는다. consent 종류가 늘면 여기 없다는 것이 아래에서 드러난다.
+DANGER = {
+    "skip": "skip --reason 아무거나",
+    "allow": "allow docs/** --reason 아무거나",
+    "approve-plan": "approve-plan .dev/plan/p.md",
+    "loop new": "loop new",
+    "loop adopt": "loop adopt deadbeef",
+    "auto-skip": "auto-skip on",
+}
+subs = sorted(h.consent_map(cfg))
+missing = [su for su in subs if su not in DANGER]
+
+allow = json.load(open(os.path.join(root, ".claude", "settings.json"),
+                       encoding="utf-8"))["permissions"]["allow"]
+
+
+def grants(entry, cmd):
+    """`allow` 항목이 이 명령을 승인하나.
+
+    Claude Code 의 규칙 두 가지만 본다: `Bash(x)` 는 **정확히** x, `Bash(x:*)` 는
+    x 로 시작하는 것 전부. 그 이상은 모델링하지 않는다 — 남의 매처를 재구현하기
+    시작하면 근사가 쌓인다.
+    """
+    if not (entry.startswith("Bash(") and entry.endswith(")")):
+        return False
+    body = entry[5:-1]
+    full = h.WRAPPER_CMD + " " + cmd
+    if body.endswith(":*"):
+        pre = body[:-2]
+        return full == pre or full.startswith(pre + " ")
+    return full == body
+
+
+leaked = [su for su in subs if su in DANGER
+          and any(grants(e, DANGER[su]) for e in allow)]
+print("종류 %d개 검사; 표 누락 %d개; 새어나간 것 %d개: %s"
+      % (len(subs), len(missing), len(leaked), ", ".join(leaked + missing) or "없음"))
+PYC
+)"
+check "동의 명령을 전수로 센다" '종류 [1-9][0-9]* *개 검사' "$CONSENT_LEAK"
+check "위험 호출 표에 빠진 종류가 없다" '표 누락 0개' "$CONSENT_LEAK"
+check "동의 필요 명령은 하나도 사전 승인되지 않는다" '새어나간 것 0개' "$CONSENT_LEAK"
 check "작업만 기록해서는 Selection 을 끝낼 수 없다" 'acceptance' "$(cli advance || true)"
 check "완료 조건 미정을 알린다" '완료 조건: (미정)' "$(cli status)"
 check "완료 조건을 기록한다" '테스트 전부 통과' \
@@ -129,7 +186,13 @@ check "둘 다 기록하면 종료 조건이 충족된다" '충족 intent_set, a
 
 echo "== 엔진 사본이 프로젝트 안에 있다"
 check "엔진 사본 생성" 'harness\.py' "$(ls "$WORK/.claude/harness/bin/")"
-check "래퍼가 사본을 먼저 가리킨다" 'P="\$D/harness\.py"' "$(cat "$WORK/.claude/harness/bin/harness")"
+# 라벨이 거꾸로였다. 래퍼는 **플러그인 원본을 먼저** 쓴다 — 사본이 먼저면 사본을
+# 덮는 것이 곧 사전 승인된 임의 코드 실행이다. 사본은 마지막 폴백일 뿐이다.
+check "래퍼가 사본을 마지막 폴백으로만 쓴다" \
+  'if \[ ! -f "\$P" \]; then P="\$D/harness\.py"; fi' \
+  "$(cat "$WORK/.claude/harness/bin/harness")"
+check "래퍼가 플러그인 원본을 먼저 가리킨다" 'P="[^$][^"]*/scripts/harness\.py"' \
+  "$(cat "$WORK/.claude/harness/bin/harness")"
 check "사본으로 실행된다" '단계 1/7 Selection' \
   "$(cd "$WORK" && ./.claude/harness/bin/harness status | grep '단계')"
 
@@ -1493,10 +1556,77 @@ check "metrics 표에 사전승인 열이 있다" '사전승인' "$AM"
 check "사전승인만 올라도 개선 신호로 읽는다" '개선 신호' "$AM"
 rm -rf "$AW"
 
+echo "== 자기 잠금 우회 세 갈래 (훅으로 실제 재현)"
+# 5차 리뷰의 CRITICAL 셋은 **같은 패턴**이다: 바닥값을 경로 **문자열**로 판정하는데,
+# 같은 파일에 다른 문자열을 붙이는 길이 셋 있었다. 대가도 셋 다 같다 — 그 파일은
+# `.claude/settings.json` 에 사전 승인된 래퍼이므로 **승인 없는 임의 코드 실행**이다.
+# rules_check 가 판정 함수를 직접 검사하고, 여기서는 훅 JSON 으로 끝까지 확인한다.
+LW="$(mktemp -d)"
+(cd "$LW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+lb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":%s}}' \
+    "$LW" "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" \
+  | CLAUDE_PROJECT_DIR="$LW" python3 "$ENGINE" hook 2>&1; }
+lw() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":%s,"content":"x"}}' \
+    "$LW" "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" \
+  | CLAUDE_PROJECT_DIR="$LW" python3 "$ENGINE" hook 2>&1; }
+
+# (1) symlink 별칭 — `ln -s . alias` 하나로 문자열이 달라진다.
+ln -s . "$LW/alias"
+check "별칭 경로로 래퍼를 Write 할 수 없다" '"permissionDecision": *"deny"' \
+  "$(lw "alias/.claude/harness/bin/harness")"
+check "그 이유가 자기 잠금이라고 말한다" '하네스 자신은 수정할 수 없다' \
+  "$(lw "alias/.claude/harness/bin/harness")"
+check "별칭 경로로 리다이렉트할 수 없다" '"permissionDecision": *"deny"' \
+  "$(lb 'printf x > alias/.claude/harness/bin/harness')"
+# `'^$'` 는 빈 문자열에 맞지 않는다(grep 은 빈 입력을 훑지 않는다). 없어야 하는 것을
+# 확인할 때는 `check_absent` 를 쓴다 — 무엇이 나오면 안 되는지 라벨에 남는다.
+check_absent "무관한 별칭 경로는 자기 잠금에 걸리지 않는다" '하네스 자신은 수정할 수 없다' \
+  "$(lb 'printf x > alias/src/a.txt')"
+
+# (2) 설정만으로 잠금 해제 — `interpreters: ["rm"]` 이면 다음 인자가 '실행 대상'이 된다.
+python3 - "$LW" <<'PYI'
+import json, os, sys
+p = os.path.join(sys.argv[1], ".claude", "harness", "stages.json")
+d = json.load(open(p, encoding="utf-8"))
+d.setdefault("bash", {})["interpreters"] = ["rm", "python3"]
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PYI
+check "interpreters 에 rm 을 넣어도 DB 를 지울 수 없다" '"permissionDecision": *"deny"' \
+  "$(lb 'rm .claude/harness/harness.db')"
+check "그 설정이 무시된다고 알린다" 'bash.interpreters .*인터프리터로 선언할 수 없다' \
+  "$(cd "$LW" && python3 "$ENGINE" status 2>&1)"
+python3 - "$LW" <<'PYJ'
+import json, os, sys
+p = os.path.join(sys.argv[1], ".claude", "harness", "stages.json")
+d = json.load(open(p, encoding="utf-8"))
+d["bash"].pop("interpreters")
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PYJ
+
+# (3) 인터프리터 문자열 안에 숨긴 경로 — **이 우회는 막지 않는다.** 셸과 파이썬을
+# 재구현하는 대신 대가를 없앤다: 래퍼는 내용이 우리 것일 때만 실행된다.
+python3 -c "open('$LW/.claude/harness/bin/harness','w').write('#!/bin/sh\necho PWNED\n')"
+check "변조가 실제로 성공했다 (전제)" 'PWNED' "$(cat "$LW/.claude/harness/bin/harness")"
+LT="$(lb '.claude/harness/bin/harness status')"
+check "변조된 래퍼는 실행 전에 막힌다" '"permissionDecision": *"deny"' "$LT"
+check "왜 막았는지 말한다" '사전 승인' "$LT"
+check "막으면서 원본으로 복구한다" 'step-seven-harness wrapper' \
+  "$(cat "$LW/.claude/harness/bin/harness")"
+check_absent "복구된 래퍼에 변조가 남지 않았다" 'PWNED' \
+  "$(cat "$LW/.claude/harness/bin/harness")"
+check_absent "다시 실행하면 통한다" '"deny"' \
+  "$(lb '.claude/harness/bin/harness status')"
+check "복구된 래퍼가 실제로 동작한다" '단계 1/7' \
+  "$(cd "$LW" && ./.claude/harness/bin/harness status | grep '단계')"
+# 오판은 마찰이고, 마찰은 게이트를 끄게 만든다. 주석만 달라도 막으면 안 된다.
+printf '# 사람이 남긴 메모\n' >> "$LW/.claude/harness/bin/harness"
+check_absent "주석이 붙은 것은 변조가 아니다" '"deny"' \
+  "$(lb '.claude/harness/bin/harness status')"
+rm -rf "$LW"
+
 echo "== 측정 산술 (손계산 대조)"
 # 합성 이력의 기대값을 미리 종이에 세고 코드가 그 값을 내는지 본다.
 # cycle_counters 11개 항목과 _survival 8개 항목.
-MC="$(cd "$(dirname "$0")/../../.." && pwd)"
 MOUT="$(python3 "$(dirname "$0")/math_check.py" "$MC" 2>&1)"; MRC=$?
 check "손계산과 전부 일치" '^0$' "$MRC"
 check "실패 항목 없음" '실패 0개' "$MOUT"

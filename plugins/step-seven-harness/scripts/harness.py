@@ -704,10 +704,12 @@ def config_problems(cfg):
                 out.append(t("criteria.verification_evidence.bash_pattern 이 검증이 "
                              "아닌 명령도 증거로 인정한다 (%s) — 성공한 아무 명령이나 "
                              "Verification 을 통과시킨다") % ", ".join(hits))
-    bad_readers = [r for r in cfg.seq("bash.readers") if r in NEVER_READERS]
-    if bad_readers:
-        out.append(t("bash.readers 의 %s 는 변경 명령이라 읽기로 선언할 수 없다 "
-                     "— 무시된다") % ", ".join(sorted(bad_readers)))
+    # readers·interpreters 는 둘 다 '무해 선언' 이고 둘 다 잠금을 푸는 데 쓰였다.
+    for key, what in (("readers", t("읽기")), ("interpreters", t("인터프리터"))):
+        bad = [r for r in cfg.seq("bash." + key) if r in NEVER_BENIGN]
+        if bad:
+            out.append(t("bash.%s 의 %s 는 변경 명령이라 %s로 선언할 수 없다 "
+                         "— 무시된다") % (key, ", ".join(sorted(bad)), what))
 
     kinds = promote_as(cfg)
     if not [k for k in kinds if k != "declined"]:
@@ -1459,6 +1461,52 @@ def rel_to_root(root, path):
     return rel.replace(os.sep, "/")
 
 
+def rel_aliases(root, path):
+    """이 경로가 가리키는 것을 root 기준 상대경로 **여러 개**로 준다.
+
+    ## 왜 하나로는 안 되나
+
+    바닥값(SELF_LOCK)은 경로 **문자열**을 본다. 그런데 symlink 는 같은 파일에 다른
+    문자열을 붙인다. `ln -s . alias` 를 만들고 `alias/.claude/harness/bin/harness` 를
+    쓰면 문자열이 안 맞아 통과했다 — 5차 리뷰가 찾았고 재현했다. 그 파일은 사전
+    승인된 래퍼이므로 결과는 **승인 없는 임의 코드 실행**이다.
+
+    그래서 판정 단위를 '문자열 하나'에서 '이 경로가 가리킬 수 있는 문자열 전부'로
+    바꾼다. 문자열 그대로와, symlink 를 푼 뒤가 **둘 다** 후보다.
+
+      - 그대로가 필요한 이유: 바닥값 자체가 symlink 여서 밖을 가리키면(`bin` ->
+        `/tmp/x`) 푼 결과는 root 밖이라 잡히지 않는다. 문자열은 잡힌다.
+      - 푼 것이 필요한 이유: 위의 별칭 경로.
+
+    아직 없는 파일도 판정한다(쓰기 **전**이다). 존재하는 조상까지만 풀고 나머지는
+    이어 붙인다. root 자신이 symlink 인 경우(macOS 의 `/tmp` -> `/private/tmp`)를
+    위해 root 도 푼 것과 안 푼 것 둘 다에 대해 상대화한다.
+    """
+    out = []
+    lit = rel_to_root(root, path)
+    if lit:
+        out.append(lit)
+    if not path:
+        return out
+    p = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
+    try:
+        tail, cur = [], p
+        while not os.path.lexists(cur):
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            tail.append(os.path.basename(cur))
+            cur = parent
+        real = os.path.join(os.path.realpath(cur), *reversed(tail))
+    except OSError:
+        return out
+    for base in (root, os.path.realpath(root)):
+        r = rel_to_root(base, real)
+        if r and r not in out:
+            out.append(r)
+    return out
+
+
 def classify(rel, cfg):
     for cls, pats in cfg.get("path_classes", {}).items():
         for pat in pats:
@@ -1668,10 +1716,37 @@ def self_lock_hit(rel):
     return False
 
 
-# 이 이름들은 `bash.readers` 로 선언할 수 없다. 설정이 변경 명령을 읽기로 위장해
-# 잠금을 우회하는 것을 막는다 (`readers: ["rm"]` 로 확인했다).
-NEVER_READERS = ("rm", "mv", "cp", "dd", "tee", "truncate", "shred", "install",
-                 "ln", "sed", "mkdir", "touch", "find")
+def floor_hit(root, path):
+    """바닥값에 걸리나 — **경로가 가리키는 것**으로 본다.
+
+    `self_lock_hit` 은 문자열 검사다. 이것은 symlink 별칭까지 본다. 바닥값을 판정하는
+    곳은 전부 이것을 써야 한다. 이유는 `rel_aliases` 에 적었다.
+    """
+    for rel in rel_aliases(root, path):
+        if self_lock_hit(rel):
+            return rel
+    return None
+
+
+# 이 이름들은 **무해하다고 선언할 수 없다.** `bash.readers`(읽기니까 건너뛴다) 와
+# `bash.interpreters`(다음 인자는 실행 대상이니까 건너뛴다) 는 둘 다 "이 이름은
+# 안전하다"는 설정이고, 둘 다 변경 명령을 넣으면 **설정만으로 자기 잠금이 풀린다.**
+#
+# readers 쪽은 `readers: ["rm"]` 로 확인해 막았는데 interpreters 쪽은 열려 있었다 —
+# `interpreters: ["rm"]` 이면 `rm <엔진>` 의 경로가 '실행 대상'으로 건너뛰어진다.
+# 5차 리뷰가 찾았다. 같은 결함을 두 번 겪었으므로 **목록을 하나로 합친다.** 앞으로
+# 세 번째 '무해 선언' 설정이 생겨도 같은 바닥을 공유한다.
+NEVER_BENIGN = ("rm", "mv", "cp", "dd", "tee", "truncate", "shred", "install",
+                "ln", "sed", "mkdir", "touch", "find", "chmod", "chown", "sqlite3")
+NEVER_READERS = NEVER_BENIGN  # 이름은 유지한다 — 문서와 테스트가 이 이름을 쓴다
+
+
+def benign_head(cfg, key, head, default=()):
+    """`head` 가 이 '무해 선언' 목록에 있고, 위장이 아닌가.
+
+    설정은 잠금을 **푸는** 방향으로는 쓰이지 않는다.
+    """
+    return head in cfg.seq("bash." + key, default) and head not in NEVER_BENIGN
 
 
 def protected_pats(cfg):
@@ -1690,8 +1765,11 @@ def check_write(ctx, rel):
     """
     w = WriteReq(ctx, rel)
     # 바닥값은 설정보다 앞이고 grant 도 보지 않는다. write_rules 가 비어 있어도 남는다.
-    if self_lock_hit(rel):
-        reason = t(SELF_LOCK_MSG) % rel
+    # **symlink 별칭까지 본다** — 문자열만 보면 `alias/.claude/harness/bin/harness` 로
+    # 사전 승인된 래퍼를 덮어쓸 수 있었다.
+    aliased = floor_hit(ctx.root, rel)
+    if aliased:
+        reason = t(SELF_LOCK_MSG) % aliased
         record_event(ctx.con, ctx.lid, ctx.sid, "block", "self_lock", rel, reason)
         return "deny", reason
     rules = write_rules(ctx.cfg)
@@ -1754,24 +1832,26 @@ def bash_protected_hit(cfg, root, cmd):
     def protected(tok):
         use = pats
         for cand in candidates(tok):
-            rel = rel_to_root(root, cand)
-            if not rel or rel == ".":
-                continue
-            if any(glob_match(rel, p) for p in use):
-                return rel
-            # 바닥값은 대소문자를 무시하고도 본다 (macOS 에서 BIN == bin 이다).
-            if self_lock_hit(rel):
-                return rel
-            # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
-            # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
-            # 바닥값에 대해서는 mutating 판정을 믿지 않는다 — `mutator_pattern` 을
-            # `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이 검사가
-            # 통째로 꺼졌다. 설정으로 잠금을 푸는 방향은 막는다.
-            low = rel.lower()
-            if any(p.lower().startswith(low + "/") for p in floor):
-                return rel
-            if mutating and any(p.startswith(rel + "/") for p in use):
-                return rel
+            # 문자열 그대로와 symlink 를 푼 것 **둘 다** 본다 — 별칭 경로로 바닥값을
+            # 건드리는 것을 막는다. 이유는 `rel_aliases` 에 적었다.
+            for rel in rel_aliases(root, cand) or []:
+                if rel == ".":
+                    continue
+                if any(glob_match(rel, p) for p in use):
+                    return rel
+                # 바닥값은 대소문자를 무시하고도 본다 (macOS 에서 BIN == bin 이다).
+                if self_lock_hit(rel):
+                    return rel
+                # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
+                # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
+                # 바닥값에 대해서는 mutating 판정을 믿지 않는다 — `mutator_pattern` 을
+                # `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이 검사가
+                # 통째로 꺼졌다. 설정으로 잠금을 푸는 방향은 막는다.
+                low = rel.lower()
+                if any(p.lower().startswith(low + "/") for p in floor):
+                    return rel
+                if mutating and any(p.startswith(rel + "/") for p in use):
+                    return rel
         return None
 
     for seg in BASH_SPLIT.split(cmd):
@@ -1786,10 +1866,12 @@ def bash_protected_hit(cfg, root, cmd):
         # 이름은 읽기로 선언될 수 없다**(NEVER_READERS). 그 위장만 막으면 되고,
         # 읽기는 원래대로 통째로 건너뛴다 — `cat` 으로 DB를 읽는 것까지 막으면
         # 과잉 차단이고, 마찰은 게이트를 끄게 만든다.
-        if (head in cfg.seq("bash.readers", BASH_READERS_DEFAULT)
-                and head not in NEVER_READERS and ">" not in seg):
+        if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) and ">" not in seg:
             continue
-        skip = 2 if head in cfg.seq("bash.interpreters", BASH_INTERPRETERS_DEFAULT) and len(toks) > 1 else 1
+        # 인터프리터도 같은 검사를 받는다. `interpreters: ["rm"]` 로 다음 인자를
+        # '실행 대상'으로 건너뛰게 만들면 설정만으로 잠금이 풀렸다 — 5차 리뷰.
+        skip = 2 if benign_head(cfg, "interpreters", head,
+                                BASH_INTERPRETERS_DEFAULT) and len(toks) > 1 else 1
         for tok in toks[skip:]:
             hit = protected(tok)
             if hit:
@@ -2142,6 +2224,20 @@ def hook_pre_tool_use(inp, ctx):
                 "`.claude/harness/stages.json` 을, 엔진을 바꾸려면 플러그인을 "
                 "수정하라. 내용을 보려면 Read 도구를 쓰라. "
                 "이 차단은 `allow` 로도 열리지 않는다.") % hit)))
+
+        # 래퍼는 사전 승인돼 있으므로 **내용이 우리 것일 때만** 실행돼야 한다.
+        # 이 검사를 모든 Bash 앞에 두는 이유: 변조는 앞선 호출에서 이미 끝나 있고,
+        # 이 명령이 래퍼를 부르는지 아닌지를 정확히 아는 것도 셸 파싱이다.
+        if not wrapper_intact(root):
+            with con:
+                record_event(con, lid, sid, "block", "wrapper_tampered",
+                             WRAPPER_CMD, cmd[:200])
+            return emit(pre_decision("deny", (
+                t("`%s` 의 내용이 하네스가 쓴 것과 다르다. 이 경로는 "
+                  "`.claude/settings.json` 에 **사전 승인**돼 있어서, 내용이 바뀌면 "
+                  "승인 없이 임의 코드가 실행된다. 그래서 실행하지 않고 원본으로 "
+                  "복구했다 — 다시 실행하면 통한다. 래퍼를 바꿔야 한다면 플러그인의 "
+                  "`WRAPPER` 를 고쳐라.") % WRAPPER_CMD)))
 
         reqs = ctrl_requests(cmd)
         for req_sub, seg in reqs:
@@ -2733,6 +2829,56 @@ def refresh_wrapper(root):
     refresh_engine(root)
     _write_if_changed(os.path.join(root, WRAPPER_REL),
                       t(WRAPPER) % os.path.abspath(__file__), 0o755)
+
+
+def wrapper_code(body):
+    """래퍼에서 **실행되는 줄만** 남긴다.
+
+    바이트로 비교하면 주석(한국어 설명)이 `language` 설정에 따라 달라져 정상 파일을
+    변조로 오판한다. 오판은 마찰이고, 마찰은 게이트를 끄게 만든다. sh 에서 `#` 줄은
+    실행되지 않으므로 빼고 본다. 첫 줄(shebang)은 **인터프리터를 정하므로** 남긴다.
+    """
+    lines = (body or "").splitlines()
+    keep = lines[:1] + [ln for ln in lines[1:]
+                        if ln.strip() and not ln.strip().startswith("#")]
+    return "\n".join(keep)
+
+
+def wrapper_intact(root):
+    """래퍼가 우리가 쓴 그것인가. 아니면 **복구하고** False 를 준다.
+
+    ## 왜 필요한가 — 사전 승인은 경로에 붙고, 신뢰는 내용에 붙는다
+
+    `SAFE_PERMS` 는 `Bash(.claude/harness/bin/harness <cmd>)` 를 **경로로** 사전
+    승인한다. 그런데 그 경로의 파일은 프로젝트 안에 있고 모델이 쓸 수 있는 자리다.
+    바닥값이 Write·Edit·Bash 대상 검사로 막지만, 경로 문자열을 우회하는 길이 하나만
+    남아도 그 즉시 **승인 없는 임의 코드 실행**이 된다. 5차 리뷰가 두 가지로 재현했다.
+
+        python3 -c "open('.claude/harness/bin/harness','w').write(...)"
+        p=.claude/harness/bin/harness; printf x > $p
+
+    둘 다 경로가 문자열 안이나 셸 변수 안에 있어 토큰으로 보이지 않는다. **인터프리터
+    안의 코드와 셸 변수 확장을 정확히 따라가는 것은 셸을 재구현하는 일이다** — 그
+    방향으로는 근사만 쌓이고, 근사는 이미 두 번 틀렸다.
+
+    그래서 막는 자리를 바꾼다. 우회를 하나씩 잡는 대신 **대가를 없앤다**: 래퍼를
+    실행하기 전에 내용이 우리가 쓴 그것인지 본다. 아니면 실행하지 않고, 복구하고,
+    알린다. 우회가 성공해도 남의 코드는 실행되지 않는다.
+
+    복구까지 하는 이유: 거부만 하면 `harness init` 조차 래퍼를 거치므로 사용자가
+    갇힌다. 복구해 두면 다음 시도가 통한다 — 변조는 실행되지 않고, 사용자는 안다.
+    """
+    path = os.path.join(root, WRAPPER_REL)
+    want = t(WRAPPER) % os.path.abspath(__file__)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            have = fh.read()
+    except Exception:
+        have = None
+    if have is not None and wrapper_code(have) == wrapper_code(want):
+        return True
+    refresh_wrapper(root)
+    return False
 
 
 def status_report(ctx):
