@@ -466,8 +466,13 @@ def install_problems(root):
         rp = os.path.realpath(root)
     except Exception:
         return []
-    # macOS·Windows 는 대소문자를 구분하지 않으므로 normcase 로 비교한다.
-    prn, rpn = os.path.normcase(pr), os.path.normcase(rp)
+    # **`normcase` 로는 부족하다.** POSIX 에서 그것은 항등 함수이고, `realpath` 도
+    # 표기를 정규화하지 않는다(확인했다: `/PLUGINS` → `/PLUGINS`). 그래서 macOS 에서
+    # `/Private/…` 로 엔진을 실행하고 root 가 `/private/…` 이면 — 같은 경로인데 —
+    # 담김 판정이 실패해 경고가 나오지 않았다. 자기 잠금에서 쓴 것과 같은 방식으로,
+    # 대소문자를 접어 비교한다. 구분하는 파일시스템에서 과잉 경고가 되는 것은
+    # 받아들인다 — 경고를 놓치는 것보다 낫다.
+    prn, rpn = os.path.normcase(pr).lower(), os.path.normcase(rp).lower()
     if prn == rpn or prn.startswith(rpn + os.sep):
         return [t("플러그인 엔진이 프로젝트 안에 있다 (%s) — 이 설치 형태에서는 "
                   "모델이 훅 엔진을 고칠 수 있으므로 자기 잠금을 신뢰할 수 없다. "

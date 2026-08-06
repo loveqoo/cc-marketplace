@@ -2519,6 +2519,22 @@ check "엔진이 프로젝트 안이면 그 사실을 말한다" '프로젝트 �
   "$( (cd "$IW2" && python3 plugins/step-seven-harness/scripts/harness.py status 2>&1) )"
 check "자기 잠금을 신뢰할 수 없다고 말한다" '신뢰할 수 없다' \
   "$( (cd "$IW2" && python3 plugins/step-seven-harness/scripts/harness.py status 2>&1) )"
+# 대소문자만 다른 접두사로 실행해도 담김을 알아채야 한다. `normcase` 는 POSIX 에서
+# 항등이고 `realpath` 도 표기를 정규화하지 않으므로(확인했다), macOS 에서
+# `/Private/…` 로 실행하고 root 가 `/private/…` 이면 경고가 사라졌다.
+IWUP="$(python3 -c "
+import sys
+p = sys.argv[1]
+print(p.replace('/private/', '/Private/', 1) if p.startswith('/private/')
+      else p.replace('/tmp/', '/TMP/', 1))" "$IW2")"
+if [ -d "$IWUP" ]; then
+  check "대소문자가 다른 접두사로 실행해도 알아챈다" '프로젝트 안에 있다' \
+    "$( (cd "$IW2" && python3 "$IWUP/plugins/step-seven-harness/scripts/harness.py" status 2>&1) )"
+else
+  # 대소문자를 구분하는 파일시스템이면 이 시나리오가 성립하지 않는다 — 건너뛴다.
+  check "대소문자 무시 비교를 쓴다 (코드 확인)" 'normcase(pr).lower()' \
+    "$(grep -o 'normcase(pr)\.lower()' "$(dirname "$0")/../scripts/harness.py" | head -1)"
+fi
 rm -rf "$IW" "$IW2"
 
 echo "== 재연결은 측정을 건드리지 않는다 (종류를 갈랐다)"
