@@ -84,7 +84,7 @@ def in_t_call(node):
         if p is None:
             return False
         if isinstance(p, ast.Call):
-            return isinstance(p.func, ast.Name) and p.func.id == "t"
+            return _msgs.is_t_call(p)
         cur = p
     return False
 

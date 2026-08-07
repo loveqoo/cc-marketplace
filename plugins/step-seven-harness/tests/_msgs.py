@@ -69,6 +69,13 @@ def assigned_name(node, parent):
     return None
 
 
+def is_t_call(call):
+    """`t(...)` 인가. 게이트는 엔진을 주입받으므로 `h.t(...)` 로도 온다."""
+    f = call.func
+    return ((isinstance(f, ast.Name) and f.id == "t")
+            or (isinstance(f, ast.Attribute) and f.attr == "t"))
+
+
 def wrapped(node, parent):
     """조상 중에 t(...) 호출이 있나. 다른 호출의 인자로 들어가면 거기서 멈춘다."""
     cur = node
@@ -76,10 +83,8 @@ def wrapped(node, parent):
         p = parent.get(id(cur))
         if p is None:
             return False
-        if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "t":
-            return True
         if isinstance(p, ast.Call):
-            return False
+            return is_t_call(p)
         cur = p
     return False
 

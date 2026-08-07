@@ -3095,7 +3095,7 @@ echo "== 래퍼의 고정 경로는 세션 시작마다 갱신된다 (구버전 
 SW2="$(mktemp -d)"
 mkdir -p "$SW2/fake/old/scripts" "$SW2/fake/new/scripts" "$SW2/w"
 for V in old new; do
-  cp "$ENGINE" "$SW2/fake/$V/scripts/harness.py"
+  cp -r "$(dirname "$ENGINE")"/. "$SW2/fake/$V/scripts/"
   cp -r "$(cd "$(dirname "$ENGINE")/../templates" && pwd)" "$SW2/fake/$V/"
   python3 -c "
 import sys
