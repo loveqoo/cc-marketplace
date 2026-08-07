@@ -19,6 +19,7 @@
 
 import calendar
 import fnmatch
+import glob as globlib
 import hashlib
 import json
 import os
@@ -2078,10 +2079,11 @@ def bash_protected_hit(cfg, root, cmd):
 
         둘 다 실제로 통과했다: `dd if=/dev/null of=<db>`, `printf x >|<LEARNED>`.
         """
-        raw = tok.strip("\"'")
-        out = [raw.lstrip("<>|&")]
-        if "=" in raw:
-            out.append(raw.split("=", 1)[1].lstrip("<>|&"))
+        out = []
+        for raw in sh_expand(root, tok):      # 셸이 펼치는 것을 우리도 편다
+            out.append(raw.lstrip("<>|&"))
+            if "=" in raw:
+                out.append(raw.split("=", 1)[1].lstrip("<>|&"))
         return [it for it in out if it]
 
     def protected(tok):
@@ -2168,6 +2170,29 @@ REDIRECT_RE = re.compile(r"^\d*(>>?\|?|&>>?)$")
 BASH_TARGET_LAST = ("cp", "ln", "install", "sed", "perl")
 
 
+def sh_expand(root, tok):
+    """셸이 실행 시점에 펼칠 것을 **우리도 펼친다.** 결과들(없으면 원래 토큰).
+
+    glob 문자가 있는 토큰을 "해석할 수 없다" 며 통과시켰다. 그 한 줄이 실패 개방이었다 —
+    `cp evil .claude/harness/bi?/harness` 한 글자로 바닥값·격리·래퍼 무결성이 전부
+    뚫렸고, 사전 승인된 래퍼가 남의 코드로 바뀌어 실행되는 것까지 재현됐다.
+
+    모르면 통과가 아니다. 셸과 **같은 확장**을 해서 결과를 본다. 아무것도 안 맞으면
+    셸도 리터럴을 그대로 넘기므로 원래 토큰을 돌려준다.
+    """
+    tok = tok.strip("\"'")
+    if not tok:
+        return []
+    if not any(ch in tok for ch in "*?["):
+        return [tok]
+    base = tok if os.path.isabs(tok) else os.path.join(root, tok)
+    try:
+        hits = sorted(globlib.glob(base))
+    except OSError:
+        hits = []
+    return hits or [tok]
+
+
 def _target(root, tok, sure):
     """이 토큰이 가리키는 리포 안 경로. 아니면 None.
 
@@ -2175,14 +2200,12 @@ def _target(root, tok, sure):
     나머지는 추측이므로, 있는 파일이거나 `/` 를 포함한 자리만 경로로 본다 —
     `chmod 755 f` 의 `755`, `sed -i s/a/b/ f` 의 `s/a/b/` 를 거르기 위해서다.
     """
-    tok = tok.strip("\"'")
-    if not tok or any(ch in tok for ch in "*?["):
-        return None          # 펼쳐지지 않은 glob 은 해석할 수 없다
-    for rel in rel_aliases(root, tok):
-        if rel == ".":
-            continue
-        if sure or os.path.lexists(os.path.join(root, rel)) or "/" in rel:
-            return rel
+    for one in sh_expand(root, tok):
+        for rel in rel_aliases(root, one):
+            if rel == ".":
+                continue
+            if sure or os.path.lexists(os.path.join(root, rel)) or "/" in rel:
+                return rel
     return None
 
 

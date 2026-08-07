@@ -242,6 +242,27 @@ for cmd, want in (
     got = ", ".join(h.bash_writes(cfg, root, cmd))
     ck("%-34s -> %s" % (cmd[:34], want or "(없음)"), got == want, "실제: %s" % (got or "-"))
 
+print("셸이 펼치는 것은 우리도 펼친다 (glob)")
+# glob 문자를 "해석 불가" 로 통과시킨 것이 실패 개방이었다 — 한 글자로 바닥값·격리·
+# 래퍼 무결성이 전부 뚫렸고 사전 승인된 래퍼가 남의 코드로 실행되는 것까지 재현됐다.
+for cmd in ("rm .claude/harness/bi?/harness",
+            "rm -rf .clau*",
+            "rm -rf .claude/harnes*",
+            "sed -i s/a/b/ .claude/harness/bi?/harness",
+            "mv .claude/harness/bi?/harness /tmp/x",
+            "cp /tmp/evil .claude/harness/bi?/harness",
+            "cd .claude/harness/b?n && rm harness",
+            "rm -rf .claude/harness/*",
+            "printf x > .claude/harness/b*n/harness",
+            "rm .claude/harness/*.db"):
+    ck("glob 우회를 막는다: %s" % cmd[:40],
+       h.bash_protected_hit(cfg, root, cmd) is not None)
+# 아무것도 안 맞는 glob 은 셸도 리터럴로 넘긴다 — 우리도 그렇게 본다.
+ck("맞는 것이 없는 glob 은 원래 토큰", h.sh_expand(root, "nope*.xyz") == ["nope*.xyz"])
+ck("glob 이 없으면 그대로", h.sh_expand(root, "src/a.py") == ["src/a.py"])
+ck("맞는 것이 있으면 펼친다",
+   any(x.endswith(".claude/harness/bin") for x in h.sh_expand(root, ".claude/harness/bi?")))
+
 print("대상을 특정할 수 없는 파괴는 사람에게 묻는다")
 # `find . -name harness.db -delete` 는 토큰에 보호 경로가 없어 어떤 문자열 검사도
 # 지나간다. 특정하려 들지 않고 **모른다고 말한다** — 막으면 정상 정리가 막히고,
