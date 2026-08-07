@@ -551,6 +551,26 @@ ck("close_loop 이 cfg 를 요구한다 (빠뜨릴 자리를 없앤다)",
 ck("close_loop 이 스냅샷을 남긴다",
    "record_cycle_close" in inspect.getsource(h.close_loop))
 
+# --- 삭제는 결손으로 보여야 한다 ---------------------------------------------
+# 요약의 `쓰기 규칙 n/m` 은 분모가 **설정 자신**이라 규칙을 지우면 7/7 → 6/6 이
+# 된다 — 삭제가 결코 결손으로 나타나지 않았다(4회차 E-F12). 개수로는 못 잡는
+# 종류라 **이름을 템플릿과 대조**한다.
+print("== 기본 규칙을 지우면 드리프트로 보인다")
+_tpl = h.jload(os.path.join(REPO, "plugins/step-seven-harness/templates/stages.json"))
+_cut = h.Cfg(dict(cfg))
+_cut["write_rules"] = [r for r in cfg["write_rules"]
+                       if r["id"] not in ("docs_readonly", "loop_prefix")]
+_d = h.drift_problems(_cut, root)
+ck("빠진 규칙 이름을 말한다",
+   any("docs_readonly" in x and "loop_prefix" in x for x in _d), _d)
+ck("정상 설정에서는 조용하다",
+   not [x for x in h.drift_problems(cfg, root) if "쓰기 규칙" in x])
+_sw = h.Cfg(dict(cfg))
+_st = list(cfg["stages"]); _st[1], _st[2] = _st[2], _st[1]
+_sw["stages"] = _st
+ck("단계 순서를 바꾸면 말한다",
+   any("단계 순서" in x for x in h.drift_problems(_sw, root)))
+
 # --- 사본은 원본과 같다 -----------------------------------------------------
 # `.py` 만 보던 시절 두 구멍이 있었다(4회차 D-M9): `gates/zzz.pyc` 를 심으면
 # `pkgutil` 이 발견해 임포트하는데 복사·정리 어느 쪽에도 안 걸렸고, 플러그인

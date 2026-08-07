@@ -632,6 +632,36 @@ def drift_problems(cfg, root):
                 and "**" not in (want.get("write_glob") or []):
             out.append(t("criteria.%s.write_glob 이 '**' 로 넓어졌다 — 이 회차 "
                          "접두사가 붙은 **아무 파일이나** 이 조건을 채운다") % name)
+    out += _rules_dropped(cfg, tpl)
+    return out
+
+
+def _rules_dropped(cfg, tpl):
+    """기본값에 있는데 설정에서 **사라진** 쓰기 규칙.
+
+    요약의 `쓰기 규칙 n/m` 은 분모가 **설정 자신**(`len(write_rules)`)이라
+    규칙을 지우면 `7/7 → 6/6` 이 된다 — 삭제는 결코 결손으로 보이지 않았다
+    (4회차 E-F12). 개수로는 잡을 수 없는 종류다. 분모를 템플릿으로 바꾸면
+    사용자가 규칙을 **더할** 자유가 사라지므로, 개수 대신 **이름을 대조한다.**
+
+    막지 않는다 — 규칙을 지우는 것은 사용자의 자유다. 지웠다는 **사실**만 말한다.
+    단계 순서도 같은 종류다: 이름 집합은 같은데 순서가 바뀌면 우선순위가 바뀐다.
+    """
+    base = [r.get("id") for r in (tpl.get("write_rules") or []) if isinstance(r, dict)]
+    have = {r.get("id") for r in write_rules(cfg) if isinstance(r, dict)}
+    gone = [r for r in base if r and r not in have]
+    out = []
+    if gone:
+        out.append(t("기본 쓰기 규칙 %s 가 설정에서 빠졌다 — 그 규칙이 막던 것이 "
+                     "지금 아무것도 막지 않는다 (요약의 분모는 설정 자신이라 "
+                     "삭제가 보이지 않는다). 의도한 것이면 그대로 두어라.")
+                   % ", ".join(gone))
+    b_st = [x.get("id") for x in (tpl.get("stages") or []) if isinstance(x, dict)]
+    c_st = [x.get("id") for x in (cfg.get("stages") or []) if isinstance(x, dict)]
+    if b_st and set(b_st) == set(c_st) and b_st != c_st:
+        out.append(t("단계 순서를 바꿨다 (%s → %s) — 단계별 쓰기 허용과 종료 조건이 "
+                     "따라 움직인다. 의도한 것이면 그대로 두어라.")
+                   % (" → ".join(b_st), " → ".join(c_st)))
     return out
 
 
@@ -2927,23 +2957,32 @@ def hook_post_tool_use(inp, ctx):
     signals = cfg.obj("criteria")
 
     with con:
+        # **차단은 Bash 도 세면서 편집은 안 셌다.** PreToolUse 는 `bash_writes` 로
+        # 대상을 뽑아 같은 규칙 엔진에 넣는데, PostToolUse 는 Write/Edit 도구만
+        # 봤다. 그래서 `sed -i`·리다이렉트로 고친 것은 재편집(churn) 지표에
+        # 안 잡히고, 승격 검증이 "변경 관측 0/1" 로 **정상 승격을 무고**했다
+        # (4회차 C⑦ 실측). "무엇을 쓰나" 의 답은 이미 하나 있다 — 그것을 쓴다.
         field = WRITE_TOOLS.get(tool)
         if field:
-            rel = rel_to_root(root, ti.get(field))
-            if rel:
-                # 편집 이력. 한 루프에서 같은 파일을 몇 번 고쳤는지가 구조 냄새다.
-                record_event(con, lid, sid, "edit", None, rel)
-                # write_glob 이 없는 조건(cli·observed·no_pending)은 그냥 지나간다.
-                for kind, sig in signals.items():
-                    # `write_glob` 은 `satisfied_by: file` 의 어휘다. 방식을 보지 않고
-                    # glob 만 보면, `human: true` 인 조건에 glob 을 더하는 것만으로
-                    # **파일을 쓰는 행위가 사람의 승인이 된다.**
-                    if not isinstance(sig, dict) or sig.get("satisfied_by") != "file":
-                        continue
-                    for pat in sig.get("write_glob") or []:
-                        if glob_match(rel, pat):
-                            record_evidence(con, lid, sid, kind, rel, root)
-                            break
+            rels = [rel_to_root(root, ti.get(field))]
+        elif tool == "Bash" and not tool_failed(inp):
+            rels = bash_writes(cfg, root, ti.get("command") or "")
+        else:
+            rels = []
+        for rel in [r for r in rels if r]:
+            # 편집 이력. 한 루프에서 같은 파일을 몇 번 고쳤는지가 구조 냄새다.
+            record_event(con, lid, sid, "edit", None, rel)
+            # write_glob 이 없는 조건(cli·observed·no_pending)은 그냥 지나간다.
+            for kind, sig in signals.items():
+                # `write_glob` 은 `satisfied_by: file` 의 어휘다. 방식을 보지 않고
+                # glob 만 보면, `human: true` 인 조건에 glob 을 더하는 것만으로
+                # **파일을 쓰는 행위가 사람의 승인이 된다.**
+                if not isinstance(sig, dict) or sig.get("satisfied_by") != "file":
+                    continue
+                for pat in sig.get("write_glob") or []:
+                    if glob_match(rel, pat):
+                        record_evidence(con, lid, sid, kind, rel, root)
+                        break
         if sid in evidence_stages(cfg) and not tool_failed(inp):
             sig = signals.get("verification_evidence") or {}
             if not isinstance(sig, dict):
@@ -4342,6 +4381,11 @@ def cli_advance(ctx, argv):
 
     # 회고가 나중에 찾아지는지 확인한다. 통찰의 질은 채점하지 않지만 찾아지는지는
     # 기계적 사실이라 확인할 수 있다. 막지는 않는다 — 무엇을 쓸지는 판단이다.
+    # **읽기만 한다.** 기록은 claim 을 이긴 뒤에 (아래 트랜잭션 안에서) 남긴다.
+    # 예전에는 여기서 바로 커밋해서, 병렬 advance 넷 중 진 셋도 `retro_keys` 를
+    # 남겼다 — 회차 전이는 한 번인데 이벤트가 넷이었다(4회차 C⑨ 실측). 그 종류는
+    # `FP_IGNORE_KINDS` 에 없어 진전 지문까지 바꿔, 아무 진전 없이 "진전 있음" 으로
+    # 보이게 만들었다. **판정 전에 커밋하지 않는다.**
     retro_note = None
     if sid == last:
         with swallow(t("회고 키 확인")):
@@ -4349,11 +4393,6 @@ def cli_advance(ctx, argv):
                 con, cfg, root, lid, retro_window_start(con, lid))
             if keys:
                 retro_note = (keys, found, missing)
-                with con:
-                    record_event(con, lid, sid, "retro_keys", str(len(found)),
-                                 "%s-%d" % (lid, cycle_of(con, lid)),
-                                 "found=%d/%d missing=%s"
-                                 % (len(found), len(keys), ",".join(missing) or "-"))
 
     snap = None
     with con:
@@ -4364,6 +4403,12 @@ def cli_advance(ctx, argv):
             raise Refuse(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
                            "`harness status` 로 현재 단계를 확인하라.")
                          % stage_obj(cfg, sid)["label"], code=1)
+        if retro_note:
+            keys, found, missing = retro_note
+            record_event(con, lid, sid, "retro_keys", str(len(found)),
+                         "%s-%d" % (lid, cycle_of(con, lid)),
+                         "found=%d/%d missing=%s"
+                         % (len(found), len(keys), ",".join(missing) or "-"))
         # 회차 경계에서만 스냅샷을 남긴다. close_loop 이 stage 를 지우기 전에.
         if sid == last:
             snap = record_cycle_close(con, cfg, lid, sid)
