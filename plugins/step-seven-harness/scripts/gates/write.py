@@ -27,7 +27,8 @@ def register(h):
         # 훅이 지나는 문 셋. 예전 탐침은 `floor_hit` + `_first_violation` 을
         # 직접 불렀다 — `check_write` 보다 한 층 아래다. 그래서 `check_write`
         # 본문을 통째로 비워도 `쓰기 규칙 7/7` 이 그대로였다(4회차 D-C1).
-        entry = ("check_write", "floor_verdict", "bash_writes")
+        # 훅 표가 지나는 문. 아래 층(`check_write` 등)은 여기를 통해 지나간다.
+        entry = ("hook_pre_tool_use",)
 
         @property
         def name(self):
@@ -38,56 +39,74 @@ def register(h):
             return sum(1 for r in rules if h.rule_reachable(cfg, r)), len(rules)
 
         def probes(self, ctx):
+            """**훅 표에서 출발한다.** 네 헬퍼가 하던 일을 하나로 모았다.
+
+            예전에는 `check_write`·`floor_verdict`·`bash_writes` 를 직접 불렀다.
+            그 다섯 함수는 지켰지만 **그 위의 훅 디스패처는 아무도 소유하지
+            않았다** — `HOOKS = {}` 한 줄이면 게이트가 전부 죽는데 자기검사
+            34/34 가 그대로였다(5회차 D-C1). 문을 하나 위에서 연다.
+            """
             cfg, root = ctx.cfg, ctx.root
 
-            def _ctx(con, lid, at):
+            def hook(tool, ti, at=None, use=None):
+                at = at or ctx.sid
                 if not h.stage_known(cfg, at):
                     raise ValueError(h.t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % at)
-                return h.Ctx(con, cfg, root, lid, at)
+                with h.probe_loop(ctx.con) as (con, lid):
+                    yield con, lid
+                    d, why = h.probe_decision(
+                        h.Ctx(con, use or cfg, root, lid, at),
+                        {"hook_event_name": "PreToolUse", "tool_name": tool,
+                         "tool_input": ti})
+                    self._last = (bool(d), "%s(%s)" % (d, (why or "")[:60]) if d else "")
+
+            def broken_re(cmd, at=None):
+                """**설정 정규식이 깨진 경로.** `bash_mutator_re` 는 `re.error` 에서
+                코드 상수로 되돌아간다 — "잘못된 정규식으로 게이트를 열지 않는다".
+                그 주장에 탐침도 진단도 없어서, 페일세이프를 무매칭 패턴으로
+                바꿔도 검사 전부가 초록이었다(5회차 A6). 깨진 설정으로 한 번
+                돌려 본다."""
+                bad = h.Cfg(dict(cfg))
+                bad["bash"] = dict(cfg.obj("bash"), mutator_pattern="[")
+                return _run(hook("Bash", {"command": cmd}, at, use=bad))
+
+            def _run(gen):
+                for _ in gen:
+                    pass
+                return self._last
 
             def wr(rel, at=None):
-                """**훅과 같은 문.** `check_write` 가 판정한다."""
-                with h.probe_loop(ctx.con) as (con, lid):
-                    decision, why = h.check_write(_ctx(con, lid, at or ctx.sid), rel)
-                return bool(decision), (why or "")
+                """Write 도구가 훅을 지난다."""
+                return _run(hook("Write", {"file_path": rel}, at))
 
             def wrg(rel, at=None):
-                """**예외가 걸린 상태**로 판정한다. `grant_opens` 규칙(docs_readonly)이
-                비켜야 그 뒤의 규칙이 유일한 차단자가 되고, 그때만 탐침이 구분력을 갖는다.
-
-                예전에는 `WriteReq.grant` 에 가짜 dict 를 꽂았다 — 그건 `check_write`
-                가 하는 소진 처리를 건너뛰는 모형이었다. 사본에 **진짜 예외 행**을
-                넣는다. 사본이라 소진돼도 남지 않는다.
-                """
-                with h.probe_loop(ctx.con) as (con, lid):
+                """**예외가 걸린 상태**로. `grant_opens` 규칙(docs_readonly)이 비켜야
+                뒤 규칙이 유일한 차단자가 되고, 그때만 탐침이 구분력을 갖는다.
+                사본에 **진짜 예외 행**을 넣는다 — 소진돼도 남지 않는다."""
+                g = hook("Write", {"file_path": rel}, at)
+                for con, lid in g:
                     con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
                                 "VALUES(?,?,?,?,?)", (lid, rel, "selftest", 1, h.now()))
-                    decision, why = h.check_write(_ctx(con, lid, at or ctx.sid), rel)
-                return bool(decision), (why or "")
+                return self._last
 
             def bh(cmd):
-                """바닥값 판정은 **하나**다 — 경로를 특정하면 deny, 원문에만
-                보이면 ask. 둘을 따로 두면 탐침이 한쪽만 덮는다."""
-                decision, hit = h.floor_verdict(cfg, root, cmd)
-                return bool(decision), ("%s(%s)" % (decision, hit) if decision else "")
+                """바닥값도 같은 문으로. 경로를 특정하면 deny, 원문에만 보이면 ask."""
+                return _run(hook("Bash", {"command": cmd}))
 
             def br(cmd, at=None):
-                """Bash 경로도 훅과 같다 — `bash_writes` 로 대상을 뽑아 `check_write`."""
-                with h.probe_loop(ctx.con) as (con, lid):
-                    c = _ctx(con, lid, at or ctx.sid)
-                    for rel in h.bash_writes(cfg, root, cmd):
-                        decision, why = h.check_write(c, rel)
-                        if decision:
-                            return True, "%s/%s" % (rel, why or "")
-                return False, ""
+                """Bash 쓰기도 훅과 같은 문."""
+                return _run(hook("Bash", {"command": cmd}, at))
 
             def wr_prefixed():
                 """접두사는 **탐침이 도는 작업**의 것이어야 한다. 실제 작업의
                 접두사를 격리된 작업에 대고 물으면 늘 어긋난다."""
                 with h.probe_loop(ctx.con) as (con, lid):
                     rel = ".dev/plan/%sprobe.md" % h.file_prefix(con, lid)
-                    decision, why = h.check_write(_ctx(con, lid, ctx.sid), rel)
-                return bool(decision), (why or "")
+                    d, why = h.probe_decision(
+                        h.Ctx(con, cfg, root, lid, ctx.sid),
+                        {"hook_event_name": "PreToolUse", "tool_name": "Write",
+                         "tool_input": {"file_path": rel}})
+                return bool(d), (why or "")
 
             out = []
             for desc, call, want in (
@@ -103,6 +122,8 @@ def register(h):
                      h._bind(bh, "perl -i -pe s/a/b/ " + h.ENGINE_REL), True),
                     # 셸 확장은 펼치지 않는다 — 원문에 보이면 묻는다. 이 탐침이
                     # 없으면 그 층이 자기증명 밖에 남는다(4회차 A·C②).
+                    (h.t("설정 정규식이 깨져도 막는다"),
+                     h._bind(broken_re, "touch docs/probe.md", "selection"), True),
                     (h.t("셸 치환으로도 바닥값을 열 수 없다"),
                      h._bind(bh, 'cp evil "$(pwd)/' + h.WRAPPER_CMD + '"'), True),
                     (h.t("인터프리터 인라인 코드도 마찬가지"),

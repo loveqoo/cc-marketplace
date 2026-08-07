@@ -26,7 +26,8 @@ def register(h):
         # 훅은 `ctrl_decision` 으로 판정한다. 예전 탐침은 `ctrl_requests` 로 이름을
         # 뽑아 `consent_map` 멤버십만 봤다 — 한 층 아래다. 그래서 `ctrl_decision`
         # 본문을 통째로 비워도 `승인 필요 6/6` 이 그대로였다(4회차).
-        entry = ("ctrl_decision",)
+        # 훅 표가 지나는 문. `ctrl_known`·`ctrl_decision` 은 여기 아래다.
+        entry = ("hook_pre_tool_use",)
 
         @property
         def name(self):
@@ -44,20 +45,17 @@ def register(h):
 
         def probes(self, ctx):
             def ask(cmd):
-                """**훅과 같은 길로 판정한다.** `ctrl_requests` 로 호출을 뽑고
-                하나하나 `ctrl_decision` 에 넣는다 — 훅이 하는 그대로다.
-
-                판정이 나오면(ask/deny) 막힌 것이다. `permissionDecision` 을
-                직접 읽지 않고 '판정이 있었나' 만 본다 — 승인 방식이 바뀌어도
-                탐침은 계속 옳다.
+                """**훅 표에서 출발한다.** `ctrl_decision` 을 직접 부르면 그 위의
+                `ctrl_known` 층("하네스를 부르는데 무엇을 부르는지 못 읽으면
+                묻는다")을 지나지 않는다 — 그 층을 항상 True 로 바꿔도 검사
+                전부가 초록이었다(5회차 D8). 문을 하나 위에서 연다.
                 """
-                for sub, pos, direct, seg in h.ctrl_requests(cmd):
-                    with h.probe_loop(ctx.con) as (con, lid):
-                        out = h.ctrl_decision(con, ctx.cfg, ctx.root, sub, pos,
-                                              direct, seg, None, lid, ctx.sid)
-                    if out:
-                        return True, sub
-                return False, h.t("판정 없음")
+                with h.probe_loop(ctx.con) as (con, lid):
+                    d, why = h.probe_decision(
+                        h.Ctx(con, ctx.cfg, ctx.root, lid, ctx.sid),
+                        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                         "tool_input": {"command": cmd}})
+                return bool(d), (why or h.t("판정 없음"))[:60]
 
             out = []
             for i, name in enumerate(self.FLOOR):
@@ -65,6 +63,11 @@ def register(h):
                 call = "%s %s %s" % (h.WRAPPER_CMD, name, self.ARGS.get(name, ""))
                 out.append((h.t("동의 게이트: %s (%s)") % (name, shape),
                             h._bind(ask, self.WRAPS[i % 4] % call.strip()), True))
+            # **모르는 하위 명령은 묻는다.** `ctrl_known` 은 "하네스를 부르는데
+            # 무엇을 부르는지 못 읽으면 ask" 라는 층인데, 항상 True 로 바꿔도
+            # 검사 전부가 초록이었다(5회차 D8). 그 계약에 단정이 없었다.
+            out.append((h.t("모르는 하위 명령은 묻는다"),
+                        h._bind(ask, "%s bogus-subcommand" % h.WRAPPER_CMD), True))
             # 통과하는 쪽이 없으면 이 게이트는 구분력이 없다 — 조회 명령은 묻지 않는다.
             out.append((h.t("조회 명령은 동의를 묻지 않는다"),
                         h._bind(ask, "%s status" % h.WRAPPER_CMD), False))

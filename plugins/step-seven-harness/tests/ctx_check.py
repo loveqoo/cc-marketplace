@@ -41,6 +41,7 @@ walrus, except 별칭의 **스코프**를 전부 정확히 안다.
 때문인데, 이제 훅은 내부 오류를 사용자에게 알린다(`inactive()`). 그러니 이 검사는
 '최후의 방어선'이 아니라 **빨리 잡는 도구**다. 못 잡는 것은 실행하면 보인다.
 """
+import ast
 import os
 import sys
 import symtable
@@ -69,22 +70,66 @@ def walk_scopes(table, path=()):
             yield it
 
 
+def arity(files, bad):
+    """엔진 안의 호출이 **정의된 인자 개수와 맞는가.**
+
+    파이썬에는 컴파일러가 없어서 시그니처를 바꾸고 호출부 하나를 빠뜨려도
+    그 줄을 실제로 밟기 전까지 조용하다. 실제로 그랬다: `close_loop` 에
+    `kind` 를 필수로 더하면서 호출 두 곳 중 하나만 고쳤고, 그 자리는 기본
+    설정에서 **도달 불가**(마지막 단계가 `skippable: false`)라 검사 여덟 개와
+    테스트 766개가 전부 초록이었다. `stages[6].skippable: true` 한 줄이면
+    `TypeError` 로 죽었다(5회차 M2).
+
+    "등록 시점에 터지게 한다"(`Gate` 의 `abc`)와 같은 생각을 호출에 적용한다.
+    기본값·`*args`·`**kwargs` 가 있으면 판정하지 않는다 — 모르면 조용히 넘긴다.
+    """
+    defs, calls, n = {}, [], 0
+    for src_path in files:
+        tree = ast.parse(open(src_path, encoding="utf-8").read())
+        for fn in [x for x in ast.walk(tree) if isinstance(x, ast.FunctionDef)]:
+            a = fn.args
+            if a.vararg or a.kwarg or a.kwonlyargs:
+                continue
+            lo = len(a.args) - len(a.defaults)
+            defs.setdefault(fn.name, set()).add((lo, len(a.args)))
+        for c in [x for x in ast.walk(tree) if isinstance(x, ast.Call)]:
+            if isinstance(c.func, ast.Name) and not c.keywords \
+                    and not any(isinstance(x, ast.Starred) for x in c.args):
+                calls.append((os.path.basename(src_path), c.lineno,
+                              c.func.id, len(c.args)))
+    for fname, line, name, got in calls:
+        want = defs.get(name)
+        if not want or len(want) != 1:      # 이름이 겹치면 판정하지 않는다
+            continue
+        lo, hi = next(iter(want))
+        n += 1
+        if not (lo <= got <= hi):
+            bad.append("%s:%d 이(가) %s 를 인자 %d개로 부른다 (정의는 %d~%d개)"
+                       % (fname, line, name, got, lo, hi))
+    return n
+
+
 def main():
     checked, bad = 0, []
     files = sources()
     for src_path in files:
         checked += scan(src_path, bad)
-    print("  파일 %d개 · 함수 스코프 %d개 검사 (symtable)" % (len(files), checked))
+    ncall = arity(files, bad)
+    print("  파일 %d개 · 함수 스코프 %d개 검사 (symtable) · 호출 %d개 인자 대조"
+          % (len(files), checked, ncall))
+    if ncall < 200:
+        print("  대조한 호출이 너무 적다 (%d) — 추출이 깨졌다" % ncall)
+        return 1
     # 숫자를 **출력만** 하고 단정하지 않았다. 추출이 죽어도 "누락 없음" 이었다.
     if checked < 250:
         print("  훑은 스코프가 너무 적다 (%d) — 추출이 깨졌다" % checked)
         return 1
     if bad:
-        print("  언팩 누락 %d건" % len(bad))
+        print("  문제 %d건" % len(bad))
         for b in sorted(set(bad)):
             print("    " + b)
         return 1
-    print("  언팩 누락 없음")
+    print("  문제 없음")
     return 0
 
 

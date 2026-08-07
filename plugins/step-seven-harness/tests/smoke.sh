@@ -35,6 +35,27 @@ check_empty() { # check_empty <label> <actual>
   fi
 }
 
+# **판정 장치가 살아 있나.** 5회차 변이 테스트: `check()` 를 무조건 PASS 로
+# 바꿔도, 마지막 `[ "$FAIL" -eq 0 ]` 을 지워도 `766 passed, 0 failed` + 상위
+# `all.sh` 는 `전부 통과` 였다. 766개 단정이 전부 죽어도 초록이다.
+#
+# 검사를 검사하는 것은 검사밖에 없다. 반드시 실패해야 하는 것과 반드시 통과해야
+# 하는 것을 하나씩 넣고, 그 결과가 기대와 다르면 **여기서 멈춘다.**
+_canary() {
+  local p0=$PASS f0=$FAIL
+  check "카나리아: 통과해야 한다" 'abc' 'xxabcxx'
+  check "카나리아: 실패해야 한다" 'NEVER-MATCHES-THIS' 'zzz' >/dev/null
+  check_empty "카나리아: 빈 것" ""
+  check_empty "카나리아: 안 빈 것" "x" >/dev/null
+  if [ "$PASS" -ne $((p0 + 2)) ] || [ "$FAIL" -ne $((f0 + 2)) ]; then
+    printf '카나리아 실패 — check()/check_empty() 의 판정이 고장났다 (PASS %d→%d, FAIL %d→%d)\n' \
+      "$p0" "$PASS" "$f0" "$FAIL" >&2
+    exit 1
+  fi
+  PASS=$p0; FAIL=$f0        # 카나리아는 집계에 넣지 않는다
+}
+_canary
+
 # JSON 경로의 값을 정확히 비교한다. 정규식이 아니므로 "무엇이든 통과"가 불가능하다.
 jq1() { python3 -c "
 import json,sys
@@ -3384,4 +3405,9 @@ check "무슨 일인지 stderr 로 알린다" 'step-seven-harness' \
   "$(hook "$(W docs/x.md)" 2>&1 >/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+# 개수 바닥. 절을 통째로 `if false` 로 감싸도 초록이었다(5회차 D11).
+if [ "$PASS" -lt 700 ]; then
+  echo "체크가 $PASS 개뿐이다 (최소 700) — 절이 통째로 꺼졌다" >&2
+  exit 1
+fi
 [ "$FAIL" -eq 0 ]

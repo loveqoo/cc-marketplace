@@ -662,6 +662,60 @@ def _rules_dropped(cfg, tpl):
         out.append(t("단계 순서를 바꿨다 (%s → %s) — 단계별 쓰기 허용과 종료 조건이 "
                      "따라 움직인다. 의도한 것이면 그대로 두어라.")
                    % (" → ".join(b_st), " → ".join(c_st)))
+    return out + _wiring_changed(cfg, tpl)
+
+
+# 단계가 소유한 **배선**. 이름이 아니라 값이 바뀌면 게이트가 통째로 옮겨 간다.
+STAGE_WIRING = ("write", "exit_criteria", "stop_requires", "skip_requires",
+                "skippable")
+
+
+def _wiring_changed(cfg, tpl):
+    """단계의 배선이 기본값에서 달라진 것.
+
+    **이 축은 아무 게이트도 소유하지 않았다.** `stages[verification]` 의
+    `exit_criteria` 를 이미 충족된 다른 조건(`intent_set`)으로 **갈아끼우면**
+    Verification 게이트가 완전히 죽는데, 개수 기반 카운터(`4/7`)는 배열이
+    비지 않았으므로 그대로였고 `criteria` 에도 그 조건이 남아 있어 "criteria 에
+    없다" 진단도 안 걸렸다 — `status` 첫 두 줄이 stock 과 바이트 동일했다
+    (5회차 B-C1·H8·H10).
+
+    `skippable`/`skip_requires` 도 같다. 스킵 게이트는 `REQUIRED_GATES` 에
+    없어서 소유자가 아예 없었다.
+
+    개수로는 잡을 수 없다. 이름과 값을 템플릿과 **그대로 대조**한다. 막지
+    않는다 — 바꾸는 것은 사용자의 자유이고, 바꿨다는 사실만 말한다.
+    """
+    base = {x.get("id"): x for x in (tpl.get("stages") or []) if isinstance(x, dict)}
+    out = []
+    for st in cfg.get("stages") or []:
+        if not isinstance(st, dict):
+            continue
+        want = base.get(st.get("id"))
+        if not want:
+            continue                      # 사용자가 더한 단계 — 대조 대상이 아니다
+        for key in STAGE_WIRING:
+            a, b = want.get(key), st.get(key)
+            if a == b:
+                continue
+            # **덜어낸 것은 말하지 않는다.** 어휘에서 빼는 것은 사용자의 자유이고,
+            # 그 결정은 이미 내려져 있다(`덜어낸 것을 되살리지 않는다`). 위험한
+            # 것은 축소가 아니라 **교체**다 — 배열이 비지 않으니 개수 카운터는
+            # 그대로인데 내용이 딴것이 된다. `exit_criteria: ["intent_set"]` 하나로
+            # Verification 게이트가 죽는데 `4/7` 이 유지됐다(5회차 B-C1).
+            if isinstance(a, list) and isinstance(b, list):
+                added = [x for x in b if x not in a]
+                if not added:
+                    continue                      # 순수 축소 — 조용
+                out.append(t("stages[%s].%s 에 %s 가 들어왔다 (기본: %s) — 그 단계의 "
+                             "강제가 따라 움직인다. 의도한 것이면 그대로 두어라.")
+                           % (st.get("id"), key,
+                              json.dumps(added, ensure_ascii=False),
+                              json.dumps(a, ensure_ascii=False)))
+            elif b and not a:
+                # 불리언이 관대한 쪽으로 뒤집혔다 (`skippable: false → true`)
+                out.append(t("stages[%s].%s 를 켰다 — 그 단계를 건너뛸 수 있게 된다. "
+                             "의도한 것이면 그대로 두어라.") % (st.get("id"), key))
     return out
 
 
@@ -1472,17 +1526,25 @@ def record_cycle_close(con, cfg, lid, sid, kind="cycle_close"):
     """
     cyc = cycle_of(con, lid)
     tgt = "%s-%d" % (lid, cyc)
-    row = con.execute("SELECT detail FROM event WHERE target=? "
-                      "AND kind IN ('cycle_close','cycle_adopt')", (tgt,)).fetchone()
-    if row:
-        try:
-            return json.loads(row["detail"])
-        except ValueError:
-            return None
     c = cycle_counters(con, lid, cycle_window_start(con, lid))
     c["cycle"] = cyc
-    record_event(con, lid, sid, kind, str(cyc), tgt,
-                 json.dumps(c, ensure_ascii=False))
+    # **판단을 INSERT 의 WHERE 안으로.** 읽고-없으면-쓰기는 원자적이지 않아서
+    # 병렬 `loop adopt` 다섯이 같은 회차에 스냅샷을 다섯 개 남겼다 — 회차 1개가
+    # "기록된 회차 5개" 로 집계됐다(5회차 C②). `claim` 은 이 저장소가 같은
+    # 문제에 이미 쓰는 어휘다(`stage_set`, `stop_block`).
+    if not claim(con, "INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                      "SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS ("
+                      "SELECT 1 FROM event WHERE target=? "
+                      "AND kind IN ('cycle_close','cycle_adopt'))",
+                 (now(), lid, sid, kind, str(cyc), tgt,
+                  json.dumps(c, ensure_ascii=False), tgt)):
+        # 다른 호출이 먼저 남겼다. 그 행이 진실이다.
+        row = con.execute("SELECT detail FROM event WHERE target=? "
+                          "AND kind IN ('cycle_close','cycle_adopt')", (tgt,)).fetchone()
+        try:
+            return json.loads(row["detail"]) if row else None
+        except ValueError:
+            return None
     return c
 
 
@@ -3189,6 +3251,27 @@ def hook_stop(inp, ctx):
     if not problems:
         return continue_or_stop(con, cfg, root, lid, sid, stage, prompt_id)
 
+    # **예산을 적지 못해도 답은 안다.** 이 트랜잭션이 터지면 예외가 `inactive()`
+    # 로 떨어져 Stop 게이트가 통째로 열렸다 — 읽기 전용 FS 에서 `prompt_id` 유무와
+    # 무관하게 재현됐다(5회차 D-C2). 기록은 곁다리이고 판정은 이미 손에 있다.
+    #
+    # 적지 못하면 **예산이 안 줄었다는 뜻**이므로 전부 막는 쪽이 옳다. 우회 예산은
+    # 사용자가 관대해지려고 둔 것이지 DB 사고로 얻는 것이 아니다.
+    blocked, exhausted = [t for _k, t in problems], []
+    with swallow(t("턴 종료 예산")):
+        blocked, exhausted = self_stop_budget(con, cfg, lid, sid, stage,
+                                              prompt_id, problems, limits)
+
+    if blocked:
+        emit({"decision": "block", "reason": " / ".join(blocked)})
+    elif exhausted:
+        # 조용히 통과시키지 않는다 — 우회 사실을 사용자에게 노출한다
+        emit({"systemMessage": t("harness: %s 단계를 미충족 상태로 종료했다 (%s). "
+                               "차단 상한 소진.") % (stage["label"], ", ".join(exhausted))})
+
+
+def self_stop_budget(con, cfg, lid, sid, stage, prompt_id, problems, limits):
+    """차단 예산을 소비하고 `(막을 것, 소진된 것)` 을 돌려준다."""
     blocked, exhausted = [], []
     with con:
         for key, text in problems:
@@ -3206,13 +3289,7 @@ def hook_stop(inp, ctx):
         for key in exhausted:
             record_event(con, lid, sid, "bypass", key, stage["id"],
                          t("차단 상한 소진으로 미충족 상태 종료"))
-
-    if blocked:
-        emit({"decision": "block", "reason": " / ".join(blocked)})
-    elif exhausted:
-        # 조용히 통과시키지 않는다 — 우회 사실을 사용자에게 노출한다
-        emit({"systemMessage": t("harness: %s 단계를 미충족 상태로 종료했다 (%s). "
-                               "차단 상한 소진.") % (stage["label"], ", ".join(exhausted))})
+    return blocked, exhausted
 
 
 # 하네스가 **스스로** 남기는 기록은 진전이 아니다. 이걸 빼지 않으면 이어붙임
@@ -3420,9 +3497,17 @@ def run_hook():
                             t("`%s` 또는 `%s status`") % (init_hint(root), WRAPPER_CMD))
         pid = inp.get("prompt_id")
         if pid:
-            with con:
-                con.execute("INSERT OR IGNORE INTO prompt_stage(prompt_id,stage,at) "
-                            "VALUES(?,?,?)", (pid, sid, now()))
+            # **부기가 판정을 막지 않는다.** 이건 말머리 검사용 순수 기록인데
+            # `swallow` 밖에 있었다. 읽기 전용 FS·디스크 참·잠금 경합에서 이
+            # INSERT 가 터지면 예외가 `inactive()` 로 떨어져 **그 뒤의 판정이
+            # 아예 돌지 않았다** — `rm -rf .claude` 가 통과했다(5회차 C④·D-C2,
+            # 두 리뷰어가 각자 재현). Claude Code 는 `prompt_id` 를 항상 보낸다.
+            #
+            # `record_event` 만 감싼 것은 열한 곳 중 하나를 고친 것이었다.
+            with swallow(t("프롬프트-단계 기록")):
+                with con:
+                    con.execute("INSERT OR IGNORE INTO prompt_stage(prompt_id,stage,at) "
+                                "VALUES(?,?,?)", (pid, sid, now()))
         fn = HOOKS.get(inp.get("hook_event_name"))
         if fn:
             fn(inp, Ctx(con, cfg, root, lid, sid))
@@ -3968,6 +4053,38 @@ class probe_loop(object):
         return False
 
 
+def probe_hook(ctx, inp):
+    """훅이 **실제로 지나는 길**로 판정을 받아온다 — `HOOKS` 표에서 찾아 부른다.
+
+    4회차에 "탐침이 진입점을 지났는지 계수한다" 로 고쳤고, 그 규칙은 자기가 겨눈
+    다섯 함수를 실제로 지킨다(비우면 3~12개 탐침이 실패한다). **그런데 그 다섯
+    위에 훅 디스패처가 있었다.** `HOOKS = {}` 한 줄이면 게이트가 전부 죽는데
+    자기검사 34/34 와 `강제 중:` 줄이 바이트 하나 안 바뀌었다(5회차 D-C1).
+
+    같은 실수의 한 층 위 판이다. 그래서 탐침을 **표에서** 출발시킨다 — 표가
+    비면 탐침이 돌지 못하고, 돌지 못한 것도 결과다(`ValueError`).
+
+    돌려주는 것은 훅이 낸 것(`PROBE_EMITS`)이다. `probe_run` 이 `emit` 을
+    가로채므로 stdout 은 더럽혀지지 않는다.
+    """
+    name = inp.get("hook_event_name")
+    fn = HOOKS.get(name)
+    if fn is None:
+        raise ValueError(t("훅 표에 %s 가 없다 — 그 이벤트는 아무 판정도 받지 못한다")
+                         % name)
+    fn(inp, ctx)
+    return list(PROBE_EMITS)
+
+
+def probe_decision(ctx, inp):
+    """훅의 판정 `(decision, reason)`. 아무 말이 없으면 `(None, "")`."""
+    for out in probe_hook(ctx, inp):
+        got = (out or {}).get("hookSpecificOutput") or {}
+        if got.get("permissionDecision"):
+            return got["permissionDecision"], got.get("permissionDecisionReason", "")
+    return None, ""
+
+
 class probe_run(object):
     """탐침 한 번을 **격리해서** 돌리고, 진입점을 지났는지 센다.
 
@@ -3986,7 +4103,7 @@ class probe_run(object):
 
     def __init__(self, mod, names):
         self.mod, self.names, self.hits = mod, names, 0
-        self._orig = {}
+        self._orig, self._tables = {}, []
 
     def _count(self, fn):
         def go(*a, **kw):
@@ -3996,14 +4113,26 @@ class probe_run(object):
 
     def __enter__(self):
         for nm in self.names:
-            self._orig[nm] = getattr(self.mod, nm)
-            setattr(self.mod, nm, self._count(self._orig[nm]))
+            fn = getattr(self.mod, nm)
+            self._orig[nm] = fn
+            wrapped = self._count(fn)
+            setattr(self.mod, nm, wrapped)
+            # **표가 잡아둔 참조도 바꾼다.** `HOOKS` 는 정의 시점에 함수 객체를
+            # 직접 담으므로 모듈 속성만 감싸면 계수기가 안 닿는다 — 탐침이
+            # 진입점을 지나고도 "지나지 않았다" 로 나왔다(5회차 D-H3 의 우회를
+            # 내가 그대로 밟았다). 참조를 들고 있는 곳을 함께 갈아 끼운다.
+            for key, val in list(HOOKS.items()):
+                if val is fn:
+                    self._tables.append((HOOKS, key, fn))
+                    HOOKS[key] = wrapped
         del PROBE_EMITS[:]
         self._orig["emit"] = self.mod.emit
         self.mod.emit = PROBE_EMITS.append
         return self
 
     def __exit__(self, *exc):
+        for tbl, key, fn in self._tables:
+            tbl[key] = fn
         for nm, fn in self._orig.items():
             setattr(self.mod, nm, fn)
         return False
@@ -4208,7 +4337,7 @@ def _enter(ctx, dest_idx):
     """dest_idx 단계를 active 로. 범위를 넘으면 루프를 닫고 새 루프를 만든다."""
     con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
     if dest_idx >= len(cfg["stages"]):
-        close_loop(con, cfg, lid)
+        close_loop(con, cfg, lid, "cycle_close")
         return create_loop(con, cfg, root), cfg["stages"][0]["id"], True
     sid = cfg["stages"][dest_idx]["id"]
     # **들어가는 쪽도 차지해야 한다.** 떠나는 쪽에만 claim 을 붙였더니, 대상 단계 행이
@@ -5104,7 +5233,18 @@ def cli_promote(ctx, argv):
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
             "decision=excluded.decision, maturity=excluded.maturity, "
             "note=excluded.note, loop_id=excluded.loop_id, at=excluded.at, "
-            "recheck_at=excluded.recheck_at, after_id=excluded.after_id",
+            # **재발 창은 뒤로 밀지 않는다.** `after_id=excluded.after_id` 였을 때
+            # 똑같은 명령을 한 번 더 치는 것만으로 그동안의 재발이 창 밖으로
+            # 나가 `regressed → established`, `재발 100% → 0%` 가 됐다
+            # (5회차 C① 실측). 승격은 동의 다이얼로그가 없는 '기록' 이라 비용이
+            # 0 이다 — 비용 0 으로 되돌릴 수 있는 지표는 지표가 아니다.
+            #
+            # 결정을 **바꾸면**(다른 `--as`) 새 시도이므로 창을 옮긴다. 같은
+            # 결정을 반복하는 것은 새 시도가 아니라 같은 시도다.
+            "recheck_at=CASE WHEN promotion.decision=excluded.decision "
+            "THEN promotion.recheck_at ELSE excluded.recheck_at END, "
+            "after_id=CASE WHEN promotion.decision=excluded.decision "
+            "THEN promotion.after_id ELSE excluded.after_id END",
             (key, kind, as_kind, maturity, note, lid, now(), now(),
              last_event_id(con)))
         record_event(con, lid, sid,
