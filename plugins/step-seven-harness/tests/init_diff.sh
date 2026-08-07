@@ -42,7 +42,9 @@ python3 -c "import ast,sys;ast.parse(open(sys.argv[1],encoding='utf-8').read())"
 
 # 현재 엔진도 같은 방식으로 격리한다 (실제 플러그인 트리를 쓰면 templates 가 다르다)
 mkdir -p "$BASE/new/scripts" "$BASE/new/templates"
-cp "$NEW" "$BASE/new/scripts/harness.py"
+# **엔진은 한 파일이 아니다.** 구현이 `parts/`·`gates/` 로 갈라져 있으므로
+# `harness.py` 만 복사하면 조각을 못 실어 게이트가 통째로 빠진 채 돈다.
+cp -R "$(dirname "$NEW")/." "$BASE/new/scripts/"
 for f in stages.json POLICY.md rationale.md; do
   cp "$REPO/plugins/step-seven-harness/templates/$f" "$BASE/new/templates/$f"
 done

@@ -85,8 +85,7 @@ def register(h):
                 사본에 **진짜 예외 행**을 넣는다 — 소진돼도 남지 않는다."""
                 g = hook("Write", {"file_path": rel}, at)
                 for con, lid in g:
-                    con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
-                                "VALUES(?,?,?,?,?)", (lid, rel, "selftest", 1, h.now()))
+                    h.grant_write(con, lid, rel, "selftest", 1)
                 return self._last
 
             def bh(cmd):

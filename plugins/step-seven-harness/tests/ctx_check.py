@@ -70,6 +70,54 @@ def walk_scopes(table, path=()):
             yield it
 
 
+def cross_names(files, bad):
+    """엔진과 조각이 **합쳐진 이름공간**에서 없는 이름을 쓰는가.
+
+    구현을 `parts/` 로 가르면서 이름을 런타임에 합치게 했다(`parts/__init__.py`).
+    그 대가로 `pyflakes` 가 무력해진다 — 파일 하나만 보면 `record_event` 가
+    정의되지 않은 것으로 보인다. **오타를 잡아 주던 그물이 사라진 것**이므로
+    같은 일을 구조에 맞게 다시 만든다.
+
+    합집합에도 없으면 그것은 진짜 오타다.
+    """
+    import builtins
+    known = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__path__"}
+    trees = {}
+    for f in files:
+        tr = ast.parse(open(f, encoding="utf-8").read())
+        trees[f] = tr
+        for n in ast.walk(tr):
+            if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                known.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    known.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, (ast.Assign, ast.AugAssign, ast.For,
+                                ast.comprehension, ast.With, ast.ExceptHandler)):
+                if isinstance(n, ast.ExceptHandler) and n.name:
+                    known.add(n.name)      # `except X as e` 의 e
+                for t2 in ast.walk(n):
+                    if isinstance(t2, ast.Name) and isinstance(t2.ctx, ast.Store):
+                        known.add(t2.id)
+                    elif isinstance(t2, ast.arg):
+                        known.add(t2.arg)
+            elif isinstance(n, ast.arg):
+                known.add(n.arg)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                known.add(n.id)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                known.add(n.name)          # `except X as e` 의 e
+    n = 0
+    for f, tr in trees.items():
+        for x in ast.walk(tr):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load):
+                n += 1
+                if x.id not in known:
+                    bad.append("%s:%d 이(가) 어디에도 없는 '%s' 를 쓴다"
+                               % (os.path.basename(f), x.lineno, x.id))
+    return n
+
+
 def arity(files, bad):
     """엔진 안의 호출이 **정의된 인자 개수와 맞는가.**
 
@@ -115,8 +163,9 @@ def main():
     for src_path in files:
         checked += scan(src_path, bad)
     ncall = arity(files, bad)
-    print("  파일 %d개 · 함수 스코프 %d개 검사 (symtable) · 호출 %d개 인자 대조"
-          % (len(files), checked, ncall))
+    nname = cross_names(files, bad)
+    print("  파일 %d개 · 스코프 %d개 · 호출 %d개 인자 · 이름 %d개 대조"
+          % (len(files), checked, ncall, nname))
     if ncall < 200:
         print("  대조한 호출이 너무 적다 (%d) — 추출이 깨졌다" % ncall)
         return 1

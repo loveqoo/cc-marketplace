@@ -23,6 +23,19 @@ import harness as h  # noqa: E402
 FAILS = []
 
 
+def engine_src():
+    """엔진 **전부**의 소스. 구현이 `parts/` 로 갈라졌으므로 `harness.py` 하나만
+    훑으면 옮겨간 코드를 못 본다 — 검사가 조용히 눈이 먼다."""
+    import glob as _g
+    out = [inspect.getsource(h)]
+    base = os.path.join(REPO, "plugins/step-seven-harness/scripts")
+    for f in sorted(_g.glob(os.path.join(base, "**", "*.py"), recursive=True)):
+        if os.path.abspath(f) != os.path.abspath(h.__file__):
+            out.append(open(f, encoding="utf-8").read())
+    return "\n".join(out)
+
+
+
 def ck(label, cond, detail=""):
     print("  %-52s %s%s" % (label, "ok" if cond else "FAIL",
                             "" if cond else "  " + str(detail)))
@@ -39,6 +52,7 @@ def fixture():
     subprocess.run([sys.executable,
                     os.path.join(REPO, "plugins/step-seven-harness/scripts/harness.py"),
                     "init"], cwd=root, capture_output=True, check=True)
+    # 엔진 사본은 `.py` 를 전부 옮긴다 — `parts/`·`gates/` 포함. 한 파일이 아니다.
     return root, shutil.rmtree
 
 
@@ -522,7 +536,7 @@ ck("손상 판정에 quick_check 를 쓴다",
    "quick_check" in inspect.getsource(h.quarantine_db))
 
 _bare = []
-for _fn in [n for n in ast.walk(ast.parse(inspect.getsource(h)))
+for _fn in [n for n in ast.walk(ast.parse(engine_src()))
             if isinstance(n, ast.FunctionDef)]:
     for _n in ast.walk(_fn):
         if (isinstance(_n, ast.ExceptHandler) and _n.type is not None
@@ -543,7 +557,7 @@ print("== 반복된 질의는 한 곳에서만 쓴다")
 import collections  # noqa: E402
 import re as _re  # noqa: E402
 _shapes = collections.Counter()
-for _n in ast.walk(ast.parse(inspect.getsource(h))):
+for _n in ast.walk(ast.parse(engine_src())):
     if not (isinstance(_n, ast.Constant) and isinstance(_n.value, str)):
         continue
     _y = _re.sub(r"\s+", " ", _n.value).strip()
@@ -685,7 +699,7 @@ ck("원문에만 보이면 ask",
    h.floor_verdict(cfg, root, 'cp evil "$(pwd)/.claude/harness/bin/harness"')[0] == "ask")
 ck("아무것도 아니면 판정 없음",
    h.floor_verdict(cfg, root, "git add -A")[0] is None)
-_src = inspect.getsource(h)
+_src = engine_src()
 _calls = (_src.count("floor_verdict(cfg, root, cmd)")
           - _src.count("def floor_verdict(cfg, root, cmd)"))
 ck("훅은 바닥값을 한 곳에서만 묻는다", _calls == 1, _calls)

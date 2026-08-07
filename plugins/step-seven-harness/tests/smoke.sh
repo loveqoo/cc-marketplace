@@ -1549,7 +1549,7 @@ echo "== Ctx 언팩 누락 (AST 전수)"
 CRC2=0; COUT="$(python3 "$(dirname "$0")/ctx_check.py" "$MC" 2>&1)" || CRC2=$?
 check "ctx 를 풀지 않고 쓰는 함수가 없다" '^0$' "$CRC2"
 # `[0-9]*` 는 `함수 0개` 에도 맞았다 — 0개를 훑고도 '훑었다'가 통과했다.
-check "검사가 실제로 함수를 훑었다" '함수 스코프 [1-9][0-9]* *개' "$COUT"
+check "검사가 실제로 함수를 훑었다" '스코프 [1-9][0-9]* *개' "$COUT"
 
 echo "== 계획 승인 다이얼로그가 계획을 보여준다"
 # auto-mode(acceptEdits)에서도 계획 승인은 물어야 한다 — "편집 자동 수락" 이지
@@ -3175,7 +3175,7 @@ s = open(p, encoding='utf-8').read()
 s = s.replace('def cli_status(ctx, argv):',
               'def cli_status(ctx, argv):\n    print(\'ENGINE=%s\' % v), ' .replace('%s', v).replace(' % v', '') + 'None', 1)
 open(p, 'w', encoding='utf-8').write(s)
-" "$SW2/fake/$V/scripts/harness.py" "$V"
+" "$SW2/fake/$V/scripts/parts/cli.py" "$V"
 done
 (cd "$SW2/w" && git init -q . && python3 "$SW2/fake/old/scripts/harness.py" init >/dev/null)
 check "래퍼가 자기를 쓴 엔진을 고정한다" 'fake/old'   "$(grep -oE 'P="[^"]*harness\.py"' "$SW2/w/.claude/harness/bin/harness" | head -1)"

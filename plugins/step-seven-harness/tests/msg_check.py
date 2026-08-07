@@ -144,9 +144,31 @@ for n in ast.walk(tree):
 # 생기면 이 검사는 놓친다. 사용 지점마다 보려고 했더니 `for k, _ in TREND_KEYS`
 # (키만 읽는 정상 코드)까지 지적하는 오탐이 났고, 오탐이 나는 검사는 아무도 보지
 # 않는다. 정확한 보장은 위의 리터럴 전수 검사이고 이건 보조 검사다.
+# **엔진 파일 전부를 본다.** 구현이 `parts/` 로 갈라지면서 상수는 엔진에, 감싸는
+# 자리는 조각에 있게 됐다 — 한 파일만 보면 "감싸는 자리가 없다" 는 거짓 지적이 난다.
+_all = [(tree, parent)]
+for _f in _msgs.engine_files(os.path.dirname(ENGINE)):
+    if os.path.abspath(_f) != os.path.abspath(ENGINE):
+        _s, _t, _p, _d = _msgs.parse(_f)
+        _all.append((_t, _p))
+
+
+def _wrapped_somewhere(name):
+    global parent
+    for _tr, _par in _all:
+        parent = _par                  # `in_t_call` 이 보는 부모 맵을 갈아 끼운다
+        for n in ast.walk(_tr):
+            if (isinstance(n, ast.Name) and n.id == name
+                    and isinstance(n.ctx, ast.Load)
+                    and (in_t_call(n) or iterated_with_t(n))):
+                parent = _all[0][1]
+                return True
+    parent = _all[0][1]
+    return False
+
+
 for name in sorted(lazy_used - SCALAR_TEXT):
-    if not any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
-               and (in_t_call(n) or iterated_with_t(n)) for n in ast.walk(tree)):
+    if not _wrapped_somewhere(name):
         bad.append("%s 는 LAZY_MSG_NAMES 에 있으나 t() 로 감싸는 자리가 없다 "
                    "— 번역이 조용히 빠진다" % name)
 
