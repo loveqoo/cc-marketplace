@@ -27,25 +27,30 @@ REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
                        else os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "..", "..", ".."))
 PLUGIN = os.path.join(REPO, "plugins/step-seven-harness")
-ENGINE = os.path.join(PLUGIN, "scripts/harness.py")
+SCRIPTS = os.path.join(PLUGIN, "scripts")
+ENGINE = os.path.join(SCRIPTS, "harness.py")
 STAGES = os.path.join(PLUGIN, "templates/stages.json")
 CATALOG = os.path.join(PLUGIN, "templates/messages.ko.json")
 
 src, tree, parent, _docs = _msgs.parse(ENGINE)
 LAZY = _msgs.lazy_names(src)
-found = _msgs.engine_strings(ENGINE)
+# 목록을 손으로 적지 않는다 — 새 파일이 기본 '미검사' 가 되면 안 된다.
+FILES = _msgs.engine_files(SCRIPTS)
+found = _msgs.engine_strings(SCRIPTS)
 bad = []
 
-missing = [(ln, s) for s, ln, ok, name in found
+# 파일이 여럿이면 줄번호만으로는 어디인지 모른다. 파일명을 함께 낸다.
+missing = [(f, ln, s) for s, ln, ok, name, f in found
            if not ok and not (name and name in LAZY)]
-lazy_used = {name for s, ln, ok, name in found
+lazy_used = {name for s, ln, ok, name, _f in found
              if not ok and name and name in LAZY}
 
-print("  엔진 출력 문자열 %d개 (고유 %d개)" % (len(found), len({s for s, _, _, _ in found})))
+print("  엔진 파일 %d개 · 출력 문자열 %d개 (고유 %d개)"
+      % (len(FILES), len(found), len({s for s, _, _, _, _ in found})))
 print("  t() 로 감싸지 않은 것 %d개" % len(missing))
-for ln, txt in missing[:12]:
-    bad.append("harness.py:%d 이(가) t() 밖에 있다 — %s"
-               % (ln, txt[:70].replace("\n", " ")))
+for f, ln, txt in missing[:12]:
+    bad.append("%s:%d 이(가) t() 밖에 있다 — %s"
+               % (f, ln, txt[:70].replace("\n", " ")))
 if len(missing) > 12:
     bad.append("... 그리고 %d개 더" % (len(missing) - 12))
 
@@ -104,7 +109,7 @@ def iterated_with_t(node):
     return False
 
 
-LAZY_WITH_TEXT = {name for _s, _ln, _ok, name in found if name and name in LAZY}
+LAZY_WITH_TEXT = {name for _s, _ln, _ok, name, _f in found if name and name in LAZY}
 
 # **스칼라와 컨테이너를 가른다.** 이 구분이 없으면 검사가 오탐을 낸다.
 #   스칼라(`USAGE = """..."""`)  — 값 자체가 문장이다. raw 사용은 곧 누출이다.
@@ -146,7 +151,7 @@ for name in sorted(lazy_used - SCALAR_TEXT):
         bad.append("%s 는 LAZY_MSG_NAMES 에 있으나 t() 로 감싸는 자리가 없다 "
                    "— 번역이 조용히 빠진다" % name)
 
-want = {s for s, _, _, _ in found} | set(_msgs.config_strings(STAGES))
+want = {s for s, _, _, _, _ in found} | set(_msgs.config_strings(STAGES))
 if os.path.isfile(CATALOG):
     cat = json.load(open(CATALOG, encoding="utf-8"))
     have = set(cat)

@@ -25,7 +25,7 @@ PLUGIN = os.path.join(REPO, "plugins/step-seven-harness")
 OUT = os.path.join(PLUGIN, "templates/messages.ko.json")
 
 keys = sorted(
-    {s for s, _, _, _ in _msgs.engine_strings(os.path.join(PLUGIN, "scripts/harness.py"))}
+    {s for s, _, _, _, _ in _msgs.engine_strings(os.path.join(PLUGIN, "scripts"))}
     | set(_msgs.config_strings(os.path.join(PLUGIN, "templates/stages.json"))))
 with io.open(OUT, "w", encoding="utf-8") as fh:
     json.dump({k: k for k in keys}, fh, ensure_ascii=False, indent=2, sort_keys=True)

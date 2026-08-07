@@ -3196,6 +3196,54 @@ def _write_if_changed(path, body, mode=None):
         return None
 
 
+def engine_sources(scripts_dir):
+    """엔진을 이루는 파이썬 파일 전부 (scripts_dir 기준 상대경로).
+
+    목록을 손으로 적지 않는다 — 구현이 파일로 갈라질 때 새 파일이 사본에서 빠지면
+    그 게이트가 조용히 사라진다.
+    """
+    out = []
+    for dirpath, _dirs, names in os.walk(scripts_dir):
+        for n in sorted(names):
+            if n.endswith(".py"):
+                out.append(os.path.relpath(os.path.join(dirpath, n), scripts_dir))
+    return sorted(out)
+
+
+def _copy_engine(src_dir, dst_dir):
+    """엔진 파일 전부를 사본으로. **부분 복사를 남기지 않는다.**
+
+    한 파일이라도 못 쓰면 **사본의 파이썬 파일을 전부 지운다.** 반쯤 복사되거나
+    낡은 사본은 실행되면 게이트가 빠진 채로 돌고, 그게 곧 게이트 해제다. 없는 편이
+    낫다 — 래퍼는 원본(플러그인)으로 떨어지고, 그것이 옳은 엔진이다.
+    """
+    changed = False
+    for rel in engine_sources(src_dir):
+        try:
+            with open(os.path.join(src_dir, rel), encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError:
+            body = None
+        r = (_write_if_changed(os.path.join(dst_dir, rel), body, 0o644)
+             if body is not None else None)
+        if r is None:                      # 못 읽었거나 못 썼다
+            _purge_engine_copy(dst_dir)
+            return None
+        changed = changed or bool(r)
+    return changed
+
+
+def _purge_engine_copy(dst_dir):
+    """사본의 파이썬 파일을 전부 없앤다. 낡은 엔진이 도는 것보다 없는 것이 낫다."""
+    for dirpath, _dirs, names in os.walk(dst_dir):
+        for n in names:
+            if n.endswith(".py"):
+                try:
+                    os.remove(os.path.join(dirpath, n))
+                except OSError:
+                    pass
+
+
 def refresh_engine(root):
     """엔진 사본을 프로젝트 안에 둔다.
 
@@ -3206,12 +3254,7 @@ def refresh_engine(root):
     dst = os.path.join(root, ENGINE_REL)
     if src == os.path.abspath(dst):
         return False  # 사본 자신이 실행 중이면 덮어쓰지 않는다
-    try:
-        with open(src, encoding="utf-8") as fh:
-            body = fh.read()
-    except Exception:
-        return False
-    changed = _write_if_changed(dst, body, 0o644)
+    changed = _copy_engine(os.path.dirname(src), os.path.dirname(dst))
     # **기본값도 사본과 함께 가야 한다.** 사본이 실행될 때 plugin_root() 는
     # `.claude/harness/` 를 가리키고 거기엔 templates/ 가 없다. 그래서 어휘 기본값을
     # 못 찾고, 훅(플러그인 엔진)과 CLI(사본)의 판정이 갈렸다 — 래퍼로 advance 하면

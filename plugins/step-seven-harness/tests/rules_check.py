@@ -286,6 +286,33 @@ ck("대상이 분명하면 바닥값이 막는다",
 ck("정상 명령은 바닥값에 걸리지 않는다",
    h.bash_protected_hit(cfg, root, "find . -name '*.pyc' -delete") is None)
 
+print("엔진 사본은 전부-아니면-없음 (파일 분리를 견디는 조건)")
+# 구현이 파일로 갈라지면 사본이 **반쯤** 복사될 수 있다. 반쯤 복사된 엔진은 실행되면
+# 게이트가 빠진 채로 돌고, 그게 곧 게이트 해제다. 없는 편이 낫다 — 래퍼는 원본으로
+# 떨어지고 그것이 옳은 엔진이다.
+_sd = os.path.join(REPO, "plugins/step-seven-harness/scripts")
+_bd = os.path.join(root, ".claude", "harness", "bin")
+ck("사본이 엔진 파일 전부를 담는다",
+   set(h.engine_sources(_sd)) <= {f for f in os.listdir(_bd) if f.endswith(".py")})
+ck("목록을 손으로 적지 않는다 (발견한다)", len(h.engine_sources(_sd)) >= 1)
+# 한 파일을 못 쓰게 만들면 사본의 .py 가 전부 사라져야 한다
+_probe = os.path.join(_bd, "_atomic_probe.py")
+open(_probe, "w").close()
+os.chmod(_probe, 0o400)
+try:
+    _left_before = [f for f in os.listdir(_bd) if f.endswith(".py")]
+    ck("전제: 사본에 .py 가 있다", len(_left_before) >= 1)
+    h._purge_engine_copy(_bd)
+    ck("실패하면 사본의 .py 를 전부 없앤다",
+       [f for f in os.listdir(_bd) if f.endswith(".py")] == [])
+finally:
+    if os.path.exists(_probe):
+        os.chmod(_probe, 0o644)
+        os.remove(_probe)
+    h.refresh_engine(root)
+ck("복구하면 사본이 다시 온전하다",
+   set(h.engine_sources(_sd)) <= {f for f in os.listdir(_bd) if f.endswith(".py")})
+
 print("게이트는 빠지면 소리를 낸다 (파일 분리를 견디는 조건)")
 # 구현이 파일로 갈라지면 파일 하나가 안 실려도 조용히 사라질 수 있다. 그때
 # `강제 중:` 줄에서 그 게이트만 빠지고 아무도 모른다 — 그것이 곧 게이트 해제다.

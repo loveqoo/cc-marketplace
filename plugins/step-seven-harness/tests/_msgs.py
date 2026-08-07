@@ -5,10 +5,26 @@
 계산하면 어긋나고, 어긋난 것을 아무도 모른다 — 이 저장소에서 반복해 겪은 부류다.
 """
 import ast
+import glob
 import json
+import os
 import re
 
 KO = re.compile(r"[가-힣]")
+
+
+def engine_files(scripts_dir):
+    """엔진을 이루는 파이썬 파일 **전부**. 목록을 손으로 적지 않는다.
+
+    엔진이 파일 하나였을 때는 `harness.py` 를 상수로 박아 뒀다. 구현이 파일로
+    갈라지는 순간 그 상수는 **새 파일을 기본 '미검사'로 만든다** — 이 저장소에서
+    `doc_check` 의 `DOCS` 목록이 정확히 그 상태였다(3회차). 발견하게 한다.
+    """
+    found = sorted(glob.glob(os.path.join(scripts_dir, "**", "*.py"),
+                             recursive=True))
+    if not found:
+        raise SystemExit("엔진 파일을 하나도 찾지 못했다: %s" % scripts_dir)
+    return found
 
 # 사람에게 나가지 않는 문자열. 번역 대상이 아니다.
 #   SCHEMA        SQL. 주석에 한글이 있지만 출력되지 않는다.
@@ -69,7 +85,15 @@ def wrapped(node, parent):
 
 
 def engine_strings(engine_path):
-    """엔진의 출력 문자열 전부. (문자열, 줄번호, 감싸졌나, 대입된 상수명)."""
+    """엔진의 출력 문자열 전부. (문자열, 줄번호, 감싸졌나, 대입된 상수명, 파일).
+
+    `engine_path` 가 디렉터리면 그 아래 `*.py` 를 전부 훑는다.
+    """
+    if os.path.isdir(engine_path):
+        out = []
+        for f in engine_files(engine_path):
+            out += engine_strings(f)
+        return out
     src, tree, parent, docs = parse(engine_path)
     out = []
     for n in ast.walk(tree):
@@ -79,7 +103,8 @@ def engine_strings(engine_path):
         name = assigned_name(n, parent)
         if name in EXEMPT_ASSIGN:
             continue
-        out.append((n.value, n.lineno, wrapped(n, parent), name))
+        out.append((n.value, n.lineno, wrapped(n, parent), name,
+                    os.path.basename(engine_path)))
     return out
 
 

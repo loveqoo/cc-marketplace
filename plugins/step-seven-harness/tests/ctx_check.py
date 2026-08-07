@@ -49,7 +49,16 @@ BUNDLE = {"con", "cfg", "root", "lid", "sid"}
 REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
                        else os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "..", "..", ".."))
-SRC = os.path.join(REPO, "plugins/step-seven-harness/scripts/harness.py")
+SCRIPTS = os.path.join(REPO, "plugins/step-seven-harness/scripts")
+
+
+def sources():
+    """엔진을 이루는 파일 **전부**. 목록을 손으로 적으면 새 파일이 기본 '미검사' 다."""
+    import glob
+    found = sorted(glob.glob(os.path.join(SCRIPTS, "**", "*.py"), recursive=True))
+    if not found:
+        raise SystemExit("엔진 파일을 찾지 못했다: %s" % SCRIPTS)
+    return found
 
 
 def walk_scopes(table, path=()):
@@ -61,11 +70,29 @@ def walk_scopes(table, path=()):
 
 
 def main():
-    src = open(SRC, encoding="utf-8").read()
-    top = symtable.symtable(src, os.path.basename(SRC), "exec")
-    module_names = {s.get_name() for s in top.get_symbols()}
-
     checked, bad = 0, []
+    files = sources()
+    for src_path in files:
+        checked += scan(src_path, bad)
+    print("  파일 %d개 · 함수 스코프 %d개 검사 (symtable)" % (len(files), checked))
+    # 숫자를 **출력만** 하고 단정하지 않았다. 추출이 죽어도 "누락 없음" 이었다.
+    if checked < 250:
+        print("  훑은 스코프가 너무 적다 (%d) — 추출이 깨졌다" % checked)
+        return 1
+    if bad:
+        print("  언팩 누락 %d건" % len(bad))
+        for b in sorted(set(bad)):
+            print("    " + b)
+        return 1
+    print("  언팩 누락 없음")
+    return 0
+
+
+def scan(src_path, bad):
+    src = open(src_path, encoding="utf-8").read()
+    top = symtable.symtable(src, os.path.basename(src_path), "exec")
+    module_names = {s.get_name() for s in top.get_symbols()}
+    checked = 0
     for path, sc in walk_scopes(top):
         if sc.get_type() != "function":
             continue
@@ -83,22 +110,10 @@ def main():
             # 모듈 전역에 그 이름이 있으면 정상 (엔진에는 없지만 규칙은 지킨다).
             if name in module_names and not sym.is_local():
                 continue
-            bad.append("%s:%d 이(가) '%s' 를 풀지 않고 쓴다"
-                       % (".".join(path), sc.get_lineno(), name))
-
-    print("  함수 스코프 %d개 검사 (symtable)" % checked)
-    # 숫자를 **출력만** 하고 단정하지 않았다. `walk_scopes` 가 아무것도 안 내놔도
-    # "언팩 누락 없음" 으로 초록이었다 — 검사기가 죽은 것과 통과가 구분되지 않는다.
-    if checked < 250:
-        print("  훑은 스코프가 너무 적다 (%d) — 추출이 깨졌다" % checked)
-        return 1
-    if bad:
-        print("  언팩 누락 %d건" % len(bad))
-        for b in sorted(set(bad)):
-            print("    " + b)
-        return 1
-    print("  언팩 누락 없음")
-    return 0
+            bad.append("%s의 %s:%d 이(가) '%s' 를 풀지 않고 쓴다"
+                       % (os.path.basename(src_path), ".".join(path),
+                          sc.get_lineno(), name))
+    return checked
 
 
 sys.exit(main())
