@@ -18,6 +18,7 @@
 """
 
 import calendar
+import abc
 import fnmatch
 import glob as globlib
 import hashlib
@@ -603,60 +604,6 @@ def config_problems(cfg):
     # 게이트는 **자기 설정을 스스로 진단한다.** 여기서 게이트마다 적으면 게이트를
     # 더할 때 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
     out = gate_problems(cfg)
-    # 쓰기 규칙. 여기 오타는 특히 조용하다 — 규칙이 아무것도 막지 않거나,
-    # 반대로 아무 경로에도 해당하지 않아 통째로 죽는다. 둘 다 티가 안 난다.
-    fr = cfg.obj("folder_rules")
-    seen_ids = set()
-    for i, r in enumerate(cfg.get("write_rules") or []):
-        at = "write_rules[%d]" % i
-        if not isinstance(r, dict):
-            out.append(t("%s 가 객체가 아니다 — 이 규칙은 무시된다") % at)
-            continue
-        rid = r.get("id")
-        if not rid:
-            out.append(t("%s 에 id 가 없다 — 차단 기록이 '?' 로 남아 승격에 쓸 수 없다") % at)
-        elif rid in seen_ids:
-            out.append(t("%s 의 id '%s' 가 중복이다 — 통계가 두 규칙을 한 덩어리로 센다")
-                       % (at, rid))
-        else:
-            seen_ids.add(rid)
-        at = "write_rules[%s]" % (rid or i)
-        if not r.get("deny"):
-            out.append(t("%s 에 deny 메시지가 없다 — 막으면서 무엇을 하라는 말이 없다") % at)
-        when, req = r.get("when") or {}, r.get("require") or {}
-        for k in when:
-            if k not in WRITE_SELECTORS:
-                out.append(t("%s.when 의 '%s' 는 모르는 선택자다 (%s 중 하나) "
-                           "— 이 조건은 무시된다") % (at, k, "/".join(WRITE_SELECTORS)))
-        tests = [k for k in req if k in WRITE_TESTS]
-        unknown = [k for k in req if k not in WRITE_TESTS]
-        for k in unknown:
-            out.append(t("%s.require 의 '%s' 는 모르는 판정이다 (%s 중 하나)")
-                       % (at, k, "/".join(WRITE_TESTS)))
-        if not tests:
-            out.append(t("%s 에 판정이 없다 — 이 규칙은 아무것도 막지 않는다") % at)
-        elif len(tests) > 1:
-            out.append(t("%s 에 판정이 %d개다 (%s) — 하나만 쓴다. 첫 것만 적용된다")
-                       % (at, len(tests), ", ".join(sorted(tests))))
-        pname = req.get("predicate")
-        if pname and pname not in WRITE_PREDICATES:
-            out.append(t("%s.require.predicate '%s' 라는 파이썬 술어가 없다 "
-                       "— 이 규칙은 아무것도 막지 않는다") % (at, pname))
-        # folder_rules 의 어느 목록을 가리키는 자리들. 없는 이름을 가리키면 조용히 죽는다.
-        for field, holder in (("subdir_in", when), ("basename_not_in", when),
-                              ("subdir_in", req), ("not_matching", req),
-                              ("stage_in", req)):
-            name = holder.get(field)
-            if isinstance(name, str) and name not in fr:
-                out.append(t("%s 의 %s='%s' 가 folder_rules 에 없다 — %s")
-                           % (at, field, name,
-                              t("이 규칙이 어떤 경로에도 해당하지 않는다")
-                              if holder is when else t("아무것도 막지 못한다")))
-        name = req.get("basename_matches")
-        if isinstance(name, str) and cfg.at(name) is None:
-            out.append(t("%s.require.basename_matches='%s' 가 설정에 없다 "
-                       "— 아무것도 막지 못한다") % (at, name))
-
     # recall 대상 폴더. 여기 오타가 나면 그 폴더의 기록은 **영원히 안 나온다** —
     # 파일은 있고 키워드도 맞는데 조회에 안 걸린다. 조용한 결함으로 실제로 있었다.
     dev_dirs = set(cfg.seq("folder_rules.dev_subdirs"))
@@ -3084,6 +3031,14 @@ def run_hook():
             return inactive(t("상태 DB(%s)를 읽을 수 없다") % DB_REL,
                             t("`%s` (기록은 .dev/ 의 파일에 남아 있다)")
                             % init_hint(root))
+        gone = missing_gates()
+        if gone:
+            # 게이트 구현이 안 실렸다. 그 게이트가 막던 것이 **전부** 통과한다 —
+            # 파일이 빠졌든 import 가 터졌든, 결과는 게이트 해제와 같다.
+            return inactive(t("게이트 %s 가 실리지 않았다 — 그 게이트가 막던 것이 "
+                              "지금 아무것도 막지 않는다") % ", ".join(gone),
+                            t("플러그인 설치가 온전한지 확인하라 (`scripts/` 아래 "
+                              "파일이 빠졌을 수 있다)"))
         cfg = load_config(root, plugin_root())
         load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
         # 손상된 문서를 템플릿으로 갈아치우지는 않는다 — 덜어낸 규칙이 되살아난다.
@@ -3484,52 +3439,70 @@ MUST_VERIFY = ("npm test", "pnpm -r test", "yarn workspace app test", "bun test"
 # 요약·자기검사·설정 진단이 전부 `GATES` 를 순회하므로 **빠뜨릴 자리가 없다.**
 
 
-class Gate(object):
+class Gate(abc.ABC):
     """게이트 하나. 네 책임을 **한 곳에서** 소유한다.
 
-    구현이 채우는 것:
-      key      설정에서 이 게이트를 끄는 손잡이들 (진단이 전수로 본다)
-      state    (지금 켜진 수, 전체) — `강제 중:` 줄이 순회한다
-      probes   [(설명, 판정거리, 막혀야 하나)] — 자기검사가 순회한다
-      problems [문장] — 설정 진단이 순회한다
+    `abc` 를 쓰는 이유: 넷 중 하나를 빠뜨리면 **등록 시점에** 터진다. 파이썬에는
+    컴파일러가 없지만 추상 클래스가 그 자리를 일부 대신한다 — 나머지(탐침이 실제로
+    구분력이 있는가)는 `gate_probes` 가 실행으로 본다.
     """
 
     knobs = ()          # 이 게이트를 끄는 설정 경로들
 
     @property
+    @abc.abstractmethod
+    def key(self):
+        """번역되지 않는 안정된 식별자. **레지스트리가 이것으로 소실을 감지한다** —
+        사람이 보는 이름은 언어에 따라 바뀌므로 그것으로는 셀 수 없다."""
+
+    @property
+    @abc.abstractmethod
     def name(self):
         """사람이 보는 이름. **읽을 때** 번역한다 — 클래스 정의 시점에는 아직
         프로젝트의 `language` 를 모른다."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def state(self, cfg):
         """(켜진 수, 전체). 둘이 다르면 사용자가 그 차이를 본다."""
-        raise NotImplementedError
 
+    @abc.abstractmethod
     def probes(self, ctx):
         """[(설명, 호출, 막혀야 하나)]. `호출` 은 인자 없이 불러 (막혔나, 설명) 을 준다."""
-        raise NotImplementedError
 
     def problems(self, cfg):
         return []
 
 
+# **여기 있어야 하는 게이트.** 구현이 파일로 갈라지면 파일 하나가 안 실려도 조용히
+# 사라질 수 있다 — 그때 `강제 중:` 줄에서 그 게이트만 빠지고 아무도 모른다.
+# 그래서 레지스트리가 아니라 **엔진이** 목록을 선언하고, 없으면 소리를 낸다.
+REQUIRED_GATES = ("write", "consent", "criteria", "stop", "promotion")
 GATES = []
 
 
 def gate(cls):
-    """게이트를 등록한다. 데코레이터 하나가 요약·자기검사·진단 전부에 꽂는다."""
+    """게이트를 등록한다. 데코레이터 하나가 요약·자기검사·진단 전부에 꽂는다.
+
+    추상 메서드가 하나라도 비어 있으면 여기서 `TypeError` 가 난다 — 등록 시점이다.
+    """
     GATES.append(cls())
     return cls
 
 
+def missing_gates():
+    """실려야 하는데 없는 게이트. 비어 있으면 정상."""
+    return [k for k in REQUIRED_GATES if k not in {g.key for g in GATES}]
+
+
 def gate_probes(ctx):
-    """모든 게이트의 탐침을 돌린다. **자기를 증명하지 못하는 게이트도 결과다.**
+    """모든 게이트의 탐침을 돌린다. 실리지 않은 게이트가 있으면 그것이 첫 결과다. **자기를 증명하지 못하는 게이트도 결과다.**
 
     막는 탐침과 통과하는 탐침을 둘 다 갖지 못한 게이트는 구분력이 없다 — 설정으로
     꺼져도, 과잉 차단이 되어도 그 게이트만은 조용하다. 그것을 실패로 낸다.
     """
-    out = []
+    out = [(t("게이트 %s 가 실려 있다") % k, False,
+            t("실리지 않았다 — 그 게이트가 막던 것이 통과한다"))
+           for k in missing_gates()]
     for g in GATES:
         try:
             ps = list(g.probes(ctx))
@@ -3586,6 +3559,8 @@ class ConsentGate(Gate):
     # 있고, 줄였다는 **사실이 요약에 보인다** — 막지는 않는다.
     FLOOR = ("skip", "allow", "approve-plan", "auto-skip", "loop new", "loop adopt")
 
+    key = "consent"
+
     @property
     def name(self):
         return t("승인 필요")
@@ -3636,6 +3611,8 @@ class PromotionGate(Gate):
 
     KINDS = ("block", "tool_fail", "stop_gate", "bypass", "skip")
     knobs = ("promotion.kinds", "promotion.min_loops", "promotion.exclude_rules")
+
+    key = "promotion"
 
     @property
     def name(self):
@@ -3701,6 +3678,8 @@ class WriteGate(Gate):
 
     knobs = ("write_rules", "folder_rules.protected_paths", "bash.mutator_pattern",
              "bash.readers", "bash.interpreters", "path_classes")
+
+    key = "write"
 
     @property
     def name(self):
@@ -3795,6 +3774,67 @@ class WriteGate(Gate):
         return out
 
     def problems(self, cfg):
+        return self._syntax(cfg) + self._empty(cfg)
+
+    def _syntax(self, cfg):
+        """규칙 하나하나의 **문법**. 오타는 특히 조용하다 — 규칙이 아무것도 막지
+        않거나, 반대로 아무 경로에도 해당하지 않아 통째로 죽는다."""
+        out = []
+        fr = cfg.obj("folder_rules")
+        seen_ids = set()
+        for i, r in enumerate(cfg.get("write_rules") or []):
+            at = "write_rules[%d]" % i
+            if not isinstance(r, dict):
+                out.append(t("%s 가 객체가 아니다 — 이 규칙은 무시된다") % at)
+                continue
+            rid = r.get("id")
+            if not rid:
+                out.append(t("%s 에 id 가 없다 — 차단 기록이 '?' 로 남아 승격에 쓸 수 없다") % at)
+            elif rid in seen_ids:
+                out.append(t("%s 의 id '%s' 가 중복이다 — 통계가 두 규칙을 한 덩어리로 센다")
+                           % (at, rid))
+            else:
+                seen_ids.add(rid)
+            at = "write_rules[%s]" % (rid or i)
+            if not r.get("deny"):
+                out.append(t("%s 에 deny 메시지가 없다 — 막으면서 무엇을 하라는 말이 없다") % at)
+            when, req = r.get("when") or {}, r.get("require") or {}
+            for k in when:
+                if k not in WRITE_SELECTORS:
+                    out.append(t("%s.when 의 '%s' 는 모르는 선택자다 (%s 중 하나) "
+                               "— 이 조건은 무시된다") % (at, k, "/".join(WRITE_SELECTORS)))
+            tests = [k for k in req if k in WRITE_TESTS]
+            unknown = [k for k in req if k not in WRITE_TESTS]
+            for k in unknown:
+                out.append(t("%s.require 의 '%s' 는 모르는 판정이다 (%s 중 하나)")
+                           % (at, k, "/".join(WRITE_TESTS)))
+            if not tests:
+                out.append(t("%s 에 판정이 없다 — 이 규칙은 아무것도 막지 않는다") % at)
+            elif len(tests) > 1:
+                out.append(t("%s 에 판정이 %d개다 (%s) — 하나만 쓴다. 첫 것만 적용된다")
+                           % (at, len(tests), ", ".join(sorted(tests))))
+            pname = req.get("predicate")
+            if pname and pname not in WRITE_PREDICATES:
+                out.append(t("%s.require.predicate '%s' 라는 파이썬 술어가 없다 "
+                           "— 이 규칙은 아무것도 막지 않는다") % (at, pname))
+            # folder_rules 의 어느 목록을 가리키는 자리들. 없는 이름을 가리키면 조용히 죽는다.
+            for field, holder in (("subdir_in", when), ("basename_not_in", when),
+                                  ("subdir_in", req), ("not_matching", req),
+                                  ("stage_in", req)):
+                name = holder.get(field)
+                if isinstance(name, str) and name not in fr:
+                    out.append(t("%s 의 %s='%s' 가 folder_rules 에 없다 — %s")
+                               % (at, field, name,
+                                  t("이 규칙이 어떤 경로에도 해당하지 않는다")
+                                  if holder is when else t("아무것도 막지 못한다")))
+            name = req.get("basename_matches")
+            if isinstance(name, str) and cfg.at(name) is None:
+                out.append(t("%s.require.basename_matches='%s' 가 설정에 없다 "
+                           "— 아무것도 막지 못한다") % (at, name))
+        return out
+
+    def _empty(self, cfg):
+        """**있는데 공허한 값.** 빈 목록·아무것도 안 맞는 정규식·모르는 클래스."""
         out = []
         fr = cfg.get("folder_rules")
         if isinstance(fr, dict) and "protected_paths" in fr \
@@ -3852,6 +3892,8 @@ class CriteriaGate(Gate):
     """
 
     knobs = ("criteria", "stages[].exit_criteria")
+
+    key = "criteria"
 
     @property
     def name(self):
@@ -3975,6 +4017,8 @@ class StopGate(Gate):
     """
 
     knobs = ("stages[].stop_requires", "stop_block_limits", "stop_continue.enabled")
+
+    key = "stop"
 
     @property
     def name(self):
@@ -5461,6 +5505,12 @@ def run_cli(argv):
         # traceback 으로 죽으면 게이트가 **영구히** 꺼진다.
         print(t("상태 DB를 열 수 없다 (%s). `%s` 로 복구하라 — 읽을 수 없는 파일은 "
                 "지우지 않고 옆으로 옮긴다.") % (exc, init_hint(root)), file=sys.stderr)
+        return 1
+    gone = missing_gates()
+    if gone:
+        print(t("게이트 %s 가 실리지 않았다 — 그 게이트가 막던 것이 지금 아무것도 "
+                "막지 않는다. 플러그인 설치가 온전한지 확인하라.") % ", ".join(gone),
+              file=sys.stderr)
         return 1
     cfg = load_config(root, plugin_root())
     load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)

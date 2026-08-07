@@ -286,6 +286,31 @@ ck("대상이 분명하면 바닥값이 막는다",
 ck("정상 명령은 바닥값에 걸리지 않는다",
    h.bash_protected_hit(cfg, root, "find . -name '*.pyc' -delete") is None)
 
+print("게이트는 빠지면 소리를 낸다 (파일 분리를 견디는 조건)")
+# 구현이 파일로 갈라지면 파일 하나가 안 실려도 조용히 사라질 수 있다. 그때
+# `강제 중:` 줄에서 그 게이트만 빠지고 아무도 모른다 — 그것이 곧 게이트 해제다.
+ck("필요한 게이트가 전부 실려 있다", h.missing_gates() == [])
+ck("게이트 키는 번역되지 않는다 (언어가 바뀌어도 셀 수 있다)",
+   all(g.key.isascii() for g in h.GATES))
+ck("키가 중복되지 않는다", len({g.key for g in h.GATES}) == len(h.GATES))
+_saved = list(h.GATES)
+try:
+    h.GATES[:] = [g for g in h.GATES if g.key != "stop"]
+    ck("빠지면 목록이 그것을 말한다", h.missing_gates() == ["stop"])
+    ck("자기검사도 그것을 실패로 낸다",
+       any(not ok and "stop" in w for w, ok, _g in h.gate_probes(ctx)))
+finally:
+    h.GATES[:] = _saved
+ck("되돌리면 다시 온전하다", h.missing_gates() == [])
+# 추상 넷 중 하나라도 비면 **등록 시점에** 터진다 — 파이썬의 컴파일 에러 자리.
+try:
+    class _Half(h.Gate):
+        key = "half"
+    _Half()
+    ck("추상 메서드가 비면 등록이 터진다", False, "터지지 않았다")
+except TypeError:
+    ck("추상 메서드가 비면 등록이 터진다", True)
+
 print("측정 창과 회고 창은 다른 질문이다")
 # 재연결(`cycle_adopt`)은 **측정 창만** 새로 연다. 측정 창이 안 열리면 버려진 회차의
 # 마찰이 다음 회차 기록으로 흡수되고, 회고 창까지 열리면 이미 적어 둔 회고가
