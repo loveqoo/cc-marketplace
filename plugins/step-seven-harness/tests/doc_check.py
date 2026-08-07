@@ -64,6 +64,7 @@ def stage_labels():
 
 def main():
     bad = []
+    total_links = total_stages = 0
     real = stage_labels()
     for rel in DOCS:
         path = os.path.join(REPO, rel)
@@ -83,6 +84,7 @@ def main():
 
         for i, line in enumerate(body.splitlines(), 1):
             for m in STAGE_RE.finditer(line):
+                total_stages += 1
                 got, name = "%s/%s" % (m.group(1), m.group(2)), m.group(3)
                 # 이름 비교도 대소문자를 가리지 않는다
                 low = {k.lower(): (k, v) for k, v in real.items()}
@@ -97,6 +99,7 @@ def main():
                     bad.append("%s:%d: 단계 번호가 stages.json 과 다르다 — "
                                "`%s %s` 라고 적혀 있으나 실제는 %s"
                                % (rel, i, got, name, want))
+        total_links += len(LINK_RE.findall(body))
         for target in LINK_RE.findall(body):
             if not os.path.exists(os.path.normpath(os.path.join(base, target))):
                 bad.append("%s: 링크가 가리키는 것이 없다 — %s" % (rel, target))
@@ -119,6 +122,22 @@ def main():
     if off:
         bad.append("hooks.json 의 timeout %s 가 HOOK_TIMEOUT_S(%d) 와 다르다"
                    % (off, eng.HOOK_TIMEOUT_S))
+    # PreToolUse matcher 가 엔진이 판정하는 도구를 덮는가. 756개 검사는 훅 JSON 을
+    # 엔진 stdin 에 직접 먹이므로 matcher 를 지나지 않는다 — 이 한 줄을 지워도
+    # 스위트는 초록이고 실제로는 모든 게이트가 사라진다.
+    pre = [e for grp, entries in hooks["hooks"].items() if grp == "PreToolUse"
+           for e in entries]
+    covered = set()
+    for e in pre:
+        covered |= set((e.get("matcher") or "").split("|"))
+    need = set(eng.WRITE_TOOLS) | {"Bash"}
+    gap = sorted(need - covered)
+    print("  PreToolUse matcher 가 판정 대상을 덮는다        %s"
+          % ("ok" if not gap else "FAIL %s" % gap))
+    if gap:
+        bad.append("hooks.json 의 PreToolUse matcher 에 %s 가 없다 — 그 도구는 훅이 "
+                   "아예 뜨지 않아 게이트가 통째로 사라진다" % ", ".join(gap))
+
     fits = eng.DB_WAIT_S * 2 <= eng.HOOK_TIMEOUT_S
     print("  잠금 대기(%ds)가 훅 예산(%ds) 안에 든다        %s"
           % (eng.DB_WAIT_S, eng.HOOK_TIMEOUT_S, "ok" if fits else "FAIL"))
@@ -126,6 +145,14 @@ def main():
         bad.append("DB_WAIT_S(%d) 가 훅 예산(%d)에 비해 크다 — 잠금 대기 중 "
                    "강제 종료되면 fail-open 경고도 못 낸다"
                    % (eng.DB_WAIT_S, eng.HOOK_TIMEOUT_S))
+
+    # 추출이 죽으면 "문제 없음" 이 된다. `STAGE_RE`·`LINK_RE` 를 아무것도 안 맞는
+    # 정규식으로 바꿔도 초록이었다 — 이 파일의 존재 이유가 통째로 꺼져도 티가 안 났다.
+    if total_links < 5:
+        bad.append("링크를 %d개밖에 못 찾았다 — LINK_RE 가 깨졌다" % total_links)
+    # 개수를 박지 않는다. "추출이 살아 있는가" 만 본다 — 0 이면 정규식이 죽은 것이다.
+    if total_stages < 1:
+        bad.append("단계 표기를 하나도 못 찾았다 — STAGE_RE 가 깨졌다")
 
     if bad:
         print("\n문제 %d건" % len(bad))

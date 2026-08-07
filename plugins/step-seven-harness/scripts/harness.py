@@ -2137,11 +2137,16 @@ def bash_protected_hit(cfg, root, cmd):
         toks = re.findall(r"\S+", seg)
         if not toks:
             continue
-        # 앞의 `VAR=값` 은 명령이 아니라 대입이다. 건너뛰면 그 값에 든 경로를 놓친다
-        # (`X=.claude/harness/bin; rm $X/harness`). 대입은 검사 대상으로 남기고,
-        # 머리는 그 뒤의 진짜 명령으로 잡는다.
-        while len(toks) > 1 and ASSIGN_RE.match(toks[0]):
+        # 앞의 `VAR=값` 은 명령이 아니라 대입이다. **값 안의 경로를 검사하고** 넘긴다.
+        # 예전에는 버리기만 해서 `DB=<보호경로>; rm $DB` 가 그대로 지나갔다 — 주석은
+        # "검사 대상으로 남긴다" 였는데 코드가 달랐다.
+        while toks and ASSIGN_RE.match(toks[0]):
+            hit = protected(toks[0])
+            if hit:
+                return hit
             toks = toks[1:]
+        if not toks:
+            continue
         head = os.path.basename(toks[0].strip("\"'"))
         # 리다이렉트가 있으면 읽기 명령도 쓰기가 된다 (`cat x > 엔진`).
         # `readers` 에 `rm` 을 넣어 잠금을 우회한 것을 확인했으므로, 읽기로 분류된
@@ -3547,14 +3552,6 @@ SELFTEST = (
     # 과잉 수집도 결함이다 — 읽기 명령이 쓰기로 잡히면 마찰이고, 마찰은 게이트를 끈다.
     ("읽기 명령은 쓰기 대상을 만들지 않는다", "bashrule",
      "grep -rn foo .claude/settings.json", False, "selection"),
-    # 동의 게이트. 셸이 어떻게 감싸든 하네스 호출은 하네스 호출이다.
-    ("동의 명령을 알아본다", "consent", "<WRAP> auto-skip on", True, None),
-    ("따옴표로 감싼 호출도 알아본다", "consent",
-     "\"<WRAP>\" skip context --reason x", True, None),
-    ("sh -c 로 감싼 호출도 알아본다", "consent",
-     "sh -c '<WRAP> approve-plan p.md'", True, None),
-    ("중첩 셸 안의 loop new 도 알아본다", "consent",
-     "bash -lc \"<WRAP> loop new --reason r\"", True, None),
     # 동의가 필요 없는 명령까지 묻지는 않는다 — 과잉은 마찰이다.
     ("조회 명령은 동의를 묻지 않는다", "consent", "<WRAP> status", False, None),
     ("접두사 붙인 산출물은 통과", "write", ".dev/plan/<PREFIX>probe.md", False, None),
@@ -3570,7 +3567,10 @@ UNRELATED = ("src/a.py", "README.md", ".claude/settings.json", "Makefile")
 # 탐침이 실제로 뚫린 자리를 담고 있어야 자기검사가 거짓말을 하지 않는다.
 NOT_VERIFICATION = ("ls", "echo hi", "true", "cat README.md", "git status", "pwd",
                     'echo "npm test"', 'git commit -m "ran npm test"',
-                    "cat tsc.log", "grep -rn pytest src/", "ls | grep vitest")
+                    "cat tsc.log", "grep -rn pytest src/", "ls | grep vitest",
+                    # **무해한 머리 + 진짜 테스트 이름.** 이 모양이 없어서 머리 앵커링을
+                    # 없애는 뮤테이션이 조용히 통과했다 — 탐침이 막는 것을 증명해야 한다.
+                    "true npm test", "sleep 0 pytest", "# npm test", "false npm test")
 # 이 도구를 썼다는 사실만으로 검증이 됐다고 볼 수 없다. 읽기·탐색은 검증이 아니다.
 # MCP 이름도 넣는다 — 브라우저 목록 조회가 검증으로 세어졌는데 탐침이 그 자리를 못 봤다.
 INNOCUOUS_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "TodoWrite",
@@ -3656,6 +3656,29 @@ def selftest_criteria(cfg):
     return out
 
 
+# 동의 게이트를 감싸는 껍데기들. 셸이 어떻게 감싸든 하네스 호출은 하네스 호출이다.
+CONSENT_WRAPS = ("%s", '"%s"', "sh -c '%s'", 'bash -lc "%s"')
+CONSENT_ARGS = {"skip": "context --reason x", "allow": "docs/** --reason x",
+                "approve-plan": "p.md", "auto-skip": "on --reason x",
+                "loop new": "--reason x", "loop adopt": "abcdef --reason x"}
+
+
+def consent_probes():
+    """`CONSENT_FLOOR` 의 **모든** 종류 × 감싸는 방식 몇 가지. 표에서 생성한다.
+
+    손으로 넷을 적어 두었더니 그 넷을 지워도 스위트가 초록이었다. 탐침 수를 탐침
+    표에서 세는 검사는 자기 자신을 재는 것이므로 공허하다 — 게이트 목록이 늘면
+    탐침도 함께 는다.
+    """
+    out = []
+    for i, sub_name in enumerate(CONSENT_FLOOR):
+        call = "%s %s" % ("<WRAP>", "%s %s" % (sub_name, CONSENT_ARGS.get(sub_name, "")))
+        out.append(("동의 게이트: %s (%s)" % (sub_name, ("그대로", "따옴표", "sh -c",
+                                                     "중첩 셸")[i % 4]),
+                    "consent", CONSENT_WRAPS[i % 4] % call.strip(), True, None))
+    return out
+
+
 def selftest(ctx):
     """대표 조작을 **실제 판정 함수**에 넣고 기대와 대조한다.
 
@@ -3665,7 +3688,8 @@ def selftest(ctx):
     pre = file_prefix(con, lid)
     out = []
     ids = stage_ids(cfg)
-    for raw_label, kind, target, want_block, at_stage in SELFTEST:
+    for raw_label, kind, target, want_block, at_stage in (
+            tuple(SELFTEST) + tuple(consent_probes())):
         label = t(raw_label)
         tgt = target.replace("<PREFIX>", pre).replace("<WRAP>", WRAPPER_CMD)
         # 단계가 지정됐고 그 단계가 존재하면 그 단계로 판정한다. 없으면 현재 단계.

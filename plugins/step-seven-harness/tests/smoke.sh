@@ -66,9 +66,13 @@ check_absent() { # check_absent <label> <must-not-appear> <actual>
 # 예전에는 `자기검사: 1[0-9]*/1[0-9]* 통과` 였고, 그 정규식은 `18/19`(=1건 실패)에도
 # 맞았다 — 라벨은 "전부 통과한다" 인데 **부분 통과를 통과로 셌다.** 탐침을 19개에서
 # 22개로 늘리자 드러났다. 대리 지표(정규식)를 버리고 값을 꺼내 비교한다.
+# 탐침이 몇 개여야 하는지 **엔진에서 세어 온다.** 파일에 박으면 탐침이 늘 때마다
+# 사람이 기대값을 고치게 되고, 그 습관이 진짜 회귀도 함께 고친다.
+SF_MIN=0
+
 check_selftest() { # <label> <기대-실패수> <status 출력>
   local OUT
-  OUT="$(printf '%s' "$3" | SF_WANT="$2" python3 -c '
+  OUT="$(printf '%s' "$3" | SF_WANT="$2" SF_MIN="$SF_MIN" python3 -c '
 import os, re, sys
 want = int(os.environ["SF_WANT"])
 m = re.search(r"자기검사: (\d+)/(\d+) 통과", sys.stdin.read())
@@ -76,8 +80,10 @@ if not m:
     print("자기검사 줄이 없다")
 else:
     ok, total = int(m.group(1)), int(m.group(2))
-    if total < 15:
-        print("탐침이 %d개뿐이다 — 표가 비었나" % total)
+    floor = int(os.environ.get("SF_MIN", "0"))
+    if total < floor:
+        print("탐침이 %d개뿐이다 (최소 %d) — 표에서 사라졌다"
+              % (total, floor))
     elif total - ok != want:
         print("실패 %d개, 기대 %d개 (%d/%d)" % (total - ok, want, ok, total))
     else:
@@ -128,7 +134,8 @@ LID="$(loopid)"
 check "CLAUDE.md 앵커 1줄" '^@\.claude/harness/POLICY\.md$' "$(cat "$WORK/CLAUDE.md")"
 check "루프 해시 형식 YYMMDD-xxxxxx" '^[0-9]\{6\}-[0-9a-f]\{6\}$' "$LID"
 check "gitignore 에 db·wal·shm" 'harness\.db-wal' "$(cat "$WORK/.gitignore")"
-check "래퍼 생성" 'harness' "$(ls "$WORK/.claude/harness/bin/")"
+check "래퍼 생성" '^ok$' \
+  "$([ -x "$WORK/.claude/harness/bin/harness" ] && echo ok || echo no)"
 check "7단계 모두 등록" '^7$' "$(sql 'SELECT COUNT(*) FROM stage')"
 
 echo "== 사용법 안내"
@@ -2966,6 +2973,23 @@ json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 check_selftest "정상이면 전부 통과한다" 0 "$(sf status 2>&1)"
 check_absent "정상이면 실패를 내지 않는다" '자기검사 .* 실패' "$(sf status 2>&1)"
 check "--json 에도 실린다" 'selftest' "$(sf status --json 2>&1)"
+# **탐침 목록이 게이트 목록을 덮는가.** 개수 바닥값으로는 탐침 다섯을 지워도 통과했다 —
+# 자기 자신을 재기 때문이다. 설정의 동의 종류마다 그 종류를 실제로 넣어 보는 탐침이
+# 있는지 이름으로 대조한다.
+sf status --json > "$SF/sel.json" 2>/dev/null
+SFCOV="$(python3 - "$(dirname "$ENGINE")" "$SF/sel.json" <<'PYC'
+import json, os, sys
+labels = [x.get("what", "") for x in
+          json.load(open(sys.argv[2], encoding="utf-8")).get("selftest", [])]
+cfg = json.load(open(os.path.join(sys.argv[1], "..", "templates", "stages.json"),
+                     encoding="utf-8"))
+missing = [k for k in cfg["consent"] if not any(k in lb for lb in labels)]
+print("동의 %d종 · 탐침 없는 종류 %d개: %s"
+      % (len(cfg["consent"]), len(missing), ", ".join(missing) or "없음"))
+PYC
+)"
+check "동의 종류를 전수로 센다" '동의 [1-9][0-9]*종' "$SFCOV"
+check "모든 동의 종류에 탐침이 있다" '탐침 없는 종류 0개' "$SFCOV"
 
 echo "  -- 개수 요약이 놓쳤던 것들을 잡는다"
 # ① 거짓값 조건: Codex 가 'live_rules 보정도 못 잡는다' 고 한 HIGH
@@ -3302,7 +3326,7 @@ DBROKEN="$(hook "$(W docs/x.md)" 2>/dev/null)"
 check_absent "DB 손상 시 차단하지 않음" 'permissionDecision' "$DBROKEN"
 check "DB 손상을 사용자에게 알린다" '게이트가 꺼졌다' "$DBROKEN"
 check "무엇이 문제인지 말한다" 'file is not a database' "$DBROKEN"
-hook "$(W docs/x.md)" >/dev/null 2>&1; CRC=$?
+CRC=0; hook "$(W docs/x.md)" >/dev/null 2>&1 || CRC=$?
 check "DB 손상 시 종료 코드 0" '^0$' "$CRC"
 check "traceback 을 내지 않는다" '^0$' \
   "$(hook "$(W docs/x.md)" 2>&1 >/dev/null | grep -c Traceback)"

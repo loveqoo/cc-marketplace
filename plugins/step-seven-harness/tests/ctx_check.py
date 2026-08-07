@@ -87,6 +87,11 @@ def main():
                        % (".".join(path), sc.get_lineno(), name))
 
     print("  함수 스코프 %d개 검사 (symtable)" % checked)
+    # 숫자를 **출력만** 하고 단정하지 않았다. `walk_scopes` 가 아무것도 안 내놔도
+    # "언팩 누락 없음" 으로 초록이었다 — 검사기가 죽은 것과 통과가 구분되지 않는다.
+    if checked < 250:
+        print("  훑은 스코프가 너무 적다 (%d) — 추출이 깨졌다" % checked)
+        return 1
     if bad:
         print("  언팩 누락 %d건" % len(bad))
         for b in sorted(set(bad)):
