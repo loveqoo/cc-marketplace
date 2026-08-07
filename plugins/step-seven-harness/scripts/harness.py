@@ -603,21 +603,6 @@ def config_problems(cfg):
     # 게이트는 **자기 설정을 스스로 진단한다.** 여기서 게이트마다 적으면 게이트를
     # 더할 때 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
     out = gate_problems(cfg)
-    crit = cfg.obj("criteria")
-    for name, spec in sorted(crit.items()):
-        if not isinstance(spec, dict):
-            out.append(t("criteria.%s 가 객체가 아니다 — 이 조건은 무시된다") % name)
-            continue
-        how = spec.get("satisfied_by")
-        if how is None:
-            out.append(t("criteria.%s 에 satisfied_by 가 없다 — cli 로 간주한다") % name)
-        elif how not in SATISFIED_BY:
-            out.append(t("criteria.%s.satisfied_by='%s' 는 모르는 값이다 (%s 중 하나) "
-                       "— 판정이 cli 로 떨어진다")
-                       % (name, how, "/".join(SATISFIED_BY)))
-        if how == "file" and not spec.get("write_glob"):
-            out.append(t("criteria.%s 는 satisfied_by=file 인데 write_glob 이 없다 "
-                       "— 어떤 파일도 이 조건을 채우지 못한다") % name)
     # 쓰기 규칙. 여기 오타는 특히 조용하다 — 규칙이 아무것도 막지 않거나,
     # 반대로 아무 경로에도 해당하지 않아 통째로 죽는다. 둘 다 티가 안 난다.
     fr = cfg.obj("folder_rules")
@@ -723,7 +708,7 @@ def config_problems(cfg):
             out.append(t("bash.mutator_pattern 이 잘못된 정규식이다 (%s) "
                        "— 기본 패턴으로 되돌아간다") % e)
 
-    known = set(crit)
+    known = set(cfg.obj("criteria"))
     for st in cfg.get("stages") or []:
         if not isinstance(st, dict):
             continue
@@ -1090,15 +1075,6 @@ def promo_match(item):
     return {col: item["name"]}
 
 
-def promo_key(kind, rule, target):
-    """승격 단위의 키. block 은 규칙이, tool_fail 은 정규화된 명령이 의미 있는 키다.
-
-    stats 의 묶음 기준과 같아야 한다 — 다르면 "3개 작업에서 반복"이라고 보여준
-    항목과 승격을 요구하는 항목이 어긋난다.
-    """
-    return "%s:%s" % (kind, (rule if kind == "block" else target) or "-")
-
-
 def repeated_items(con, cfg):
     """여러 작업에서 반복된 항목. 한 작업 안의 반복은 우연일 수 있다."""
     kinds = cfg.seq("promotion.kinds", ("block", "tool_fail"))
@@ -1385,24 +1361,6 @@ def retro_files_of_loop(con, cfg, root, lid):
             continue
         for n in names:
             if n.startswith(lid + "-") and os.path.isfile(os.path.join(d, n)):
-                out.append(os.path.join(d, n))
-    return out
-
-
-def retro_files_of_cycle(con, cfg, root, lid):
-    """이 회차가 쓴 회고·학습 파일. 파일명 접두사로 가른다."""
-    pre = file_prefix(con, lid)
-    out = []
-    for sub in recall_dirs(cfg):
-        d = os.path.join(root, ".dev", sub)
-        if not os.path.isdir(d):
-            continue
-        try:
-            names = sorted(os.listdir(d))
-        except OSError:
-            continue
-        for n in names:
-            if n.startswith(pre) and os.path.isfile(os.path.join(d, n)):
                 out.append(os.path.join(d, n))
     return out
 
@@ -1934,7 +1892,6 @@ def floor_hit(root, path):
 # 세 번째 '무해 선언' 설정이 생겨도 같은 바닥을 공유한다.
 NEVER_BENIGN = ("rm", "mv", "cp", "dd", "tee", "truncate", "shred", "install",
                 "ln", "sed", "mkdir", "touch", "find", "chmod", "chown", "sqlite3")
-NEVER_READERS = NEVER_BENIGN  # 이름은 유지한다 — 문서와 테스트가 이 이름을 쓴다
 
 
 def benign_head(cfg, key, head, default=()):
@@ -3884,78 +3841,191 @@ class WriteGate(Gate):
         return out
 
 
+@gate
+class CriteriaGate(Gate):
+    """단계의 **종료 조건**이 자기 산출물만 받아들이나.
+
+    흩어져 있던 것: 판정(`criterion_met`·`verification_hit`·`fs_evidence`),
+    요약(`enforcing_summary` 의 `criteria`/`gated_stages`), 탐침(`selftest_criteria`
+    70줄 + `MUST_VERIFY`/`NOT_VERIFICATION`/`UNRELATED`/`INNOCUOUS_TOOLS`),
+    진단(`config_problems`). 열한 곳이었다.
+    """
+
+    knobs = ("criteria", "stages[].exit_criteria")
+
+    @property
+    def name(self):
+        return t("종료 조건")
+
+    def state(self, cfg):
+        stages = cfg.get("stages") or []
+        return (sum(1 for st in stages
+                    if isinstance(st, dict) and (st.get("exit_criteria") or [])),
+                len(stages))
+
+    def probes(self, ctx):
+        cfg = ctx.cfg
+        out = []
+        for name, spec in sorted((cfg.obj("criteria") or {}).items()):
+            if not isinstance(spec, dict):
+                continue
+            out += self._one(cfg, name, spec)
+        # **막는 쪽.** 사람만 채울 수 있는 조건이 증거 없이 충족되면 안 된다.
+        human = [k for k, v in sorted((cfg.obj("criteria") or {}).items())
+                 if isinstance(v, dict) and v.get("human")]
+        if human:
+            k = human[0]
+            out.append((t("증거 없는 '%s' 는 단계를 막는다") % k,
+                        _bind(lambda: (not criterion_met(ctx.con, cfg, ctx.root,
+                                                         ctx.lid, k),
+                                       t("증거 없이 충족된다"))), True))
+        # 통과하는 쪽. 둘 다 없으면 게이트가 자기를 증명하지 못한다.
+        out.append((t("종료 조건이 하나라도 있다"),
+                    _bind(lambda: (not (cfg.obj("criteria") or {}),
+                                   t("조건이 하나도 없다"))), False))
+        return out
+
+    def _one(self, cfg, name, spec):
+        """조건 하나의 탐침들. `(설명, 호출, 막혀야 하나)` — 여기서 '막힘' 은
+        **결함이 있다** 는 뜻이다(전부 want=True 로 두고 결함을 찾는다)."""
+        how = spec.get("satisfied_by")
+        out = []
+
+        def bad(desc, fn):
+            out.append((desc, fn, False))     # 결함이 없어야 한다 = 통과
+
+        if spec.get("human"):
+            bad(t("%s 는 사람만 채울 수 있는 방식인가") % name,
+                _bind(lambda: (how != "cli",
+                               t("human: true 인데 satisfied_by=%s 다 — 파일을 쓰거나 "
+                                 "도구를 쓰는 것만으로 사람의 승인이 된다") % how)))
+        if how == "file":
+            pats = cfg.seq("criteria.%s.write_glob" % name)
+            hits = [p for p in UNRELATED if any(glob_match(p, g) for g in pats)]
+            bad(t("%s 는 무관한 파일을 받지 않는다") % name,
+                _bind(lambda: (bool(hits),
+                               t("무관한 경로도 받는다: %s") % ", ".join(hits))))
+        if how in ("cli", "no_pending_promotions") and spec.get("write_glob"):
+            bad(t("%s 의 write_glob 이 방식과 맞지 않는다") % name,
+                _bind(lambda: (True, t("satisfied_by=%s 인데 write_glob 이 있다") % how)))
+        if how == "no_pending_promotions":
+            bad(t("%s 가 실제로 무언가를 모은다") % name,
+                _bind(lambda: (not cfg.seq("promotion.kinds"),
+                               t("promotion.kinds 가 비어 있어 늘 충족된다"))))
+        if how == "observed":
+            out += self._observed(cfg, name, spec, bad)
+        return out
+
+    def _observed(self, cfg, name, spec, bad):
+        """관측으로 채우는 조건. 신호가 셋(bash_pattern·tools·tool_pattern)이라
+        하나만 탐침하면 나머지로 새어 나간다 — 셋 다 본다."""
+        pat = spec.get("bash_pattern")
+        bad(t("%s 에 판정 기준이 있다") % name,
+            _bind(lambda: (not pat,
+                           t("bash_pattern 이 없어 아무 명령도 검증이 되지 못한다"))))
+        hits = [c for c in NOT_VERIFICATION if pat and verification_hit(cfg, c)]
+        bad(t("%s 는 검증 명령만 인정한다") % name,
+            _bind(lambda: (bool(hits),
+                           t("검증이 아닌 명령도 인정: %s") % ", ".join(hits[:4]))))
+        missed = [c for c in MUST_VERIFY if not verification_hit(cfg, c)]
+        bad(t("%s 가 실제 검증 명령을 받아들인다") % name,
+            _bind(lambda: (bool(missed),
+                           t("이것들을 거부한다: %s") % ", ".join(missed[:4]))))
+        tools = [x for x in cfg.seq("criteria.%s.tools" % name) if x in INNOCUOUS_TOOLS]
+        bad(t("%s 는 무해한 도구를 증거로 세지 않는다") % name,
+            _bind(lambda: (bool(tools), t("무해한 도구도 증거: %s") % ", ".join(tools))))
+        tp = spec.get("tool_pattern")
+        try:
+            tre = re.compile(tp) if tp else None
+        except re.error:
+            tre = None
+        thits = [x for x in INNOCUOUS_TOOLS if tre and tre.search(x)]
+        bad(t("%s 의 도구 패턴이 너무 넓지 않다") % name,
+            _bind(lambda: (bool(thits), t("무해한 도구에도 걸린다: %s") % ", ".join(thits))))
+        return []
+
+    def problems(self, cfg):
+        out = []
+        for name, spec in sorted(cfg.obj("criteria").items()):
+            if not isinstance(spec, dict):
+                out.append(t("criteria.%s 가 객체가 아니다 — 이 조건은 무시된다") % name)
+                continue
+            how = spec.get("satisfied_by")
+            if how is None:
+                out.append(t("criteria.%s 에 satisfied_by 가 없다 — cli 로 간주한다")
+                           % name)
+            elif how not in SATISFIED_BY:
+                out.append(t("criteria.%s.satisfied_by='%s' 는 모르는 값이다 "
+                             "(%s 중 하나) — 판정이 cli 로 떨어진다")
+                           % (name, how, "/".join(SATISFIED_BY)))
+            if how == "file" and not spec.get("write_glob"):
+                out.append(t("criteria.%s 는 satisfied_by=file 인데 write_glob 이 없다 "
+                             "— 어떤 파일도 이 조건을 채우지 못한다") % name)
+        return out
+
+
+@gate
+class StopGate(Gate):
+    """턴을 끝내기 전에 무엇을 요구하나.
+
+    `stop_requires` 를 비우면 검증 증거·회고·승격 결정의 강제가 통째로 사라지는데
+    요약이 한 글자도 안 바뀌었다(2회차). 그것을 고쳤더니 이번엔 `stop_block_limits`
+    를 0 으로 두는 길이 남아 있었다(3회차) — **같은 게이트의 다른 손잡이**다.
+    손잡이를 여기 모아 두고, 어느 쪽으로 꺼도 탐침이 잡는다.
+    """
+
+    knobs = ("stages[].stop_requires", "stop_block_limits", "stop_continue.enabled")
+
+    @property
+    def name(self):
+        return t("턴 종료 게이트")
+
+    def _limits_live(self, cfg):
+        lim = cfg.get("stop_block_limits")
+        if not isinstance(lim, dict):
+            return True                      # 없으면 기본값 1 이 쓰인다
+        return any(int(v or 0) > 0 for v in lim.values()) if lim else True
+
+    def state(self, cfg):
+        stages = cfg.get("stages") or []
+        live = sum(1 for st in stages
+                   if isinstance(st, dict) and (st.get("stop_requires") or []))
+        return (live if self._limits_live(cfg) else 0), len(stages)
+
+    def probes(self, ctx):
+        cfg = ctx.cfg
+
+        def requires():
+            """요구하는 단계가 하나라도 있나."""
+            n = sum(1 for st in (cfg.get("stages") or [])
+                    if isinstance(st, dict) and (st.get("stop_requires") or []))
+            return n > 0, t("%d개 단계가 요구한다") % n
+
+        def budget():
+            """차단 예산이 0 이면 첫 시도부터 소진으로 떨어져 한 번도 못 막는다."""
+            ok = self._limits_live(cfg)
+            return (not ok), t("stop_block_limits 가 전부 0 이다")
+
+        return [(t("턴 종료를 요구하는 단계가 있다"), requires, True),
+                (t("차단 예산이 0 이 아니다"), budget, False)]
+
+    def problems(self, cfg):
+        out = []
+        if not self._limits_live(cfg):
+            out.append(t("stop_block_limits 가 전부 0 이다 — 첫 시도부터 '상한 소진' "
+                         "으로 떨어져 턴 종료 게이트가 한 번도 막지 못한다"))
+        stages = cfg.get("stages") or []
+        if stages and not any(isinstance(st, dict) and (st.get("stop_requires") or [])
+                              for st in stages):
+            out.append(t("어떤 단계도 stop_requires 가 없다 — 검증 증거·회고·승격 "
+                         "결정을 미충족 상태로 턴을 끝낼 수 있다"))
+        return out
+
+
 def _bind(fn, *a):
     """인자를 묶어 둔다. 탐침은 **나중에** 돌아야 한다 (돌려 본 결과가 결과다)."""
     return lambda: fn(*a)
 
-
-def selftest_criteria(cfg):
-    """종료 조건이 **자기 산출물만** 받아들이나. (설명, 통과, 결과)"""
-    out = []
-    for name, spec in sorted((cfg.obj("criteria") or {}).items()):
-        if not isinstance(spec, dict):
-            continue
-        if spec.get("human") and spec.get("satisfied_by") != "cli":
-            out.append((t("%s 는 사람만 채울 수 있는 방식인가") % name, False,
-                        t("human: true 인데 satisfied_by=%s 다 — 파일을 쓰거나 도구를 "
-                          "쓰는 것만으로 사람의 승인이 된다") % spec.get("satisfied_by")))
-        if spec.get("satisfied_by") == "file":
-            pats = cfg.seq("criteria.%s.write_glob" % name)
-            hits = [p for p in UNRELATED
-                    if any(glob_match(p, g) for g in pats)]
-            out.append((t("%s 는 무관한 파일을 받지 않는다") % name, not hits,
-                        t("무관한 경로도 받는다: %s") % ", ".join(hits) if hits
-                        else t("자기 산출물만 받는다")))
-        if spec.get("satisfied_by") in ("cli", "no_pending_promotions") \
-                and spec.get("write_glob"):
-            # `write_glob` 은 `satisfied_by: file` 의 어휘다. 다른 방식에 붙어 있으면
-            # 아무도 그것으로 판정하지 않거나(죽은 설정), 관측이 그것을 인정해
-            # **사람만 채울 수 있는 조건이 파일 쓰기로 채워진다.**
-            out.append((t("%s 의 write_glob 이 방식과 맞지 않는다") % name, False,
-                        t("satisfied_by=%s 인데 write_glob 이 있다")
-                        % spec.get("satisfied_by")))
-        if spec.get("satisfied_by") == "no_pending_promotions" \
-                and not cfg.seq("promotion.kinds"):
-            out.append((t("%s 가 실제로 무언가를 모은다") % name, False,
-                        t("promotion.kinds 가 비어 있어 늘 충족된다")))
-        if spec.get("satisfied_by") == "observed":
-            # 신호는 셋이다 — bash_pattern·tools·tool_pattern. 손으로 하나만
-            # 탐침했더니 `tools: ["Read"]` 로 아무 도구가 증거가 되는 길이 열려
-            # 있었다(4차 리뷰). **설정에 있는 신호를 훑어** 전부 탐침한다.
-            pat = spec.get("bash_pattern")
-            try:
-                vre = re.compile(pat) if pat else None
-            except re.error:
-                vre = None
-            # **판정 함수에 넣는다.** 예전에는 여기서 정규식을 직접 돌려서,
-            # 엔진이 실제로 쓰는 판정(`verification_hit`)과 다른 것을 검사했다.
-            hits = [c for c in NOT_VERIFICATION
-                    if vre is not None and verification_hit(cfg, c)]
-            missed = [c for c in MUST_VERIFY if not verification_hit(cfg, c)]
-            out.append((t("%s 가 실제 검증 명령을 받아들인다") % name, not missed,
-                        t("이것들을 거부한다: %s") % ", ".join(missed[:4]) if missed
-                        else t("%d종을 전부 받아들인다") % len(MUST_VERIFY)))
-            if vre is None:
-                out.append((t("%s 에 판정 기준이 있다") % name, False,
-                            t("bash_pattern 이 없어 아무 명령도 검증이 되지 못한다")))
-            out.append((t("%s 는 검증 명령만 인정한다") % name, not hits,
-                        t("검증이 아닌 명령도 인정: %s") % ", ".join(hits) if hits
-                        else t("검증 명령만 인정한다")))
-            tools = [x for x in cfg.seq("criteria.%s.tools" % name)
-                     if x in INNOCUOUS_TOOLS]
-            out.append((t("%s 는 무해한 도구를 증거로 세지 않는다") % name, not tools,
-                        t("무해한 도구도 증거: %s") % ", ".join(tools) if tools
-                        else t("검증 도구만 인정한다")))
-            tp = spec.get("tool_pattern")
-            try:
-                tre = re.compile(tp) if tp else None
-            except re.error:
-                tre = None
-            thits = [x for x in INNOCUOUS_TOOLS if tre and tre.search(x)]
-            out.append((t("%s 의 도구 패턴이 너무 넓지 않다") % name, not thits,
-                        t("무해한 도구에도 걸린다: %s") % ", ".join(thits) if thits
-                        else t("검증 도구만 걸린다")))
-    return out
 
 
 def selftest(ctx):
@@ -3965,38 +4035,22 @@ def selftest(ctx):
     더할 때 표에 행을 넣는 것을 잊어도 조용했고, 실제로 동의 게이트가 통째로 빠진 채
     22/22 를 냈다. 이제 탐침은 게이트가 소유하므로 빠뜨릴 자리가 없다.
     """
-    return selftest_criteria(ctx.cfg) + gate_probes(ctx)
+    return gate_probes(ctx)
 
 
 def enforcing_summary(cfg):
     """**지금 실제로 강제되고 있는 것.**
 
-    왜 세는가: 공허한 설정을 하나하나 예측해 진단하려 했더니 모양마다 새 규칙이
-    필요했고(빈 목록, 아무것도 안 맞는 정규식, 이름 바꾸기, 조건 배열 비우기…),
-    그래도 계속 새어나갔다. 예측은 끝이 없다. 대신 **결과를 보여준다** — 규칙이
-    0개면 그 숫자가 보이고, 조건이 사라지면 그 숫자가 보인다. 어떤 방식으로
-    비웠는지는 알 필요가 없다.
+    예측은 끝이 없다(빈 목록, 아무것도 안 맞는 정규식, 이름 바꾸기…). 대신 결과를
+    보여준다. 그 결과는 **게이트가 스스로 말한다** — 여기서 게이트별로 세면 게이트를
+    더할 때 이 자리를 잊게 되고, 잊어도 조용하다.
+
+    남는 것은 게이트의 `n/m` 으로 표현되지 않는 것뿐이다. 보호 경로는 바닥값 ∪ 설정
+    이라 '전체' 가 없고, 언어는 게이트가 아니다.
     """
-    stages = cfg.get("stages") or []
-    rules = write_rules(cfg)
     return {
-        "write_rules": len(rules),
-        # **발동할 수 있는** 규칙만 따로 센다. 있기만 한 규칙은 강제가 아니다 —
-        # `when.class` 를 없는 클래스로 두면 일곱 규칙이 전부 죽는데 예전 요약은
-        # "쓰기 규칙 7" 이라고 말했다. 요약이 거짓말하면 '결과를 보여준다'가 무의미하다.
-        "live_rules": sum(1 for r in rules if rule_reachable(cfg, r)),
         "protected_paths": len(protected_pats(cfg)),
-        "criteria": len(cfg.obj("criteria") or {}),
-        "gated_stages": sum(1 for st in stages
-                            if isinstance(st, dict) and (st.get("exit_criteria") or [])),
-        "stages": len(stages),
-        # 게이트가 자기 상태를 말한다. 여기서 게이트별로 세면 게이트를 더할 때
-        # 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
         "gates": gate_states(cfg),
-        # 턴 종료 게이트를 세는 자리가 없었다. `stop_requires` 를 전부 비우면 검증
-        # 증거·회고·승격 결정의 강제가 통째로 사라지는데 요약이 **한 글자도** 안 바뀌었다.
-        "stop_gates": sum(1 for st in stages
-                          if isinstance(st, dict) and (st.get("stop_requires") or [])),
         "language": cfg.at("language") or "ko",
     }
 
@@ -4021,17 +4075,11 @@ def render_status(d, cfg):
     e = d.get("enforcing") or {}
     if e:
         # 무엇이 실제로 강제되는지 **숫자로** 보여준다. 0 이 보이면 그게 신호다.
-        rules_txt = "%d" % e.get("write_rules", 0)
-        if e.get("live_rules", 0) != e.get("write_rules", 0):
-            rules_txt += t("(발동 가능 %d)") % e.get("live_rules", 0)
         if st:
             print(t("자기검사: %d/%d 통과 (대표 조작을 실제 판정에 넣어 확인)")
                   % (len(st) - len(fails), len(st)))
-        print(t("강제 중: 쓰기 규칙 %s · 보호 경로 %d · 종료 조건 %d "
-                "(게이트 있는 단계 %d/%d) · 턴 종료 게이트 %d/%d%s · 언어 %s")
-              % (rules_txt, e.get("protected_paths", 0),
-                 e.get("criteria", 0), e.get("gated_stages", 0), e.get("stages", 0),
-                 e.get("stop_gates", 0), e.get("stages", 0),
+        print(t("강제 중: 보호 경로 %d%s · 언어 %s")
+              % (e.get("protected_paths", 0),
                  "".join(" · %s %d/%d" % (n, on, tot)
                          for n, on, tot in e.get("gates", [])),
                  e.get("language", "ko")))

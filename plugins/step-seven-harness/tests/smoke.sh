@@ -3201,8 +3201,8 @@ echo "== 강제되는 것을 숫자로 보여준다 (예측이 아니라 결과)
 EF="$(mktemp -d)"
 (cd "$EF" && git init -q . && python3 "$ENGINE" init >/dev/null)
 ef() { (cd "$EF" && python3 "$ENGINE" "$@"); }
-check "정상 상태를 숫자로 보여준다" '쓰기 규칙 7 · 보호 경로 7' "$(ef status 2>&1)"
-check "게이트 있는 단계 수를 보여준다" '게이트 있는 단계 4/7' "$(ef status 2>&1)"
+check "정상 상태를 숫자로 보여준다" '보호 경로 7 .*쓰기 규칙 7/7' "$(ef status 2>&1)"
+check "게이트 있는 단계 수를 보여준다" '종료 조건 4/7' "$(ef status 2>&1)"
 python3 -c "
 import json, sys
 p = sys.argv[1]
@@ -3216,7 +3216,7 @@ for st in cfg['stages']:
         st['exit_criteria'] = []; st['stop_requires'] = []
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$EF/.claude/harness/stages.json"
-check "게이트를 지우면 숫자가 줄어 보인다" '게이트 있는 단계 3/7' "$(ef status 2>&1)"
+check "게이트를 지우면 숫자가 줄어 보인다" '종료 조건 3/7' "$(ef status 2>&1)"
 python3 -c "
 import json, sys
 p = sys.argv[1]
@@ -3228,7 +3228,7 @@ for st in cfg['stages']:
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$EF/.claude/harness/stages.json"
 check "전부 비우면 0 으로 보인다" '쓰기 규칙 0' "$(ef status 2>&1)"
-check "게이트 있는 단계도 0" '게이트 있는 단계 0/7' "$(ef status 2>&1)"
+check "게이트 있는 단계도 0" '종료 조건 0/7' "$(ef status 2>&1)"
 check "승인 필요도 0" '승인 필요 0' "$(ef status 2>&1)"
 check "바닥값은 남아 있다 (보호 경로 3)" '보호 경로 3' "$(ef status 2>&1)"
 check "--json 에도 실린다" 'enforcing' "$(ef status --json 2>&1)"
@@ -3248,7 +3248,7 @@ for r in cfg['write_rules']:
     r['when'] = {'class': 'nonexistent_class'}
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$EF2/.claude/harness/stages.json"
-check "죽은 규칙은 발동 가능 0 으로 보인다" '쓰기 규칙 7(발동 가능 0)' "$(ef2 status 2>&1)"
+check "죽은 규칙은 발동 가능 0 으로 보인다" '쓰기 규칙 0/7' "$(ef2 status 2>&1)"
 check "모르는 class 를 지적한다" "path_classes 에 없다" "$(ef2 status 2>&1)"
 check "가능한 class 를 알려준다" 'context/dev/docs/source/tests' "$(ef2 status 2>&1)"
 check_empty "실제로 아무것도 막지 못한다" \
@@ -3263,7 +3263,7 @@ cfg['write_rules'] = json.load(open(sys.argv[2], encoding='utf-8'))['write_rules
 cfg['write_rules'][4]['require'] = {}
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$EF2/.claude/harness/stages.json" "$EF2/.claude/harness/bin/defaults.json"
-check "판정이 없는 규칙도 발동 불가로 센다" '발동 가능 6' "$(ef2 status 2>&1)"
+check "판정이 없는 규칙도 발동 불가로 센다" '쓰기 규칙 6/7' "$(ef2 status 2>&1)"
 rm -rf "$EF2"
 
 echo "  -- 검증 패턴은 탐침으로 본다 (텍스트를 읽지 않는다)"
