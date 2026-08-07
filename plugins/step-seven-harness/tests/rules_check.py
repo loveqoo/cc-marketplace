@@ -551,6 +551,37 @@ ck("close_loop 이 cfg 를 요구한다 (빠뜨릴 자리를 없앤다)",
 ck("close_loop 이 스냅샷을 남긴다",
    "record_cycle_close" in inspect.getsource(h.close_loop))
 
+# --- 사본은 원본과 같다 -----------------------------------------------------
+# `.py` 만 보던 시절 두 구멍이 있었다(4회차 D-M9): `gates/zzz.pyc` 를 심으면
+# `pkgutil` 이 발견해 임포트하는데 복사·정리 어느 쪽에도 안 걸렸고, 플러그인
+# 업그레이드로 게이트 파일이 없어져도 사본에는 영원히 남았다.
+print("== 엔진 사본은 원본과 같다")
+ck("임포트 가능한 확장자를 전부 본다",
+   set(h.IMPORTABLE) >= {".py", ".pyc", ".so"}, h.IMPORTABLE)
+_cp = _tf.mkdtemp()
+os.makedirs(os.path.join(_cp, "gates"))
+for _f in ("harness.py", "gates/__init__.py", "gates/zzz.pyc", "gates/old.py"):
+    open(os.path.join(_cp, _f), "w").write("x\n")
+_found = set(h._importable(_cp))
+ck("사본 안의 .pyc 를 찾는다", os.path.join("gates", "zzz.pyc") in _found, _found)
+h._purge_engine_copy(_cp)
+ck("정리하면 .pyc 도 사라진다", not h._importable(_cp), h._importable(_cp))
+
+# --- 게이트 하나가 깨져도 나머지는 실린다 -------------------------------------
+# 첫 예외에서 루프가 중단돼 `criteria.py` 하나가 알파벳 뒤 셋을 끌고 갔다.
+print("== 게이트 하나가 깨져도 나머지는 실린다")
+ck("적재 실패를 목록으로 돌려준다",
+   isinstance(h.GATE_LOAD_FAILS, list), type(h.GATE_LOAD_FAILS))
+ck("정상 설치에서는 비어 있다", not h.GATE_LOAD_FAILS, h.GATE_LOAD_FAILS)
+ck("원인을 읽는 곳이 있다", h.gate_load_why() == "")
+h.GATE_LOAD_FAILS.append(("criteria", "SyntaxError: 실험"))
+try:
+    ck("원인이 메시지에 실린다",
+       "criteria" in h.gate_load_why() and "실험" in h.gate_load_why(),
+       h.gate_load_why())
+finally:
+    h.GATE_LOAD_FAILS.pop()
+
 # --- 원문 바닥값 감시 -----------------------------------------------------
 # 4회차가 바닥값을 **세 방향**에서 뚫었고 전부 실행까지 재현됐다. 셋 다 토큰으로는
 # 경로가 아니지만 문자열에는 그대로 들어 있었다. 확장을 하나씩 구현하는 대신

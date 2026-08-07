@@ -3345,7 +3345,8 @@ def run_hook():
             # 게이트 구현이 안 실렸다. 그 게이트가 막던 것이 **전부** 통과한다 —
             # 파일이 빠졌든 import 가 터졌든, 결과는 게이트 해제와 같다.
             return inactive(t("게이트 %s 가 실리지 않았다 — 그 게이트가 막던 것이 "
-                              "지금 아무것도 막지 않는다") % ", ".join(gone),
+                              "지금 아무것도 막지 않는다%s")
+                            % (", ".join(gone), gate_load_why()),
                             t("플러그인 설치가 온전한지 확인하라 (`scripts/` 아래 "
                               "파일이 빠졌을 수 있다)"))
         cfg = load_config(root, plugin_root())
@@ -3537,18 +3538,42 @@ def _copy_engine(src_dir, dst_dir):
             _purge_engine_copy(dst_dir)
             return None
         changed = changed or bool(r)
+    # **사본은 원본과 같아야 한다.** 원본에 없는데 사본에 있는 것은 지운다.
+    #
+    # 없었을 때 두 구멍이 있었다(4회차 D-M9): ① `gates/zzz.pyc` 를 심으면
+    # `pkgutil` 이 발견해 임포트하는데 복사·정리 어느 쪽에도 안 걸렸다 —
+    # 사본 경로로 남의 게이트를 심을 수 있었다. ② 플러그인 업그레이드로 게이트
+    # 파일이 없어져도 사본에는 영원히 남아 낡은 게이트가 계속 돌았다.
+    keep = {os.path.normpath(r) for r in engine_sources(src_dir)}
+    for rel in _importable(dst_dir):
+        if os.path.normpath(rel) not in keep:
+            with swallow(t("사본 정리(%s)") % rel):
+                os.remove(os.path.join(dst_dir, rel))
+            changed = True
     return changed
 
 
-def _purge_engine_copy(dst_dir):
-    """사본의 파이썬 파일을 전부 없앤다. 낡은 엔진이 도는 것보다 없는 것이 낫다."""
+# 파이썬이 **임포트할 수 있는** 것. `.py` 만 보면 `.pyc` 가 남고, `pkgutil` 은
+# 그것을 발견한다. 확장자 목록이지만 파이썬의 것이지 우리 어휘가 아니다.
+IMPORTABLE = (".py", ".pyc", ".pyo", ".so")
+
+
+def _importable(dst_dir):
+    """사본 안에서 임포트될 수 있는 파일 (dst_dir 기준 상대경로)."""
+    out = []
     for dirpath, _dirs, names in os.walk(dst_dir):
-        for n in names:
-            if n.endswith(".py"):
-                try:
-                    os.remove(os.path.join(dirpath, n))
-                except OSError:
-                    pass
+        for n in sorted(names):
+            if n.endswith(IMPORTABLE):
+                out.append(os.path.relpath(os.path.join(dirpath, n), dst_dir))
+    return out
+
+
+def _purge_engine_copy(dst_dir):
+    """사본에서 **임포트될 수 있는 것을 전부** 없앤다. 낡은 엔진이 도는 것보다
+    없는 것이 낫다 — 래퍼는 원본(플러그인)으로 떨어지고 그것이 옳은 엔진이다."""
+    for rel in _importable(dst_dir):
+        with swallow(t("사본 삭제(%s)") % rel):
+            os.remove(os.path.join(dst_dir, rel))
 
 
 def refresh_engine(root):
@@ -3849,6 +3874,17 @@ def gate(cls):
     return cls
 
 
+def gate_load_why():
+    """왜 안 실렸는지. 없으면 빈 문자열.
+
+    `GATE_LOAD_FAILS` 를 채우기만 하고 아무도 읽지 않으면 그 값은 없는 것과 같다.
+    "실리지 않았다" 만 말하고 원인을 삼키면 사용자는 고칠 수 없다(4회차 D-M10).
+    """
+    if not GATE_LOAD_FAILS:
+        return ""
+    return t(" (%s)") % "; ".join("%s — %s" % nm_why for nm_why in GATE_LOAD_FAILS)
+
+
 def missing_gates():
     """실려야 하는데 없는 게이트. 비어 있으면 정상."""
     return [k for k in REQUIRED_GATES if k not in {g.key for g in GATES}]
@@ -3941,7 +3977,7 @@ def gate_probes(ctx):
     꺼져도, 과잉 차단이 되어도 그 게이트만은 조용하다. 그것을 실패로 낸다.
     """
     out = [(t("게이트 %s 가 실려 있다") % k, False,
-            t("실리지 않았다 — 그 게이트가 막던 것이 통과한다"))
+            t("실리지 않았다 — 그 게이트가 막던 것이 통과한다%s") % gate_load_why())
            for k in missing_gates()]
     for g in GATES:
         try:
@@ -5436,8 +5472,8 @@ def run_cli(argv):
     gone = missing_gates()
     if gone:
         print(t("게이트 %s 가 실리지 않았다 — 그 게이트가 막던 것이 지금 아무것도 "
-                "막지 않는다. 플러그인 설치가 온전한지 확인하라.") % ", ".join(gone),
-              file=sys.stderr)
+                "막지 않는다%s. 플러그인 설치가 온전한지 확인하라.")
+              % (", ".join(gone), gate_load_why()), file=sys.stderr)
         return 1
     cfg = load_config(root, plugin_root())
     load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
@@ -5952,12 +5988,16 @@ def main():
 #
 # 적재가 실패하면 그 게이트가 막던 것이 전부 통과한다 — 그래서 조용히 넘기지 않고
 # 사실을 남긴다. `missing_gates()` 가 그것을 소리로 바꾼다.
-GATE_LOAD_ERROR = None
+# **원인을 버리지 않는다.** 예전에는 이 값을 채우기만 하고 읽는 곳이 없어서
+# (`grep GATE_LOAD_ERROR` → 정의와 대입 둘뿐) `SyntaxError: invalid syntax
+# (criteria.py, line 2)` 같은 진짜 이유가 사라졌다. 사용자는 "실리지 않았다" 만
+# 보고 어느 파일이 왜 깨졌는지 알 수 없었다(4회차 D-M10).
+GATE_LOAD_FAILS = []
 try:
     import gates as _gates
-    _gates.register(sys.modules[__name__])
+    GATE_LOAD_FAILS = _gates.register(sys.modules[__name__]) or []
 except Exception as _exc:                      # noqa: BLE001 - 적재 실패도 사실이다
-    GATE_LOAD_ERROR = "%s: %s" % (type(_exc).__name__, _exc)
+    GATE_LOAD_FAILS = [("gates", "%s: %s" % (type(_exc).__name__, _exc))]
 
 
 if __name__ == "__main__":
