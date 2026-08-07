@@ -2950,7 +2950,20 @@ import sqlite3, sys
 print(sqlite3.connect(sys.argv[1]).execute(
   \"SELECT COUNT(*) FROM event WHERE kind='cycle_adopt'\").fetchone()[0])" \
   "$CW2/.claude/harness/harness.db")"
-check "JSON 사유가 가짜 회차가 되지 않는다" '회차 종료 기록이 없다' "$(cw2 metrics 2>&1)"
+# 3회차가 지키던 성질은 그대로다: **JSON 처럼 생긴 사유가 집계로 새면 안 된다.**
+# 달라진 것은 재연결도 이제 집계를 남긴다는 점이다 — 안 남겼더니 마찰이 쌓인
+# 회차를 `loop adopt` 한 줄로 표본에서 지울 수 있었다(4회차 C③). 사유는
+# `cycle_adopt_reason` 이라는 **다른 행**으로 갈라 둘 다 만족시킨다.
+check "사유는 집계와 다른 행에 남는다" '^1$' \
+  "$(python3 -c "
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT COUNT(*) FROM event WHERE kind='cycle_adopt_reason'\").fetchone()[0])" \
+  "$CW2/.claude/harness/harness.db")"
+check "JSON 사유가 가짜 회차가 되지 않는다" '^0$' \
+  "$(cw2 metrics 2>&1 | grep -c '999' || true)"
+check "그래도 회차 집계는 남는다 (adopt 로 지울 수 없다)" '기록된 회차 1개' \
+  "$(cw2 metrics 2>&1)"
 check "그래도 접두사는 바뀐다" '[0-9a-f]-2-' \
   "$(cw2 status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["prefix"])')"
 rm -rf "$CW2"

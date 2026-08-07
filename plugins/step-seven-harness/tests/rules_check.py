@@ -428,6 +428,75 @@ finally:
     os.chmod(wp, 0o755)
 ck("쓸 수 있게 되면 복구한다", h.wrapper_intact(root) is False)
 
+# --- 회차 경계당 스냅샷 하나 ------------------------------------------------
+# 4회차 C①: `advance --done` 은 `record_cycle_close` 를 부르고 곧이어
+# `rotate_loop` 을 부르는데 그것도 부른다 → 전부 0 인 유령 회차가 쌓여 지표가
+# 정확히 반토막 났다. 호출자 조율이 아니라 **함수 안**에 못 박았다.
+print("== 회차 경계당 스냅샷은 하나다")
+_l = h.head_loop(con)
+with con:
+    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                "VALUES(?,?,?,?,?,?)", (h.now(), _l, ctx.sid, "block", "probe", "x"))
+    first = h.record_cycle_close(con, cfg, _l, ctx.sid)
+    again = h.record_cycle_close(con, cfg, _l, ctx.sid)
+_n = con.execute("SELECT COUNT(*) c FROM event WHERE kind='cycle_close' AND target=?",
+                 ("%s-%d" % (_l, h.cycle_of(con, _l)),)).fetchone()["c"]
+ck("두 번 불러도 한 행", _n == 1, _n)
+ck("두 번째도 같은 값을 돌려준다", first == again, (first, again))
+ck("유령이 아니라 진짜 집계다", first and first.get("blocks", 0) >= 1, first)
+
+# 4회차 C③: `loop adopt` 는 `close_loop` 을 직접 불러 스냅샷 없이 회차를 버렸다 —
+# 마찰이 쌓인 회차를 지우는 가장 싼 방법이었다. `close_loop` 이 남기게 했다.
+import inspect  # noqa: E402
+ck("close_loop 이 cfg 를 요구한다 (빠뜨릴 자리를 없앤다)",
+   "cfg" in inspect.signature(h.close_loop).parameters)
+ck("close_loop 이 스냅샷을 남긴다",
+   "record_cycle_close" in inspect.getsource(h.close_loop))
+
+# --- 원문 바닥값 감시 -----------------------------------------------------
+# 4회차가 바닥값을 **세 방향**에서 뚫었고 전부 실행까지 재현됐다. 셋 다 토큰으로는
+# 경로가 아니지만 문자열에는 그대로 들어 있었다. 확장을 하나씩 구현하는 대신
+# 원문을 보고 **묻는다**. 여기서 양방향을 못 박는다.
+print("== 원문에 바닥값이 보이면 묻는다 (셸을 재구현하지 않는다)")
+for cmd in ('cp evil "$(pwd)/.claude/harness/bin/harness"',
+            "cp evil `pwd`/.claude/harness/bin/harness",
+            "cp evil $PWD/.claude/harness/bin/harness",
+            "cp evil $'.claude/harness/bin/harness'",
+            'python3 -c "open(\'.claude/harness/harness.db\',\'w\')"',
+            "perl -e \"unlink q(.claude/harness/harness.db)\"",
+            "rsync evil .claude/harness/bin/harness",
+            "gzip .claude/harness/harness.db",
+            "D=.claude/harness/bin; cp evil $D/harness"):
+    ck("  잡는다: %s" % cmd[:44], h.floor_named(cfg, cmd))
+
+# **실행은 언급이 아니다.** 여기가 과잉 차단이 되면 마찰이고, 마찰은 게이트를 끈다.
+for cmd in (".claude/harness/bin/harness status",
+            "python3 .claude/harness/bin/harness.py status",
+            "sh -c '.claude/harness/bin/harness advance'",
+            "git add -A", "npm test", "make build", "docker build -t x .",
+            "curl -sL https://example.com/x.tgz > /tmp/x.tgz",
+            "grep -rn foo src/", "ls .claude/harness",
+            # 읽기는 막지 않는다 (기존 설계). **엔진 기본값만** 면제된다.
+            "cat .claude/harness/harness.db",
+            "grep -rn x .claude/harness/bin/harness"):
+    ck("  지나간다: %s" % cmd[:44], not h.floor_named(cfg, cmd), h.floor_named(cfg, cmd))
+
+# 면제는 **하네스 실행 파일에만**. 처음에 "인터프리터의 다음 토큰" 으로 넓게
+# 뒀다가 `interpreters: [gzip]` + `gzip <DB>` 로 뚫렸다 — 4회차가 지적한
+# `skip=2` 구멍을 그대로 다시 만든 것이었다.
+_wide = h.Cfg(dict(cfg))
+_wide["bash"] = dict(cfg["bash"], interpreters=list(cfg["bash"]["interpreters"]) + ["gzip"],
+                     readers=list(cfg["bash"]["readers"]) + ["rsync"])
+ck("설정으로 readers 를 늘려도 원문 감시는 남는다",
+   h.floor_named(_wide, "rsync evil .claude/harness/bin/harness"))
+ck("설정으로 interpreters 를 늘려도 남는다",
+   h.floor_named(_wide, "gzip .claude/harness/harness.db"))
+# 면제는 **엔진 기본값** 이름에만. 설정으로 넓히는 길이 있으면 B#1 이 되살아난다.
+ck("readers 설정은 원문 감시 면제를 넓히지 못한다",
+   h.floor_named(_wide, "rsync .claude/harness/harness.db /tmp/x"))
+ck("리다이렉트가 붙으면 읽기가 아니다",
+   h.floor_named(cfg, "cat /tmp/evil > .claude/harness/bin/harness"))
+
 # --- 자기증명 규칙 자체 ---------------------------------------------------
 # 4회차: 이 강제 장치에 테스트가 없어서, `wants != {True, False}` 를 `if False:`
 # 로 바꿔도 41종 검사가 전부 초록이었다. 그리고 그 규칙은 애초에 공허했다 —

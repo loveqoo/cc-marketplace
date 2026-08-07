@@ -192,7 +192,8 @@ EVENT_KINDS = {
     "promote_declined": "승격 보류",
     "promote_verify": "승격 시 변경 관측",
     "cycle_close": "회차 종료",
-    "cycle_adopt": "작업 재연결 (측정 창은 건드리지 않는다)",
+    "cycle_adopt": "회차 포기 (재연결) — 측정에는 남고 회고 창은 그대로",
+    "cycle_adopt_reason": "재연결 사유",
     "retro_keys": "회고 검색 키 확인",
     "plan_mode_exit": "plan mode 종료 관측",
     "stop_continue": "턴 이어붙임",
@@ -871,13 +872,23 @@ def rotate_loop(con, cfg, root, lid, intent=None):
     return create_loop(con, cfg, root, intent)
 
 
-def close_loop(con, lid):
+def close_loop(con, cfg, lid, kind):
     """루프의 작업 상태를 버린다. 영구 기록은 폴더의 파일명이 갖고 있다.
 
     남기는 것: loop 인덱스(해시·의도·기간)와 event(관측 기록).
     event 를 버리면 복리의 원료가 사라지고, loop 인덱스가 없으면 event 가
     어느 작업의 것인지 알 수 없다. 버리는 것은 진행 중 상태뿐이다.
+
+    **닫기 전에 스냅샷을 남긴다.** `rotate_loop` 에만 있었더니 `loop adopt` 가
+    옆문이 됐다 — 진행 중 회차의 마찰이 어느 측정 창에도 속하지 못하고 사라져서,
+    "차단이 쌓인 회차를 없애려면 `harness loop adopt <아무 id>` 한 줄" 이 됐다
+    (4회차 C③ 실측). 스냅샷은 회차당 하나이므로(`record_cycle_close`) 이미
+    남겼으면 여기서 두 번 남지 않는다.
     """
+    try:
+        record_cycle_close(con, cfg, lid, active_stage(con, lid) or "-", kind)
+    except Exception:
+        pass
     for tbl in ("stage", "evidence", "wgrant"):
         con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
     con.execute("UPDATE loop SET closed_at=? WHERE id=?", (now(), lid))
@@ -1281,16 +1292,42 @@ def cycle_counters(con, lid, lo):
     }
 
 
-def record_cycle_close(con, cfg, lid, sid):
+def record_cycle_close(con, cfg, lid, sid, kind="cycle_close"):
     """회차 경계에서 그 회차의 집계를 한 줄로 남긴다.
 
     stage 행은 작업이 닫힐 때 삭제되므로 나중에 회차별 비용을 되살릴 수 없다.
     경계에서 스냅샷을 남기면 event 는 작업이 닫혀도 살아남아 측정이 가능해진다.
+
+    **회차 하나에 스냅샷 하나.** 이 불변식을 호출자들의 조율에 맡겼더니 깨졌다:
+    `advance --done` 은 여기를 부르고 곧이어 `rotate_loop` 을 부르는데 그것도
+    여기를 부른다. 두 번째 호출 시점에는 창 시작이 방금 쓴 행으로 옮겨져 있어
+    **전부 0 인 유령 회차**가 하나 더 쌓였고, `metrics` 의 회차 추세가 정확히
+    반토막 났다 (차단 4건 → 보고 2.0, 4회차 C① 실측). 더 나쁜 것은 `--cycle` 은
+    1행, `--done` 은 2행이라 **두 종료 경로가 서로 다른 분모**를 만든 것이다 —
+    작업을 자주 끝내는 것이 지표를 좋게 만드는 가장 싼 방법이 됐다.
+
+    호출자를 세는 대신 여기서 못 박는다. 이미 있으면 그 행을 돌려준다.
+
+    `kind` 는 **회차를 어떻게 끝냈나**다. 둘 다 집계를 남기지만 뜻이 다르다:
+      · `cycle_close` — 끝냈다. 측정 창과 **회고 창** 둘 다 여기서 새로 연다.
+      · `cycle_adopt` — 버렸다(재연결). 측정 창만 새로 연다 — 회고는 이어받은
+        작업의 앞선 사실까지 덮어야 하므로(3회차) 창을 옮기면 안 된다.
+    한 종류로 뭉치면 둘 중 하나가 늘 틀린다. 실제로 그랬다: 종류를 합쳤더니
+    재연결 뒤 1회차 회고가 '못 찾음' 이 됐다(실측).
     """
+    cyc = cycle_of(con, lid)
+    tgt = "%s-%d" % (lid, cyc)
+    row = con.execute("SELECT detail FROM event WHERE target=? "
+                      "AND kind IN ('cycle_close','cycle_adopt')", (tgt,)).fetchone()
+    if row:
+        try:
+            return json.loads(row["detail"])
+        except ValueError:
+            return None
     c = cycle_counters(con, lid, cycle_window_start(con, lid))
-    c["cycle"] = cycle_of(con, lid)
-    record_event(con, lid, sid, "cycle_close", str(c["cycle"]),
-                 "%s-%d" % (lid, c["cycle"]), json.dumps(c, ensure_ascii=False))
+    c["cycle"] = cyc
+    record_event(con, lid, sid, kind, str(cyc), tgt,
+                 json.dumps(c, ensure_ascii=False))
     return c
 
 
@@ -1975,6 +2012,71 @@ BASH_OPAQUE = (
 )
 
 
+# 바닥값 경로의 **문자열 형태**. 글롭을 떼고 접두사만 남긴다.
+FLOOR_TEXT = tuple(sorted({p.rstrip("*").rstrip("/") for p in SELF_LOCK}, key=len))
+
+
+FLOOR_RE = re.compile("|".join(re.escape(p) for p in FLOOR_TEXT))
+# 경로 토큰의 **나머지**를 먼저 삼킨다. `FLOOR_TEXT` 는 짧은 것부터라
+# `.claude/harness/bin` 이 먼저 맞고, 그 뒤 `/harness` 가 남는다.
+WORD_RE = re.compile(r"""[^\s'"]*['"]?\s+([A-Za-z][\w-]*)(?:\s+([A-Za-z][\w-]*))?""")
+
+
+def _invocation(cmd, at):
+    """`at` 위치에서 이어지는 것이 **하네스 호출**인가.
+
+    `<래퍼> status`, `python3 <엔진> advance`, `sh -c '<래퍼> skip …'` 은 전부
+    실행이지 언급이 아니다. 토큰 위치로 가르려 했더니 `sh -c '<래퍼> advance'`
+    가 과잉 차단됐다(실측). "무엇이 하네스 호출인가" 의 답은 `ctrl_known` 이
+    이미 갖고 있다 — **답이 둘이면 갈린다.** 그 답을 다시 쓴다.
+    """
+    m = WORD_RE.match(cmd, at)
+    if not m:
+        return False
+    one, two = m.group(1), m.group(2)
+    return ctrl_known(one) or (bool(two) and ctrl_known("%s %s" % (one, two)))
+
+
+def floor_named(cfg, cmd):
+    """명령 **원문**이 바닥값을 이름으로 부르나. 그 이름 또는 None.
+
+    왜 원문인가. 토큰 분석은 셸이 하는 일을 다시 구현해야 하고, 4회차 리뷰가
+    그것을 세 방향에서 뚫었다 — 전부 실행까지 재현됐다:
+
+        cp evil "$(pwd)/.claude/harness/bin/harness" && <래퍼> status
+        cp evil $'.claude/harness/bin/harness'
+        python3 -c "open('.claude/harness/harness.db','w')"
+
+    셋 다 토큰으로는 경로가 아니다. 명령 치환·ANSI-C 인용·인터프리터 인라인
+    코드를 `sh_expand` 가 펼치지 않기 때문이다. 그런데 **문자열에는 그대로
+    들어 있다.** 확장을 하나씩 구현하는 길은 목록을 늘리는 길이고, 그 목록에는
+    항상 다음 항목이 남는다.
+
+    막지 않는다 — 하네스에 이미 있는 어휘로 **묻는다**. `bash_opaque` 와 같은
+    정책이고 이유도 같다: 모르면 통과가 아니라 물음이다. 바닥값을 이름으로
+    부르는 명령은 드물다. 드문 것을 사람이 한 번 보는 비용은 작다.
+
+    **실행은 언급이 아니다.** 래퍼를 부르는 것(`<래퍼> status`)과 엔진을 돌리는
+    것(`python3 <엔진> status`)은 정상 동작이라 세지 않는다.
+    """
+    for seg in BASH_SPLIT.split(cmd):
+        # 읽기는 막지 않는다 — `cat <DB>` 까지 물으면 마찰이고, 마찰은 게이트를 끈다.
+        # **엔진 기본값만** 면제한다. `readers` 설정으로는 이 면제를 넓힐 수 없다:
+        # 그 길을 열면 `readers: ["rsync"]` 한 줄로 바닥값이 다시 열린다(4회차 B#1).
+        # 리다이렉트가 붙으면 읽기가 아니다 (`cat x > <래퍼>`).
+        toks = re.findall(r"\S+", seg)
+        i = 0
+        while i < len(toks) and ASSIGN_RE.match(toks[i]):
+            i += 1
+        if (i < len(toks) and ">" not in seg
+                and os.path.basename(toks[i].strip("\"'")) in BASH_READERS_DEFAULT):
+            continue
+        for m in FLOOR_RE.finditer(seg):
+            if not _invocation(seg, m.end()):
+                return m.group(0)
+    return None
+
+
 def bash_opaque(cmd):
     """대상을 특정할 수 없는 파괴인가. 그 이유 또는 None."""
     for rex, why in BASH_OPAQUE:
@@ -2134,7 +2236,15 @@ def _target(root, tok, sure):
         for rel in rel_aliases(root, one):
             if rel == ".":
                 continue
-            if sure or os.path.lexists(os.path.join(root, rel)) or "/" in rel:
+            if sure or os.path.lexists(os.path.join(root, rel)):
+                return rel
+            # 없는 파일은 **추측**이다. `/` 하나로 경로라고 보면 URL 과 도커 태그가
+            # 쓰기 대상이 된다 — `curl … > /tmp/x.tgz` 가 "신규 최상위 폴더
+            # 'https:/'" 로 거부됐고, `docker build -t myorg/app:1.0 . > log` 도
+            # 같았다(4회차 B#13). 메시지가 엉뚱하면 사용자는 고장으로 보고 게이트를
+            # 끈다. **콜론이 든 자리는 경로 문법이 아니다** — 이름 목록이 아니라
+            # 문법이라 늘려야 할 다음 항목이 없다.
+            if "/" in rel and not any(":" in part for part in rel.split("/")):
                 return rel
     return None
 
@@ -2625,6 +2735,19 @@ def hook_pre_tool_use(inp, ctx):
             if decision:
                 return emit(pre_decision(decision, t(
                     "이 명령이 '%s' 를 바꾼다. %s") % (rel, reason)))
+
+        # 경로 분석이 놓쳤는데 **원문에는 바닥값이 보이는** 경우. 셸 확장을
+        # 하나씩 구현하는 대신 묻는다 — 근거는 `floor_named` 에 적었다.
+        named = floor_named(cfg, cmd)
+        if named:
+            with con:
+                record_event(con, lid, sid, "ask", "floor_named", named, cmd[:200])
+            return emit(pre_decision("ask", t(
+                "이 명령의 원문에 하네스 바닥값(%s)이 보이는데, 무엇을 대상으로 "
+                "삼는지 하네스가 특정하지 못했다. 셸 치환·인용·인터프리터 인라인 "
+                "코드가 섞이면 실행 시점에야 정해진다. 바닥값은 엔진과 상태이고 "
+                "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 경로를 그대로 "
+                "적으면 하네스가 대신 판정한다.") % named))
 
         # 대상을 특정할 수 없는 파괴는 **모른다고 말하고 넘긴다.** 막으면 정상 정리
         # 작업이 막히고, 통과시키면 구멍이다. 자세한 근거는 `BASH_OPAQUE` 에 적었다.
@@ -3878,7 +4001,7 @@ def _enter(ctx, dest_idx):
     """dest_idx 단계를 active 로. 범위를 넘으면 루프를 닫고 새 루프를 만든다."""
     con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
     if dest_idx >= len(cfg["stages"]):
-        close_loop(con, lid)
+        close_loop(con, cfg, lid)
         return create_loop(con, cfg, root), cfg["stages"][0]["id"], True
     sid = cfg["stages"][dest_idx]["id"]
     # **들어가는 쪽도 차지해야 한다.** 떠나는 쪽에만 claim 을 붙였더니, 대상 단계 행이
@@ -4560,8 +4683,10 @@ def _survival(con, cfg):
 
 def _cycle_rows(con):
     out = []
-    for r in con.execute("SELECT at, detail FROM event WHERE kind='cycle_close' "
-                         "ORDER BY id"):
+    # **버린 회차도 표본이다.** `cycle_close` 만 셌더니 `loop adopt` 한 줄로
+    # 마찰이 쌓인 회차를 표본에서 지울 수 있었다 (4회차 C③).
+    for r in con.execute("SELECT at, detail FROM event "
+                         "WHERE kind IN ('cycle_close','cycle_adopt') ORDER BY id"):
         try:
             d = json.loads(r["detail"] or "{}")
         except ValueError:
@@ -5109,19 +5234,19 @@ def _loop_adopt(ctx, argv, pos):
     existed = con.execute("SELECT cycle, closed_at FROM loop WHERE id=?",
                           (want,)).fetchone()
     with con:
-        close_loop(con, lid)
+        # **버리는 것도 끝내는 것이다 — 집계는 남는다.** 3회차에는 재연결이
+        # `cycle_close` 를 쓰면 회고 창까지 옮겨 가는 것이 문제라 아예 집계를
+        # 안 남겼는데, 그러면 마찰이 쌓인 회차를 `loop adopt` 한 줄로 표본에서
+        # 지울 수 있었다(4회차 C③). 두 리뷰가 각자 옳았다 — 뿌리는 `cycle_close`
+        # 가 **측정 창**과 **회고 창** 두 경계를 겸한 것이다. 종류를 갈라
+        # `cycle_adopt` 에 집계를 담는다: 측정 창은 옮기고 회고 창은 두고.
+        close_loop(con, cfg, lid, "cycle_adopt")
         if existed:
-            # 이어받는다. 회차를 올리고 **경계를 남긴다** — 측정 창이 이전
-            # 회차와 섞이지 않게. 그리고 다시 열린 작업이므로 closed_at 을 지운다.
+            # 이어받는다. 회차를 올리고 다시 열린 작업이므로 closed_at 을 지운다.
             new_cycle = (existed["cycle"] or 1) + 1
-            # **`cycle_close` 를 쓰지 않는다.** 그 종류는 두 가지로 소비된다 —
-            # 측정 창의 경계(cycle_window_start)와 회차 스냅샷(_cycle_rows 가
-            # detail 을 JSON 으로 파싱한다). 재연결은 회차 스냅샷이 아니므로
-            # 그 종류를 쓰면 이전 회차의 측정치가 창에서 빠지면서 기록되지도
-            # 않고, 사유가 JSON 처럼 생기면 가짜 회차로 집계된다 — 리뷰가
-            # 둘 다 찾았다. 접두사를 바꾸는 것이 목적이었으므로 측정은 건드리지
-            # 않는다. 별개 종류로 기록만 남긴다.
-            record_event(con, want, cfg["stages"][0]["id"], "cycle_adopt",
+            # 사유는 **집계와 다른 행**에 남긴다. 같은 행에 넣었더니 JSON 처럼
+            # 생긴 사유가 가짜 회차로 집계됐다(3회차).
+            record_event(con, want, cfg["stages"][0]["id"], "cycle_adopt_reason",
                          str(existed["cycle"] or 1),
                          "%s-%s" % (want, existed["cycle"] or 1),
                          argv_value(argv, "reason") or "")
