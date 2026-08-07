@@ -203,10 +203,13 @@ def main():
     nprobe = live_probe_count()
     for rel in DOCS:
         body = open(os.path.join(REPO, rel), encoding="utf-8").read()
-        for m in re.finditer(r"자기검사[:  ]\s*(\d+)/(\d+)", body):
-            if int(m.group(2)) != nprobe:
+        # 예시 출력은 `N/N` 으로 적는다 — 탐침을 하나 더할 때마다 문서를 고치게
+        # 만드는 마찰이고, 그 마찰이 "검사를 문서에 맞추는" 방향을 만든다.
+        # **숫자를 적었으면** 실제와 같아야 한다는 계약은 그대로 남긴다.
+        for m in re.finditer(r"자기검사[:  ]\s*\d+/(\d+)", body):
+            if int(m.group(1)) != nprobe:
                 bad.append("%s: `자기검사 …/%s` 인데 실제 탐침은 %d개다"
-                           % (rel, m.group(2), nprobe))
+                           % (rel, m.group(1), nprobe))
         for m in re.finditer(r"messages\.ko\.json`?,?\s*(\d+)개", body):
             if int(m.group(1)) != ncat:
                 bad.append("%s: 카탈로그를 %s개라 적었는데 실제는 %d개다"

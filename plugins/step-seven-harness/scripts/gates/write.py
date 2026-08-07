@@ -122,6 +122,12 @@ def register(h):
                      h._bind(bh, "perl -i -pe s/a/b/ " + h.ENGINE_REL), True),
                     # 셸 확장은 펼치지 않는다 — 원문에 보이면 묻는다. 이 탐침이
                     # 없으면 그 층이 자기증명 밖에 남는다(4회차 A·C②).
+                    # 하네스가 **펼치지 못하는** 셸 문법. 원문 매칭도 근사였다 —
+                    # 조립하면 원문에도 안 나타난다(5회차 A-C1·C③).
+                    (h.t("셸 확장이 섞이면 묻는다"),
+                     h._bind(bh, 'cp evil "$D/x"'), True),
+                    (h.t("인터프리터 인라인 코드는 묻는다"),
+                     h._bind(bh, 'python3 -c "open(\'src/a.py\',\'w\')"'), True),
                     (h.t("설정 정규식이 깨져도 막는다"),
                      h._bind(broken_re, "touch docs/probe.md", "selection"), True),
                     (h.t("셸 치환으로도 바닥값을 열 수 없다"),
@@ -154,6 +160,7 @@ def register(h):
                     (h.t("예외가 있으면 docs 에 쓸 수 있다"),
                      h._bind(wrg, "docs/spec/001-probe.md", "scaffolding"), False),
                     (h.t("접두사 붙인 산출물은 통과"), wr_prefixed, False),
+                    (h.t("변수를 써도 읽기는 통과"), h._bind(bh, 'git log "$REF"'), False),
                     (h.t("읽기는 통과"), h._bind(bh, "cat " + h.DB_REL), False),
                     (h.t("읽기 명령은 쓰기 대상을 만들지 않는다"),
                      h._bind(br, "grep -rn foo .claude/settings.json", "selection"), False)):

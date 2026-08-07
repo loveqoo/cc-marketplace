@@ -2306,6 +2306,60 @@ def floor_verdict(cfg, root, cmd):
     return ("ask", named) if named else (None, None)
 
 
+# 하네스가 **펼치지 못하는** 셸 문법. `sh_expand` 는 글롭만 편다.
+EXPAND_RE = re.compile(r"\$\(|`|\$\{|\$[A-Za-z_]|\$'")
+# 인터프리터에 코드를 인라인으로 넘기는 형태. 그 안은 셸 토큰이 아니다.
+INLINE_CODE_RE = re.compile(r"(?:^|\s)-(?:c|e|-eval)(?:\s|=|$)|<<\s*\w")
+
+
+def bash_unresolved(cfg, cmd):
+    """이 명령이 무엇을 쓸지 **내가 해석할 수 있나.** 못 하면 그 이유.
+
+    4회차에 원문 감시(`floor_named`)를 만들며 "확장을 하나씩 구현하는 길은
+    목록을 늘리는 길" 이라고 적었다. 맞았지만 **원문 매칭 자체가 또 하나의
+    근사**였다 — 5회차가 셋으로 뚫었고 전부 실행까지 재현됐다:
+
+        D=$(printf %s .claude/harness); python3 -c "open('$D/harness.db','w')"
+        cp evil "$(echo LmNsYXVkZS9oYXJuZXNz… | base64 -d)"
+        S=$(printf %s .claude/harness); ln -s "$S/bin/${B}ess" hh && ./hh auto-skip on
+
+    조립하면 원문에도 안 나타난다. 문자열을 더 잘 보려는 방향에는 끝이 없다.
+
+    그래서 묻는 것을 바꾼다. **"바닥값이 보이나" 가 아니라 "내가 이 세그먼트를
+    해석할 수 있나."** 못 하면 막지도 통과시키지도 않고 사람에게 넘긴다 —
+    `bash_opaque` 와 같은 정책이고, 이 저장소가 세 번 뚫린 이유가 전부
+    "모르면 통과" 였다.
+
+    범위를 좁게 잡는다. 읽기는 묻지 않고, 변경하지 않는 세그먼트도 묻지 않는다.
+    `git log --oneline "$REF"` 는 지나가고 `cp x "$D/y"` 는 묻는다.
+    """
+    mut = bash_mutator_re(cfg)
+    for seg in BASH_SPLIT.split(cmd):
+        toks = re.findall(r"\S+", seg)
+        i = 0
+        while i < len(toks) and ASSIGN_RE.match(toks[i]):
+            i += 1
+        if i >= len(toks):
+            # `VAR=$(...)` 만 있는 세그먼트. 대입 자체는 아무것도 안 쓴다.
+            continue
+        head = os.path.basename(toks[i].strip("\"'"))
+        if (benign_head(cfg, "interpreters", head, BASH_INTERPRETERS_DEFAULT)
+                and INLINE_CODE_RE.search(seg) and not ctrl_exec_seg(toks[i:])):
+            return t("인터프리터에 인라인으로 넘긴 코드는 하네스가 읽지 못한다")
+        if not mut.search(seg.strip()):
+            continue
+        if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) and ">" not in seg:
+            continue
+        if EXPAND_RE.search(seg):
+            return t("셸 확장이 섞여 무엇을 쓸지 실행 시점에야 정해진다")
+    return None
+
+
+def ctrl_exec_seg(toks):
+    """이 세그먼트가 **하네스를 실행**하나. 그러면 인라인 코드가 아니다."""
+    return any(os.path.basename(x.strip("\"'")) in CTRL_NAMES for x in toks[:2])
+
+
 def bash_opaque(cmd):
     """대상을 특정할 수 없는 파괴인가. 그 이유 또는 None."""
     for rex, why in BASH_OPAQUE:
@@ -2974,7 +3028,7 @@ def hook_pre_tool_use(inp, ctx):
 
         # 대상을 특정할 수 없는 파괴는 **모른다고 말하고 넘긴다.** 막으면 정상 정리
         # 작업이 막히고, 통과시키면 구멍이다. 자세한 근거는 `BASH_OPAQUE` 에 적었다.
-        why = bash_opaque(cmd)
+        why = bash_opaque(cmd) or bash_unresolved(cfg, cmd)
         if why:
             with con:
                 record_event(con, lid, sid, "ask", "opaque_write", "", cmd[:200])
