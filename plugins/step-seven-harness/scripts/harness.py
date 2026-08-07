@@ -3673,8 +3673,8 @@ def consent_probes():
     out = []
     for i, sub_name in enumerate(CONSENT_FLOOR):
         call = "%s %s" % ("<WRAP>", "%s %s" % (sub_name, CONSENT_ARGS.get(sub_name, "")))
-        out.append(("동의 게이트: %s (%s)" % (sub_name, ("그대로", "따옴표", "sh -c",
-                                                     "중첩 셸")[i % 4]),
+        shape = (t("그대로"), t("따옴표"), t("sh -c"), t("중첩 셸"))[i % 4]
+        out.append((t("동의 게이트: %s (%s)") % (sub_name, shape),
                     "consent", CONSENT_WRAPS[i % 4] % call.strip(), True, None))
     return out
 
