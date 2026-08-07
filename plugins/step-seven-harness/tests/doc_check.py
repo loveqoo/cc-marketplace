@@ -17,19 +17,33 @@
 import json
 import os
 import re
+import glob
 import sys
 
 REPO = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
                        else os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          "..", "..", ".."))
-DOCS = (
-    "plugins/step-seven-harness/skills/install/SKILL.md",
-    "plugins/step-seven-harness/skills/harness/SKILL.md",
-    "README.md",
-    "plugins/step-seven-harness/README.md",
-    "plugins/step-seven-harness/templates/POLICY.md",
-    "plugins/step-seven-harness/templates/rationale.md",
-)
+def _docs():
+    """검사할 문서를 **찾는다.** 손목록이면 새 문서가 조용히 미검사로 남는다.
+
+    실제로 그랬다: `skills/auto-skip-{on,off}/SKILL.md` 두 개가 목록에 없어서
+    `9/9 Nonexistent` 같은 단계 오타와 깨진 링크를 넣어도 rc=0 이었다(4회차
+    E-F10). `_msgs.engine_files` 가 엔진 파일 목록에서 같은 함정을 이미 고쳤는데
+    문서 목록은 그대로였다.
+    """
+    out = ["README.md"]
+    base = "plugins/step-seven-harness"
+    for pat in ("README.md", "skills/*/SKILL.md", "templates/*.md",
+                "commands/*.md", "docs/*.md"):
+        out += sorted(glob.glob(os.path.join(REPO, base, pat)))
+    got = [x if os.path.isabs(x) else os.path.join(REPO, x) for x in out]
+    got = [os.path.relpath(x, REPO) for x in got if os.path.isfile(x)]
+    if len(got) < 6:
+        raise SystemExit("문서를 %d개밖에 못 찾았다 — 발견이 죽었다" % len(got))
+    return tuple(dict.fromkeys(got))
+
+
+DOCS = _docs()
 LINK_RE = re.compile(r"\]\((?!https?:|mailto:)([^)#\s]+)")
 # 대소문자를 가리지 않는다. `[A-Z][a-z]+` 만 잡으면 `1/7 selectoin` 같은 오타가
 # regex 에 아예 안 걸려 조용히 통과했다 — 적대적 리뷰가 지적했다.
@@ -60,6 +74,29 @@ def stage_labels():
     cfg = json.load(open(os.path.join(REPO, STAGES_JSON), encoding="utf-8"))
     n = len(cfg["stages"])
     return {s["label"]: "%d/%d" % (i + 1, n) for i, s in enumerate(cfg["stages"])}
+
+
+PLUG = "plugins/step-seven-harness"
+
+
+def live_probe_count():
+    """살아 있는 엔진의 탐침 수. **문서에 적힌 수를 여기에 맞춘다.**
+
+    개수를 문서에 박고 검사하지 않으면 반드시 낡는다 — README 가 28/28 이라
+    적고 있을 때 실제는 34/34 였다(4회차 E-F11).
+    """
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp()
+    eng = os.path.join(REPO, PLUG, "scripts/harness.py")
+    subprocess.run(["git", "init", "-q", "."], cwd=d, check=True)
+    subprocess.run([sys.executable, eng, "init"], cwd=d, capture_output=True)
+    out = subprocess.run([sys.executable, eng, "status"], cwd=d,
+                         capture_output=True, text=True).stdout
+    m = re.search(r"자기검사[:  ]\s*(\d+)/(\d+)", out)
+    if not m:
+        raise SystemExit("살아 있는 엔진에서 탐침 수를 세지 못했다")
+    return int(m.group(2))
 
 
 def main():
@@ -122,7 +159,7 @@ def main():
     if off:
         bad.append("hooks.json 의 timeout %s 가 HOOK_TIMEOUT_S(%d) 와 다르다"
                    % (off, eng.HOOK_TIMEOUT_S))
-    # PreToolUse matcher 가 엔진이 판정하는 도구를 덮는가. 756개 검사는 훅 JSON 을
+    # PreToolUse matcher 가 엔진이 판정하는 도구를 덮는가. 스모크 검사는 훅 JSON 을
     # 엔진 stdin 에 직접 먹이므로 matcher 를 지나지 않는다 — 이 한 줄을 지워도
     # 스위트는 초록이고 실제로는 모든 게이트가 사라진다.
     pre = [e for grp, entries in hooks["hooks"].items() if grp == "PreToolUse"
@@ -153,6 +190,31 @@ def main():
     # 개수를 박지 않는다. "추출이 살아 있는가" 만 본다 — 0 이면 정규식이 죽은 것이다.
     if total_stages < 1:
         bad.append("단계 표기를 하나도 못 찾았다 — STAGE_RE 가 깨졌다")
+
+    # --- 문서가 적은 수가 실제와 같은가 -----------------------------------
+    # 4회차 E-F11: README 가 `자기검사: 28/28`(실제 34), `messages.ko.json, 470개`
+    # (실제 506), 버전 `0.46.1`(실제 0.58.0) 을 말하고 있었다. **파생할 수 있는
+    # 수만** 검사한다 — 파생할 수 없는 수(테스트 개수 등)는 애초에 산문에서 뺀다.
+    # 검사할 수 없는 수를 적으면 그 수는 반드시 낡는다.
+    ver = json.load(open(os.path.join(REPO, PLUG, ".claude-plugin/plugin.json"),
+                         encoding="utf-8"))["version"]
+    ncat = len(json.load(open(os.path.join(REPO, PLUG, "templates/messages.ko.json"),
+                              encoding="utf-8")))
+    nprobe = live_probe_count()
+    for rel in DOCS:
+        body = open(os.path.join(REPO, rel), encoding="utf-8").read()
+        for m in re.finditer(r"자기검사[:  ]\s*(\d+)/(\d+)", body):
+            if int(m.group(2)) != nprobe:
+                bad.append("%s: `자기검사 …/%s` 인데 실제 탐침은 %d개다"
+                           % (rel, m.group(2), nprobe))
+        for m in re.finditer(r"messages\.ko\.json`?,?\s*(\d+)개", body):
+            if int(m.group(1)) != ncat:
+                bad.append("%s: 카탈로그를 %s개라 적었는데 실제는 %d개다"
+                           % (rel, m.group(1), ncat))
+        for m in re.finditer(r"(\d+\.\d+\.\d+) 기준", body):
+            if m.group(1) != ver:
+                bad.append("%s: `%s 기준` 인데 plugin.json 은 %s 다"
+                           % (rel, m.group(1), ver))
 
     if bad:
         print("\n문제 %d건" % len(bad))
