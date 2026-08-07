@@ -5,6 +5,7 @@
 set -e
 
 ENGINE="$(cd "$(dirname "$0")/.." && pwd)/scripts/harness.py"
+export ENGINE_PATH="$ENGINE"
 # 리포 루트. **여기서 정의한다** — 예전에는 첫 사용(ctx_check)보다 170줄 뒤에
 # 정의돼 있어서 그때까지는 빈 문자열이었다. 빈 인자를 받은 검사기는 cwd 를 리포
 # 루트로 삼았으므로, **리포 루트에서 실행할 때만 우연히 통했다.** 다른 디렉터리에서
@@ -68,7 +69,17 @@ check_absent() { # check_absent <label> <must-not-appear> <actual>
 # 22개로 늘리자 드러났다. 대리 지표(정규식)를 버리고 값을 꺼내 비교한다.
 # 탐침이 몇 개여야 하는지 **엔진에서 세어 온다.** 파일에 박으면 탐침이 늘 때마다
 # 사람이 기대값을 고치게 되고, 그 습관이 진짜 회귀도 함께 고친다.
-SF_MIN=0
+#
+# 예전에는 이 주석만 있고 `SF_MIN=0` 이었다 — `total < 0` 은 영원히 거짓이라
+# **바닥이 죽어 있었다.** 탐침을 42개에서 10개로 줄여도 다섯 자리가 전부
+# 통과했다(4회차 E-F8). 주석이 코드보다 앞서 있으면 그 주석은 거짓말이다.
+# 게이트 수 × 2 는 자기증명 규칙의 하한이다(게이트마다 막는 탐침 + 통과 탐침).
+SF_MIN="$(python3 -c '
+import os, sys
+sys.path.insert(0, os.path.dirname(os.environ["ENGINE_PATH"]))
+import harness as h
+print(len(h.GATES) * 2)' 2>/dev/null || echo 0)"
+[ "${SF_MIN:-0}" -ge 2 ] || { echo "탐침 하한을 엔진에서 세지 못했다"; exit 1; }
 
 check_selftest() { # <label> <기대-실패수> <status 출력>
   local OUT
@@ -1092,6 +1103,29 @@ print("ok")
 PYFP
 )"
 rm -rf "$CW"
+
+echo "== 체인 뒤의 변경 명령도 같은 판정을 받는다"
+# `bash_writes` 는 세그먼트를 `mut.search(seg.strip())` 으로 본다. `.strip()` 을
+# 빼면 `BASH_SPLIT` 이 남긴 앞 공백 때문에 `^` 앵커가 안 맞아 **`&&`/`;` 뒤의
+# 변경 명령이 통째로 샌다.** 코드에는 그 사고가 주석으로 적혀 있는데 검사가
+# 없었다 — 변이를 심으니 41종 검사가 전부 초록이었다(4회차 E-F2).
+# 첫 세그먼트만 보는 검사는 이 회귀를 절대 못 잡는다. 뒤 세그먼트를 본다.
+CHW="$(mktemp -d)"
+(cd "$CHW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+chb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$CHW" "$1" \
+  | CLAUDE_PROJECT_DIR="$CHW" python3 "$ENGINE" hook; }
+for C in "true && touch src/a.py" \
+         "echo a; touch src/a.py" \
+         "cd . && mkdir -p src/newdir" \
+         "false || sed -i s/a/b/ .claude/settings.json"; do
+  check "체인 뒤도 막힌다: $C" '"permissionDecision": "deny"' "$(chb "$C")"
+done
+# 첫 세그먼트 형태도 계속 막혀야 한다 (한쪽만 고치는 것을 막는다)
+check "첫 세그먼트도 여전히 막힌다" '"permissionDecision": "deny"' \
+  "$(chb "touch src/a.py")"
+# 과잉 차단 반대편: 체인이어도 읽기는 지나간다
+check_empty "체인이어도 읽기는 지나간다" "$(chb "cd . && cat README.md")"
+rm -rf "$CHW"
 
 echo "== 동의 게이트: 훅과 CLI 가 같은 방식으로 subcommand 를 읽는다"
 GW="$(mktemp -d)"

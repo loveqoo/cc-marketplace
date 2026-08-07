@@ -1,6 +1,6 @@
 #!/bin/bash
 # init 이 **무엇을 잃지 않았는지** 차등 실행으로 확인한다.
-#   usage: sh init_diff.sh [repo-root]
+#   usage: bash init_diff.sh [repo-root]   (sh 로도 돈다)
 # 스모크 스위트에 넣지 않는다 — git 히스토리를 필요로 하고 8개 픽스처에
 # 엔진을 16번 돌려 느리다. 설치 경로를 건드릴 때 손으로 돌린다.
 #
@@ -27,6 +27,18 @@ for f in stages.json POLICY.md rationale.md; do
   git -C $REPO show 77d6065:plugins/step-six-harness/templates/$f > "$BASE/old/templates/$f"
 done
 OLD="$BASE/old/scripts/harness.py"
+# **추출이 죽으면 이 검사는 아무것도 증명하지 못한다.** 0바이트 엔진이 남으면
+# 옛 트리가 공집합이 되고 "옛 것 ⊆ 새 것" 이 자동으로 참이 된다 — 실제로
+# `.git` 밖에서 돌렸을 때 `보존 8 / 퇴행 0` 이 나왔다(4회차 E-F1). 바닥을 둔다.
+for f in "$OLD" "$BASE/old/templates/stages.json"; do
+  if [ ! -s "$f" ]; then
+    echo "기준 엔진을 꺼내지 못했다: $f" >&2
+    echo "  (git 저장소 안에서, 77d6065 커밋이 있는 상태로 돌려야 한다)" >&2
+    exit 1
+  fi
+done
+python3 -c "import ast,sys;ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$OLD" || {
+  echo "기준 엔진이 파이썬으로 읽히지 않는다: $OLD" >&2; exit 1; }
 
 # 현재 엔진도 같은 방식으로 격리한다 (실제 플러그인 트리를 쓰면 templates 가 다르다)
 mkdir -p "$BASE/new/scripts" "$BASE/new/templates"
@@ -64,18 +76,26 @@ SAME=0; DIFF=0
 for c in empty claude_md gitignore settings_dict settings_empty all anchor_in_prose settings_list; do
   A=$(mktemp -d)/p; B=$(mktemp -d)/p
   fixture "$A" $c; fixture "$B" $c
-  OA=$( (cd "$A" && python3 "$OLD" init) 2>&1 | norm ); RA=$?
-  OB=$( (cd "$B" && python3 "$NEWI" init) 2>&1 | norm ); RB=$?
+  T=$(mktemp -d)
+  # **파이프 뒤의 `$?` 는 파이프 마지막 명령의 것이다.** 여기서는 `norm`(sed)이라
+  # 엔진 종료 코드가 늘 0 으로 보였고, "종료 코드: 같아야 한다" 는 불변식이
+  # 한 번도 검사되지 않았다(4회차 E-F1). 먼저 받고 나중에 다듬는다.
+  (cd "$A" && python3 "$OLD" init) > "$T/raw_a" 2>&1; RA=$?
+  (cd "$B" && python3 "$NEWI" init) > "$T/raw_b" 2>&1; RB=$?
+  OA=$(norm < "$T/raw_a"); OB=$(norm < "$T/raw_b")
   # 재실행 멱등성도 같은 픽스처에서 확인
   OA2=$( (cd "$A" && python3 "$OLD" init) 2>&1 | norm )
   OB2=$( (cd "$B" && python3 "$NEWI" init) 2>&1 | norm )
-  T=$(mktemp -d)
   tree "$A" > "$T/ta"; tree "$B" > "$T/tb"
   # 옛 엔진이 만들었는데 새 엔진이 만들지 않은 파일. 이것만 실패다.
   LOST=$(comm -23 "$T/ta" "$T/tb")
   GAIN=$(comm -13 "$T/ta" "$T/tb")
   bodies "$A" > "$T/ba"; bodies "$B" > "$T/bb"
-  BLOST=$(comm -23 <(sort -u "$T/ba") <(sort -u "$T/bb"))
+  # 프로세스 치환(`<(...)`)은 bash 전용인데 머리말과 README 는 `sh` 로 돌리라고
+  # 적어 뒀다. 그래서 이 줄이 **여덟 픽스처 전부에서 구문 오류로 죽고** BLOST 가
+  # 빈 문자열이 됐다 — 머리말이 "진짜 사고" 라고 지목한 검사가 통째로 꺼져 있었다.
+  sort -u "$T/ba" > "$T/sa"; sort -u "$T/bb" > "$T/sb"
+  BLOST=$(comm -23 "$T/sa" "$T/sb")
   if [ -z "$LOST" ] && [ -z "$BLOST" ] && [ "$RA" = "$RB" ]; then
     echo "  보존   $c$([ -n "$GAIN" ] && printf ' (추가: %s)' "$(echo $GAIN)")"
     SAME=$((SAME+1))
