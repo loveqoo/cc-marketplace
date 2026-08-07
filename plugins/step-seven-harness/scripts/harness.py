@@ -2077,6 +2077,26 @@ def floor_named(cfg, cmd):
     return None
 
 
+def floor_verdict(cfg, root, cmd):
+    """Bash 명령이 바닥값을 건드리나. `(판정, 근거)` 또는 `(None, None)`.
+
+    **바닥값에 대한 답은 하나여야 한다.** 처음에는 원문 감시(`floor_named`)를
+    경로 분석(`bash_protected_hit`) **옆에** 붙였다. 그러면 같은 질문에 판정기가
+    둘이고, 둘 중 하나만 게이트의 `entry` 에 들어가 나머지는 자기증명 밖에 남는다
+    — ①에서 고친 바로 그 모양을 내가 다시 만든 것이다.
+
+    두 판정은 **확신의 차이**이지 다른 질문이 아니다:
+      · 경로를 특정했다  → `deny`  (대상이 분명하다)
+      · 원문에만 보인다  → `ask`   (셸 치환·인용·인라인 코드로 실행 시점에 정해진다)
+    하나로 묶으면 호출자도 하나, 탐침도 하나다.
+    """
+    hit = bash_protected_hit(cfg, root, cmd)
+    if hit:
+        return "deny", hit
+    named = floor_named(cfg, cmd)
+    return ("ask", named) if named else (None, None)
+
+
 def bash_opaque(cmd):
     """대상을 특정할 수 없는 파괴인가. 그 이유 또는 None."""
     for rex, why in BASH_OPAQUE:
@@ -2679,8 +2699,8 @@ def hook_pre_tool_use(inp, ctx):
         # 하네스 자신을 Bash 로 건드리는 것을 먼저 막는다. 제어 명령 판정보다
         # 앞이어야 한다 — `rm <엔진> && harness status` 처럼 뒤에 제어 명령을
         # 붙이면 그 앞의 파괴가 검사 없이 통과했다.
-        hit = bash_protected_hit(cfg, root, cmd)
-        if hit:
+        decision, hit = floor_verdict(cfg, root, cmd)
+        if decision == "deny":
             with con:
                 record_event(con, lid, sid, "block", "protected_bash", hit, cmd[:200])
             return emit(pre_decision("deny", (
@@ -2688,6 +2708,15 @@ def hook_pre_tool_use(inp, ctx):
                 "`.claude/harness/stages.json` 을, 엔진을 바꾸려면 플러그인을 "
                 "수정하라. 내용을 보려면 Read 도구를 쓰라. "
                 "이 차단은 `allow` 로도 열리지 않는다.") % hit)))
+        if decision == "ask":
+            with con:
+                record_event(con, lid, sid, "ask", "floor_named", hit, cmd[:200])
+            return emit(pre_decision("ask", t(
+                "이 명령의 원문에 하네스 바닥값(%s)이 보이는데, 무엇을 대상으로 "
+                "삼는지 하네스가 특정하지 못했다. 셸 치환·인용·인터프리터 인라인 "
+                "코드가 섞이면 실행 시점에야 정해진다. 바닥값은 엔진과 상태이고 "
+                "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 경로를 그대로 "
+                "적으면 하네스가 대신 판정한다.") % hit))
 
         # 래퍼는 사전 승인돼 있으므로 **내용이 우리 것일 때만** 실행돼야 한다.
         # 이 검사를 모든 Bash 앞에 두는 이유: 변조는 앞선 호출에서 이미 끝나 있고,
@@ -2735,19 +2764,6 @@ def hook_pre_tool_use(inp, ctx):
             if decision:
                 return emit(pre_decision(decision, t(
                     "이 명령이 '%s' 를 바꾼다. %s") % (rel, reason)))
-
-        # 경로 분석이 놓쳤는데 **원문에는 바닥값이 보이는** 경우. 셸 확장을
-        # 하나씩 구현하는 대신 묻는다 — 근거는 `floor_named` 에 적었다.
-        named = floor_named(cfg, cmd)
-        if named:
-            with con:
-                record_event(con, lid, sid, "ask", "floor_named", named, cmd[:200])
-            return emit(pre_decision("ask", t(
-                "이 명령의 원문에 하네스 바닥값(%s)이 보이는데, 무엇을 대상으로 "
-                "삼는지 하네스가 특정하지 못했다. 셸 치환·인용·인터프리터 인라인 "
-                "코드가 섞이면 실행 시점에야 정해진다. 바닥값은 엔진과 상태이고 "
-                "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 경로를 그대로 "
-                "적으면 하네스가 대신 판정한다.") % named))
 
         # 대상을 특정할 수 없는 파괴는 **모른다고 말하고 넘긴다.** 막으면 정상 정리
         # 작업이 막히고, 통과시키면 구멍이다. 자세한 근거는 `BASH_OPAQUE` 에 적었다.

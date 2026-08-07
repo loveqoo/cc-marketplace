@@ -497,6 +497,21 @@ ck("readers 설정은 원문 감시 면제를 넓히지 못한다",
 ck("리다이렉트가 붙으면 읽기가 아니다",
    h.floor_named(cfg, "cat /tmp/evil > .claude/harness/bin/harness"))
 
+# **바닥값 판정은 하나다.** 원문 감시를 경로 분석 옆에 따로 두면 같은 질문에
+# 판정기가 둘이고, 하나만 게이트의 `entry` 에 들어가 나머지가 자기증명 밖에
+# 남는다 — ①에서 고친 모양을 그대로 다시 만드는 것이다.
+ck("경로를 특정하면 deny", h.floor_verdict(cfg, root, "rm " + h.ENGINE_REL)[0] == "deny")
+ck("원문에만 보이면 ask",
+   h.floor_verdict(cfg, root, 'cp evil "$(pwd)/.claude/harness/bin/harness"')[0] == "ask")
+ck("아무것도 아니면 판정 없음",
+   h.floor_verdict(cfg, root, "git add -A")[0] is None)
+_src = inspect.getsource(h)
+_calls = (_src.count("floor_verdict(cfg, root, cmd)")
+          - _src.count("def floor_verdict(cfg, root, cmd)"))
+ck("훅은 바닥값을 한 곳에서만 묻는다", _calls == 1, _calls)
+ck("옆에 남은 판정기가 없다",
+   _src.count("floor_named(cfg, cmd)") - _src.count("def floor_named(cfg, cmd)") == 1)
+
 # --- 자기증명 규칙 자체 ---------------------------------------------------
 # 4회차: 이 강제 장치에 테스트가 없어서, `wants != {True, False}` 를 `if False:`
 # 로 바꿔도 41종 검사가 전부 초록이었다. 그리고 그 규칙은 애초에 공허했다 —

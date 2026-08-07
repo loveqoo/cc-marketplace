@@ -27,7 +27,7 @@ def register(h):
         # 훅이 지나는 문 셋. 예전 탐침은 `floor_hit` + `_first_violation` 을
         # 직접 불렀다 — `check_write` 보다 한 층 아래다. 그래서 `check_write`
         # 본문을 통째로 비워도 `쓰기 규칙 7/7` 이 그대로였다(4회차 D-C1).
-        entry = ("check_write", "bash_protected_hit", "bash_writes")
+        entry = ("check_write", "floor_verdict", "bash_writes")
 
         @property
         def name(self):
@@ -66,8 +66,10 @@ def register(h):
                 return bool(decision), (why or "")
 
             def bh(cmd):
-                hit = h.bash_protected_hit(cfg, root, cmd)
-                return bool(hit), (hit or "")
+                """바닥값 판정은 **하나**다 — 경로를 특정하면 deny, 원문에만
+                보이면 ask. 둘을 따로 두면 탐침이 한쪽만 덮는다."""
+                decision, hit = h.floor_verdict(cfg, root, cmd)
+                return bool(decision), ("%s(%s)" % (decision, hit) if decision else "")
 
             def br(cmd, at=None):
                 """Bash 경로도 훅과 같다 — `bash_writes` 로 대상을 뽑아 `check_write`."""
@@ -99,6 +101,13 @@ def register(h):
                     # 이름을 더 넣는 대신 **결과를 탐침한다.**
                     (h.t("읽기 선언으로 바닥값을 열 수 없다"),
                      h._bind(bh, "perl -i -pe s/a/b/ " + h.ENGINE_REL), True),
+                    # 셸 확장은 펼치지 않는다 — 원문에 보이면 묻는다. 이 탐침이
+                    # 없으면 그 층이 자기증명 밖에 남는다(4회차 A·C②).
+                    (h.t("셸 치환으로도 바닥값을 열 수 없다"),
+                     h._bind(bh, 'cp evil "$(pwd)/' + h.WRAPPER_CMD + '"'), True),
+                    (h.t("인터프리터 인라인 코드도 마찬가지"),
+                     h._bind(bh, 'python3 -c "open(\'' + h.DB_REL.replace(os.sep, "/")
+                             + '\',\'w\')"'), True),
                     # 클래스를 지우는 것은 규칙을 지우는 게 아니라 그 경로를 가장 넓은
                     # 클래스로 **옮기는** 것이다 — `context` 를 비우면 훅·CLAUDE.md·
                     # stages.json 이 한꺼번에 열린다.
