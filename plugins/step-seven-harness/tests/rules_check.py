@@ -428,6 +428,37 @@ finally:
     os.chmod(wp, 0o755)
 ck("쓸 수 있게 되면 복구한다", h.wrapper_intact(root) is False)
 
+# --- 서브명령 표 ---------------------------------------------------------
+# 표로 옮기기 전에는 `harness loop inetnt "작업 내용"` 이 rc=0 으로 조용히
+# `show` 를 했다 — 사용자는 기록됐다고 믿는다. 표가 모르는 이름을 알아본다.
+print("== 서브명령은 표에서 찾는다 (모르는 이름은 조용히 떨어지지 않는다)")
+for name, table in (("loop", h.LOOP_SUBS), ("auto-skip", h.AUTO_SKIP_SUBS)):
+    ck("%s 표가 비어 있지 않다" % name, bool(table), str(sorted(table)))
+    try:
+        h.dispatch(table, name, "no-such-sub")
+        ck("%s 는 모르는 서브명령을 거절한다" % name, False, "거절하지 않았다")
+    except h.Refuse as exc:
+        ck("%s 는 모르는 서브명령을 거절한다" % name, exc.code == 2)
+        ck("  가능한 이름을 알려준다" % (),
+           all(k in " ".join(exc.lines) for k in table))
+
+# `CTRL_SUB2` 는 **동의가 필요한** loop 서브명령이다. 이름이 표와 어긋나면
+# 그 서브명령에 동의 게이트가 조용히 안 걸린다 — 게이트 제거다.
+ck("동의 대상 loop 서브명령이 전부 표에 있다",
+   set(h.CTRL_SUB2.get("loop", ())) <= set(h.LOOP_SUBS),
+   str(set(h.CTRL_SUB2.get("loop", ())) - set(h.LOOP_SUBS)))
+
+# Refuse 는 값이 아니라 예외다 — 호출자가 버릴 수 없다는 것이 존재 이유다.
+ck("Refuse 는 Exception 이다", issubclass(h.Refuse, Exception))
+ck("Refuse 는 빈 줄을 버린다", h.Refuse("a", "", "b").lines == ["a", "b"])
+ck("Refuse 는 기본 종료 코드 2", h.Refuse("a").code == 2)
+ck("Refuse 는 코드를 받는다", h.Refuse("a", code=1).code == 1)
+try:
+    h.Refuse("a", cod=1)
+    ck("Refuse 는 오타 키워드를 삼키지 않는다", False, "삼켰다")
+except TypeError:
+    ck("Refuse 는 오타 키워드를 삼키지 않는다", True)
+
 print("\n실패 %d개: %s" % (len(FAILS), FAILS or "없음"))
 con.close()
 cleanup(root)

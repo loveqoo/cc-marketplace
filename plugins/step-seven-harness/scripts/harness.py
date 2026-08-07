@@ -377,6 +377,62 @@ class Ctx(object):
         self.lid, self.sid = lid, sid
 
 
+class Refuse(Exception):
+    """CLI 가 거절한다. **설명과 종료 코드를 함께 들고 나간다.**
+
+    예전에는 `print(설명)` 과 `return 코드` 가 두 문장이었다. 둘을 잇는 것은
+    규약이고, 규약은 지켜지지 않는다 — 하나를 빼먹으면 검사가 조용히 통과한다.
+
+    **값으로 돌려주지 않는 이유:** Result 를 돌려주면 호출자가 그것을 버릴 수
+    있고, 버려진 거절은 통과와 구분되지 않는다. 파이썬에는 "이 반환값을 반드시
+    써라"를 강제할 방법이 없다. **무시할 수 없는 것은 예외뿐이다.**
+    """
+
+    def __init__(self, *lines, **kw):
+        super(Refuse, self).__init__(lines[0] if lines else "")
+        self.lines = [ln for ln in lines if ln]
+        self.code = kw.pop("code", 2)
+        if kw:
+            raise TypeError("Refuse: %s" % ", ".join(sorted(kw)))
+
+
+def sub_table():
+    """`<명령> <서브명령>` 표 하나와 그 등록 데코레이터를 만든다.
+
+    두 명령이 각자 if 체인으로 dispatch 를 다시 쓰면 **답이 갈린다.** 실제로
+    갈려 있었다 — 모르는 이름에 `loop` 는 rc=0 으로 조용히 `show` 를 했고
+    `auto-skip` 은 rc=2 로 거절했다. 같은 종류에는 답이 하나여야 한다.
+    """
+    table = {}
+
+    def register(name):
+        def deco(fn):
+            table[name] = fn
+            return fn
+        return deco
+
+    return table, register
+
+
+LOOP_SUBS, loop_sub = sub_table()
+AUTO_SKIP_SUBS, auto_skip_sub = sub_table()
+
+
+def dispatch(table, cmd, sub):
+    """서브명령을 표에서 찾는다. **없으면 거절한다.**
+
+    `if sub == "new": ... if sub == "intent": ...` 은 dispatch 를 손으로 다시
+    쓴 것이다. 손으로 쓰면 빠진 가지가 조용히 마지막 기본값으로 떨어진다 —
+    `harness loop inetnt "작업 내용"` 이 **rc=0 으로 아무 일도 하지 않았다.**
+    사용자는 기록됐다고 믿는다. 표는 모르는 이름을 알아본다.
+    """
+    fn = table.get(sub)
+    if fn is None:
+        raise Refuse(t("알 수 없는 %s 서브명령: %s") % (cmd, sub),
+                     t("가능: %s") % " | ".join(sorted(table)))
+    return fn
+
+
 def load_config(root, plugin_root_dir=None):
     """프로젝트의 stages.json. 없는 **최상위 영역만** 템플릿에서 채운다.
 
@@ -3866,21 +3922,18 @@ def cli_advance(ctx, argv):
     want_cycle = "--cycle" in argv
 
     if sid != last and (want_done or want_cycle):
-        print(t("--done / --cycle 은 마지막 단계(%s)에서만 쓴다.")
-              % stage_obj(cfg, last)["label"])
-        return 2
+        raise Refuse(t("--done / --cycle 은 마지막 단계(%s)에서만 쓴다.")
+                     % stage_obj(cfg, last)["label"], code=2)
     if sid == last:
         if want_done and want_cycle:
-            print(t("--done 과 --cycle 은 함께 쓸 수 없다."))
-            return 2
+            raise Refuse(t("--done 과 --cycle 은 함께 쓸 수 없다."), code=2)
         if not (want_done or want_cycle):
-            print(t("%s 단계에서는 두 갈래 중 하나를 골라야 한다. 스스로 판단하라:")
-                  % stage_obj(cfg, last)["label"])
-            print(t("  harness advance --done    작업이 끝났다 → %s (새 작업 선정)")
-                  % stage_obj(cfg, cfg["stages"][0]["id"])["label"])
-            print(t("  harness advance --cycle   후속 회차가 남았다 → %s (같은 작업 유지)")
-                  % stage_obj(cfg, cfg["stages"][1]["id"])["label"])
-            return 1
+            raise Refuse(t("%s 단계에서는 두 갈래 중 하나를 골라야 한다. 스스로 판단하라:")
+                         % stage_obj(cfg, last)["label"],
+                         t("  harness advance --done    작업이 끝났다 → %s (새 작업 선정)")
+                         % stage_obj(cfg, cfg["stages"][0]["id"])["label"],
+                         t("  harness advance --cycle   후속 회차가 남았다 → %s (같은 작업 유지)")
+                         % stage_obj(cfg, cfg["stages"][1]["id"])["label"], code=1)
 
     missing = exit_blockers(con, cfg, root, lid, sid)
     if missing:
@@ -3919,10 +3972,9 @@ def cli_advance(ctx, argv):
         if not claim(con, "UPDATE stage SET status='done', left_at=? "
                           "WHERE loop_id=? AND stage=? AND status='active'",
                      (now(), lid, sid)):
-            print(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
-                    "`harness status` 로 현재 단계를 확인하라.")
-                  % stage_obj(cfg, sid)["label"])
-            return 1
+            raise Refuse(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
+                           "`harness status` 로 현재 단계를 확인하라.")
+                         % stage_obj(cfg, sid)["label"], code=1)
         # 회차 경계에서만 스냅샷을 남긴다. close_loop 이 stage 를 지우기 전에.
         if sid == last:
             snap = record_cycle_close(con, cfg, lid, sid)
@@ -3975,14 +4027,12 @@ def cli_skip(ctx, argv):
     target = pos[0] if pos else None
     reason = argv_value(argv, "reason")
     if not target or not reason:
-        print(t("사용법: harness skip <stage-id|+N|until:<stage-id>> --reason \"...\""))
-        return 2
+        raise Refuse(t("사용법: harness skip <stage-id|+N|until:<stage-id>> --reason \"...\""), code=2)
     # 훅과 **같은 함수**로 판정한다. 훅이 이미 막았으므로 보통 여기 오지 않지만,
     # 셸 간접 호출로 훅을 우회해 들어온 경우에도 같은 답을 내야 한다.
     why = skip_block_reason(cfg, sid, target, con, root, lid)
     if why:
-        print(why)
-        return 1
+        raise Refuse(why, code=1)
     ids = stage_ids(cfg)
     cur = stage_index(cfg, sid)
     if target.startswith("+"):
@@ -4002,10 +4052,9 @@ def cli_skip(ctx, argv):
             # 디스크에 있는데도 "계획 파일을 남겨야 한다"고 거부한다 — 이미 한 일을
             # 하라는 말이고, 사용자는 빠져나갈 길이 없다. 실제로 그렇게 막혔다.
             if not criterion_met(con, cfg, root, lid, key):
-                print(t("%s 를 건너뛰더라도 기록은 남겨야 한다: %s")
-                      % (st["label"], criterion_why(con, cfg, root, lid, key)))
-                print(t("먼저 그 기록을 남긴 뒤 다시 시도하라. 승인만 면제된다."))
-                return 1
+                raise Refuse(t("%s 를 건너뛰더라도 기록은 남겨야 한다: %s")
+                             % (st["label"], criterion_why(con, cfg, root, lid, key)),
+                             t("먼저 그 기록을 남긴 뒤 다시 시도하라. 승인만 면제된다."), code=1)
 
     # 자동 승인으로 통과한 스킵은 사람이 승인한 것과 구분해 기록한다
     by = "auto" if auto_skip_on(con) else "user"
@@ -4025,10 +4074,9 @@ def cli_skip(ctx, argv):
                              "WHERE loop_id=? AND stage=? AND status='active'",
                         (now(), lid, sid))
         if not won:
-            print(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
-                    "`harness status` 로 현재 단계를 확인하라.")
-                  % stage_obj(cfg, sid)["label"])
-            return 1
+            raise Refuse(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
+                           "`harness status` 로 현재 단계를 확인하라.")
+                         % stage_obj(cfg, sid)["label"], code=1)
         for i in range(cur + 1, dest + 1):
             con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
                         "authorized_by=? WHERE loop_id=? AND stage=?",
@@ -4079,41 +4127,34 @@ def cli_verify(ctx, argv):
     con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     cmd = " ".join(argv[argv.index("--") + 1:]).strip() if "--" in argv else ""
     if not cmd:
-        print(t("사용법: harness verify -- <검증 명령>"))
-        print(t("  예: harness verify -- pytest tests/"))
-        return 2
+        raise Refuse(t("사용법: harness verify -- <검증 명령>"),
+                     t("  예: harness verify -- pytest tests/"), code=2)
     stages = evidence_stages(cfg)
     if sid not in stages:
-        print(t("verify 는 %s 단계에서 쓴다 (현재 %s).")
-              % (", ".join(stages), label_of(cfg, sid)))
-        return 2
+        raise Refuse(t("verify 는 %s 단계에서 쓴다 (현재 %s).")
+                     % (", ".join(stages), label_of(cfg, sid)), code=2)
     if set(cmd) & SHELL_META:
-        print(t("셸 메타문자가 있는 명령은 거부한다 — 검증 명령 하나만 넘겨라."))
-        return 2
+        raise Refuse(t("셸 메타문자가 있는 명령은 거부한다 — 검증 명령 하나만 넘겨라."), code=2)
     # 관측 경로와 **같은 판정**을 쓴다. 두 곳이 갈리면 `verify` 로는 되는데 그냥
     # 돌리면 안 되는(또는 그 반대) 일이 생긴다.
     # 패턴이 없으면 검사를 건너뛰었다 — 그 순간 이 명령은 게이트를 지나는 **셸**이
     # 된다. 없으면 거부한다. 무엇이 검증인지 모르면 아무것도 돌리지 않는 것이 맞다.
     if not cfg.at("criteria.verification_evidence.bash_pattern"):
-        print(t("`criteria.verification_evidence.bash_pattern` 이 없다 — 무엇이 검증인지 "
-                "정해지지 않았으므로 아무것도 실행하지 않는다."))
-        return 2
+        raise Refuse(t("`criteria.verification_evidence.bash_pattern` 이 없다 — 무엇이 검증인지 "
+                       "정해지지 않았으므로 아무것도 실행하지 않는다."), code=2)
     if not verification_hit(cfg, cmd):
-        print(t("검증 명령으로 보이지 않는다: %s") % cmd)
-        print(t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."))
-        return 2
+        raise Refuse(t("검증 명령으로 보이지 않는다: %s") % cmd,
+                     t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."), code=2)
     try:
         rc = subprocess.call(shlex.split(cmd), cwd=root)
     except OSError as e:
-        print(t("실행할 수 없다: %s") % e)
-        return 2
+        raise Refuse(t("실행할 수 없다: %s") % e, code=2)
     if rc != 0:
         # 실패도 사실이므로 적립한다. 증거로는 세지 않는다.
         with con:
             record_event(con, lid, sid, "tool_fail", "verify", norm_cmd(cmd),
                          "exit %d" % rc)
-        print(t("\n검증 실패 (exit %d) — 증거로 기록하지 않았다. 고치고 다시 돌려라.") % rc)
-        return 1
+        raise Refuse(t("\n검증 실패 (exit %d) — 증거로 기록하지 않았다. 고치고 다시 돌려라.") % rc, code=1)
     with con:
         record_evidence(con, lid, sid, "verification_evidence",
                         ("verify: " + cmd)[:120])
@@ -4128,8 +4169,7 @@ def cli_allow(ctx, argv):
     reason = argv_value(argv, "reason")
     uses = argv_value(argv, "uses")
     if not glob or not reason:
-        print(t("사용법: harness allow <glob> --reason \"...\" [--uses N]"))
-        return 2
+        raise Refuse(t("사용법: harness allow <glob> --reason \"...\" [--uses N]"), code=2)
     with con:
         con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
                     "VALUES(?,?,?,?,?)",
@@ -4146,12 +4186,10 @@ def cli_approve_plan(ctx, argv):
     pos = argv_positional(argv)
     path = pos[0] if pos else None
     if not path:
-        print(t("사용법: harness approve-plan <plan-file>"))
-        return 2
+        raise Refuse(t("사용법: harness approve-plan <plan-file>"), code=2)
     rel = rel_to_root(root, path)
     if not rel or not os.path.isfile(os.path.join(root, rel)):
-        print(t("계획 파일을 찾을 수 없다: %s") % path)
-        return 2
+        raise Refuse(t("계획 파일을 찾을 수 없다: %s") % path, code=2)
     # 승인 대상은 **이 회차의 계획 파일**이어야 한다. 예전에는 아무 파일이나 받아서
     # `README.md` 를 승인하면 `plan_file` 게이트까지 함께 열렸고, 지난 회차의 계획서로도
     # 열렸다. 판정은 `fs_evidence` 가 이미 하고 있으므로 그 규칙을 그대로 쓴다.
@@ -4159,17 +4197,15 @@ def cli_approve_plan(ctx, argv):
     pre = file_prefix(con, lid)
     if want and not (any(glob_match(rel, g) for g in want)
                      and os.path.basename(rel).startswith(pre)):
-        print(t("계획 파일이 아니다: %s") % rel)
-        print(t("이 회차의 계획은 %s 아래에 `%s` 로 시작하는 이름이어야 한다.")
-              % (", ".join(want), pre))
-        return 2
+        raise Refuse(t("계획 파일이 아니다: %s") % rel,
+                     t("이 회차의 계획은 %s 아래에 `%s` 로 시작하는 이름이어야 한다.")
+                     % (", ".join(want), pre), code=2)
     if evidence_digest(root, rel) is None:
         # 지문을 못 구하면 그 승인은 **만료될 수 없다.** `chmod 000` 한 번으로 승인 후
         # 계획을 통째로 갈아치울 수 있었다. 읽을 수 없으면 승인하지 않는다.
-        print(t("계획 파일을 읽을 수 없어 승인할 수 없다: %s") % rel)
-        print(t("읽을 수 있게 한 뒤 다시 시도하라 — 승인은 그 시점의 내용에 대한 것이라 "
-                "내용을 확인할 수 없으면 기록이 거짓이 된다."))
-        return 2
+        raise Refuse(t("계획 파일을 읽을 수 없어 승인할 수 없다: %s") % rel,
+                     t("읽을 수 있게 한 뒤 다시 시도하라 — 승인은 그 시점의 내용에 대한 것이라 "
+                       "내용을 확인할 수 없으면 기록이 거짓이 된다."), code=2)
     with con:
         record_evidence(con, lid, sid, "plan_file", rel, root)
         record_evidence(con, lid, sid, "plan_approved", rel, root)
@@ -4605,25 +4641,21 @@ def cli_promote(ctx, argv):
     key = pos[0]
     known = {it["key"] for it in repeated_items(con, cfg)}
     if key not in known:
-        print(t("반복 항목이 아니다: %s") % key)
-        print(t("`harness promote` 로 목록을 확인하라 (키는 'block:<규칙>' 또는 "
-              "'tool_fail:<명령>' 형식이다)."))
-        return 2
+        raise Refuse(t("반복 항목이 아니다: %s") % key,
+                     t("`harness promote` 로 목록을 확인하라 (키는 'block:<규칙>' 또는 "
+                     "'tool_fail:<명령>' 형식이다)."), code=2)
     if decline:
         as_kind = "declined"
     if not as_kind:
-        print(t("무엇으로 승격할지 골라야 한다: --as %s, 또는 --decline.")
-              % "|".join(k for k in promote_as(cfg) if k != "declined"))
-        return 2
+        raise Refuse(t("무엇으로 승격할지 골라야 한다: --as %s, 또는 --decline.")
+                     % "|".join(k for k in promote_as(cfg) if k != "declined"), code=2)
     if as_kind not in promote_as(cfg):
-        print(t("알 수 없는 승격 종류: %s (가능: %s)")
-              % (as_kind, ", ".join(promote_as(cfg))))
-        return 2
+        raise Refuse(t("알 수 없는 승격 종류: %s (가능: %s)")
+                     % (as_kind, ", ".join(promote_as(cfg))), code=2)
     if not note:
-        print(t("사유/내용이 필요하다: %s")
-              % (t("--reason \"왜 승격하지 않는가\"") if as_kind == "declined"
-                 else t("--note \"무엇을 어떻게 바꿨는가\"")))
-        return 2
+        raise Refuse(t("사유/내용이 필요하다: %s")
+                     % (t("--reason \"왜 승격하지 않는가\"") if as_kind == "declined"
+                        else t("--note \"무엇을 어떻게 바꿨는가\"")), code=2)
 
     if as_kind == "rule":
         used = len(learned_lines(con, cfg))
@@ -4631,11 +4663,10 @@ def cli_promote(ctx, argv):
                                (key,)).fetchone()
         grows = not (existing and existing["decision"] == "rule")
         if grows and used >= learned_budget(cfg):
-            print(t("LEARNED.md 예산이 찼다 (%d/%d줄). 항상 로드되는 문서라 상한이 있다.")
-                  % (used, learned_budget(cfg)))
-            print(t("먼저 한 줄을 비워라: `harness promote <기존키> --decline "
-                  "--reason \"...\"` (`harness tidy` 로 목록 확인)"))
-            return 1
+            raise Refuse(t("LEARNED.md 예산이 찼다 (%d/%d줄). 항상 로드되는 문서라 상한이 있다.")
+                         % (used, learned_budget(cfg)),
+                         t("먼저 한 줄을 비워라: `harness promote <기존키> --decline "
+                         "--reason \"...\"` (`harness tidy` 로 목록 확인)"), code=1)
 
     kind = key.split(":", 1)[0]
     # 보류의 성숙도는 'declined' 다. established 로 두면 "확립된 규칙"과 구분되지 않는다.
@@ -4834,174 +4865,194 @@ def cli_stats(ctx, argv):
     return 0
 
 
+@auto_skip_sub("off")
+def _as_off(ctx, argv, pos):
+    con = ctx.con
+    with con:
+        set_meta(con, "auto_skip", "off")
+        set_meta(con, "auto_skip_uses", "")
+        set_meta(con, "auto_skip_loop", "")
+        set_meta(con, "auto_skip_off_at", now())
+    print(t("스킵 자동 승인 OFF — 이제 모든 스킵이 사용자 동의를 요구한다."))
+    return 0
+
+
+@auto_skip_sub("on")
+def _as_on(ctx, argv, pos):
+    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
+    reason = argv_value(argv, "reason")
+    uses = argv_value(argv, "uses")
+    scope = argv_value(argv, "scope") or "project"
+    if not reason:
+        raise Refuse(t("사용법: harness auto-skip on --reason \"...\" "
+                     "[--uses N] [--scope loop|project]"), code=2)
+    if scope not in ("loop", "project"):
+        raise Refuse(t("--scope 는 loop 또는 project 여야 한다."), code=2)
+    if uses is not None:
+        try:
+            if int(uses) < 1:
+                raise ValueError
+        except ValueError:
+            raise Refuse(t("--uses 는 1 이상의 정수여야 한다."), code=2)
+    with con:
+        set_meta(con, "auto_skip", "on")
+        set_meta(con, "auto_skip_reason", reason)
+        set_meta(con, "auto_skip_at", now())
+        set_meta(con, "auto_skip_uses", str(int(uses)) if uses else "")
+        set_meta(con, "auto_skip_loop", lid if scope == "loop" else "")
+    print(t("스킵 자동 승인 ON%s — 사유: %s")
+          % (t(" (사용자 승인)") if "auto-skip" in consent_map(cfg) else "", reason))
+    print(t("범위: %s") % auto_skip_scope_note(con))
+    print(t("사유는 계속 필수이고 기록에는 authorized_by=auto 로 남는다. "
+          "끄려면 `harness auto-skip off`."))
+
+
+@auto_skip_sub("status")
+def _as_status(ctx, argv, pos):
+    con = ctx.con
+    active, expired = auto_skip_state(con)
+    if active:
+        print(t("스킵 자동 승인: ON (since %s) — 사유: %s")
+              % (get_meta(con, "auto_skip_at", "-"),
+                 get_meta(con, "auto_skip_reason", "-")))
+        print(t("  범위: %s") % auto_skip_scope_note(con))
+    else:
+        print(t("스킵 자동 승인: OFF — 모든 스킵이 사용자 동의를 요구한다.")
+              + (" (%s)" % expired if expired else ""))
+    return 0
+
+
 def cli_auto_skip(ctx, argv):
     """스킵 자동 승인 토글. on 은 PreToolUse 가 사람의 동의를 받은 뒤에만 도달한다."""
-    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
     pos = argv_positional(argv)
-    mode = pos[0] if pos else "status"
-    if mode == "off":
-        with con:
-            set_meta(con, "auto_skip", "off")
-            set_meta(con, "auto_skip_uses", "")
-            set_meta(con, "auto_skip_loop", "")
-            set_meta(con, "auto_skip_off_at", now())
-        print(t("스킵 자동 승인 OFF — 이제 모든 스킵이 사용자 동의를 요구한다."))
-        return 0
-
-    if mode == "on":
-        reason = argv_value(argv, "reason")
-        uses = argv_value(argv, "uses")
-        scope = argv_value(argv, "scope") or "project"
-        if not reason:
-            print(t("사용법: harness auto-skip on --reason \"...\" "
-                  "[--uses N] [--scope loop|project]"))
-            return 2
-        if scope not in ("loop", "project"):
-            print(t("--scope 는 loop 또는 project 여야 한다."))
-            return 2
-        if uses is not None:
-            try:
-                if int(uses) < 1:
-                    raise ValueError
-            except ValueError:
-                print(t("--uses 는 1 이상의 정수여야 한다."))
-                return 2
-        with con:
-            set_meta(con, "auto_skip", "on")
-            set_meta(con, "auto_skip_reason", reason)
-            set_meta(con, "auto_skip_at", now())
-            set_meta(con, "auto_skip_uses", str(int(uses)) if uses else "")
-            set_meta(con, "auto_skip_loop", lid if scope == "loop" else "")
-        print(t("스킵 자동 승인 ON%s — 사유: %s")
-              % (t(" (사용자 승인)") if "auto-skip" in consent_map(cfg) else "", reason))
-        print(t("범위: %s") % auto_skip_scope_note(con))
-        print(t("사유는 계속 필수이고 기록에는 authorized_by=auto 로 남는다. "
-              "끄려면 `harness auto-skip off`."))
-        return 0
-
-    if mode == "status":
-        active, expired = auto_skip_state(con)
-        if active:
-            print(t("스킵 자동 승인: ON (since %s) — 사유: %s")
-                  % (get_meta(con, "auto_skip_at", "-"),
-                     get_meta(con, "auto_skip_reason", "-")))
-            print(t("  범위: %s") % auto_skip_scope_note(con))
-        else:
-            print(t("스킵 자동 승인: OFF — 모든 스킵이 사용자 동의를 요구한다.")
-                  + (" (%s)" % expired if expired else ""))
-        return 0
-
-    print(t("사용법: harness auto-skip {on --reason \"...\" [--uses N] "
-          "[--scope loop|project] | off | status}"))
-    return 2
+    return dispatch(AUTO_SKIP_SUBS, "auto-skip", pos[0] if pos else "status")(ctx, argv, pos)
 
 
-def cli_loop(ctx, argv):
-    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
-    pos = argv_positional(argv)
-    sub = pos[0] if pos else "show"
-    if sub == "new":
-        intent = argv_value(argv, "intent")
+@loop_sub("new")
+def _loop_new(ctx, argv, pos):
+    con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
+    intent = argv_value(argv, "intent")
+    with con:
+        nlid = rotate_loop(con, cfg, root, lid, intent)
+        if nlid and intent:
+            record_evidence(con, nlid, cfg["stages"][0]["id"], "intent_set", intent)
+    if not nlid:
+        raise Refuse(t("이미 %s 는 닫혔다 — 다른 호출이 먼저 새 작업을 시작했다. "
+                       "`harness status` 로 확인하라.") % lid, code=1)
+    print(t("작업 %s 종료 → 새 작업 %s, 단계 %s")
+          % (lid, nlid, label_of(cfg, cfg["stages"][0]["id"])))
+    return 0
+
+
+@loop_sub("intent")
+def _loop_intent(ctx, argv, pos):
+    con, lid, sid = ctx.con, ctx.lid, ctx.sid
+    text = " ".join(pos[1:]).strip() or (argv_value(argv, "intent") or "").strip()
+    if not text:
+        raise Refuse(t("사용법: harness loop intent \"<이번 루프에서 할 작업>\""), code=2)
+    with con:
+        con.execute("UPDATE loop SET intent=? WHERE id=?", (text, lid))
+        # Scaffolding 의 종료 조건. 작업을 기록하지 않으면 단계를 넘어갈 수 없다.
+        record_evidence(con, lid, sid, "intent_set", text)
+    print(t("작업 %s 의 내용: %s") % (lid, text))
+    print(t("Context 단계의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다."))
+    return 0
+
+
+@loop_sub("done-when")
+def _loop_done_when(ctx, argv, pos):
+    con, lid, sid = ctx.con, ctx.lid, ctx.sid
+    items = [it for it in pos[1:] if it.strip()]
+    if "--clear" in argv:
         with con:
-            nlid = rotate_loop(con, cfg, root, lid, intent)
-            if nlid and intent:
-                record_evidence(con, nlid, cfg["stages"][0]["id"], "intent_set", intent)
-        if not nlid:
-            print(t("이미 %s 는 닫혔다 — 다른 호출이 먼저 새 작업을 시작했다. "
-                    "`harness status` 로 확인하라.") % lid)
-            return 1
-        print(t("작업 %s 종료 → 새 작업 %s, 단계 %s")
-              % (lid, nlid, label_of(cfg, cfg["stages"][0]["id"])))
+            con.execute("DELETE FROM evidence WHERE loop_id=? AND kind='acceptance'",
+                        (lid,))
+        print(t("완료 조건을 비웠다. 다시 기록하라."))
         return 0
-    if sub == "intent":
-        text = " ".join(pos[1:]).strip() or (argv_value(argv, "intent") or "").strip()
-        if not text:
-            print(t("사용법: harness loop intent \"<이번 루프에서 할 작업>\""))
-            return 2
+    if items:
         with con:
-            con.execute("UPDATE loop SET intent=? WHERE id=?", (text, lid))
-            # Scaffolding 의 종료 조건. 작업을 기록하지 않으면 단계를 넘어갈 수 없다.
-            record_evidence(con, lid, sid, "intent_set", text)
-        print(t("작업 %s 의 내용: %s") % (lid, text))
-        print(t("Context 단계의 `harness recall` 이 이 작업을 기준으로 과거 기록을 찾는다."))
-        return 0
-    if sub == "done-when":
-        items = [it for it in pos[1:] if it.strip()]
-        if "--clear" in argv:
-            with con:
-                con.execute("DELETE FROM evidence WHERE loop_id=? AND kind='acceptance'",
-                            (lid,))
-            print(t("완료 조건을 비웠다. 다시 기록하라."))
-            return 0
-        if items:
-            with con:
-                for it in items:
-                    record_evidence(con, lid, sid, "acceptance", it.strip())
-        rows = acceptance_of(con, lid)
-        if not rows:
-            print(t("사용법: harness loop done-when \"<완료 조건>\" [\"<조건2>\" ...] [--clear]"))
-            print(t("무엇이 '끝'인지 기록한다. Verification 이 이것을 대조하고,"))
-            print(t("Compounding 이 작업 종료 판단의 근거로 쓴다. 회차가 바뀌어도 유지된다."))
-            return 2
-        print(t("작업 %s 의 완료 조건 (%d개):") % (lid, len(rows)))
-        for i, it in enumerate(rows, 1):
-            print("  %d. %s" % (i, it))
-        return 0
-    if sub == "adopt":
-        want = pos[1] if len(pos) > 1 else None
-        if not want:
-            print(t("사용법: harness loop adopt <loop-id> --reason \"...\""))
-            return 2
-        # **재연결은 상태 전이다.** 예전에는 `create_loop`(INSERT OR IGNORE)에
-        # 회차 +1 을 얹었고, 그래서 세 가지가 어긋났다 — 적대적 리뷰가 전부 찾았다.
-        #   ① 없는 ID 를 adopt 하면 cycle=1 행을 만든 뒤 올려 **첫 상태가 회차 2**
-        #   ② 연속 adopt 하면 `cycle_close` 없이 회차만 올라 **측정 창에 이전
-        #      회차의 이벤트가 섞인다**
-        #   ③ 닫힌 작업을 adopt 해도 `closed_at` 이 남아 tidy 가 닫힌 작업으로 본다
-        #
-        # 뿌리는 하나다. `INSERT OR IGNORE` 가 "만들기"와 "이어받기"를 뭉갰고,
-        # `cycle` 이 **접두사 구분자**와 **측정 창 번호** 두 일을 겸했다.
-        # 그래서 둘을 갈라 명시적으로 처리한다.
-        existed = con.execute("SELECT cycle, closed_at FROM loop WHERE id=?",
-                              (want,)).fetchone()
-        with con:
-            close_loop(con, lid)
-            if existed:
-                # 이어받는다. 회차를 올리고 **경계를 남긴다** — 측정 창이 이전
-                # 회차와 섞이지 않게. 그리고 다시 열린 작업이므로 closed_at 을 지운다.
-                new_cycle = (existed["cycle"] or 1) + 1
-                # **`cycle_close` 를 쓰지 않는다.** 그 종류는 두 가지로 소비된다 —
-                # 측정 창의 경계(cycle_window_start)와 회차 스냅샷(_cycle_rows 가
-                # detail 을 JSON 으로 파싱한다). 재연결은 회차 스냅샷이 아니므로
-                # 그 종류를 쓰면 이전 회차의 측정치가 창에서 빠지면서 기록되지도
-                # 않고, 사유가 JSON 처럼 생기면 가짜 회차로 집계된다 — 리뷰가
-                # 둘 다 찾았다. 접두사를 바꾸는 것이 목적이었으므로 측정은 건드리지
-                # 않는다. 별개 종류로 기록만 남긴다.
-                record_event(con, want, cfg["stages"][0]["id"], "cycle_adopt",
-                             str(existed["cycle"] or 1),
-                             "%s-%s" % (want, existed["cycle"] or 1),
-                             argv_value(argv, "reason") or "")
-                con.execute("UPDATE loop SET cycle=?, closed_at=NULL WHERE id=?",
-                            (new_cycle, want))
-                create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
-            else:
-                # 없던 ID 다. 새로 만드는 것이므로 1회차에서 시작한다.
-                new_cycle = 1
-                create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
+            for it in items:
+                record_evidence(con, lid, sid, "acceptance", it.strip())
+    rows = acceptance_of(con, lid)
+    if not rows:
+        raise Refuse(t("사용법: harness loop done-when \"<완료 조건>\" [\"<조건2>\" ...] [--clear]"),
+                     t("무엇이 '끝'인지 기록한다. Verification 이 이것을 대조하고,"),
+                     t("Compounding 이 작업 종료 판단의 근거로 쓴다. 회차가 바뀌어도 유지된다."), code=2)
+    print(t("작업 %s 의 완료 조건 (%d개):") % (lid, len(rows)))
+    for i, it in enumerate(rows, 1):
+        print("  %d. %s" % (i, it))
+    return 0
+
+
+@loop_sub("adopt")
+def _loop_adopt(ctx, argv, pos):
+    con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
+    want = pos[1] if len(pos) > 1 else None
+    if not want:
+        raise Refuse(t("사용법: harness loop adopt <loop-id> --reason \"...\""), code=2)
+    # **재연결은 상태 전이다.** 예전에는 `create_loop`(INSERT OR IGNORE)에
+    # 회차 +1 을 얹었고, 그래서 세 가지가 어긋났다 — 적대적 리뷰가 전부 찾았다.
+    #   ① 없는 ID 를 adopt 하면 cycle=1 행을 만든 뒤 올려 **첫 상태가 회차 2**
+    #   ② 연속 adopt 하면 `cycle_close` 없이 회차만 올라 **측정 창에 이전
+    #      회차의 이벤트가 섞인다**
+    #   ③ 닫힌 작업을 adopt 해도 `closed_at` 이 남아 tidy 가 닫힌 작업으로 본다
+    #
+    # 뿌리는 하나다. `INSERT OR IGNORE` 가 "만들기"와 "이어받기"를 뭉갰고,
+    # `cycle` 이 **접두사 구분자**와 **측정 창 번호** 두 일을 겸했다.
+    # 그래서 둘을 갈라 명시적으로 처리한다.
+    existed = con.execute("SELECT cycle, closed_at FROM loop WHERE id=?",
+                          (want,)).fetchone()
+    with con:
+        close_loop(con, lid)
         if existed:
-            print(t("작업 %s 재연결(사용자 승인). 단계는 1단계부터, 회차 %d 로 다시 "
-                    "추적한다 — 지난 회차의 산출물은 이번 조건을 채우지 않는다.")
-                  % (want, new_cycle))
+            # 이어받는다. 회차를 올리고 **경계를 남긴다** — 측정 창이 이전
+            # 회차와 섞이지 않게. 그리고 다시 열린 작업이므로 closed_at 을 지운다.
+            new_cycle = (existed["cycle"] or 1) + 1
+            # **`cycle_close` 를 쓰지 않는다.** 그 종류는 두 가지로 소비된다 —
+            # 측정 창의 경계(cycle_window_start)와 회차 스냅샷(_cycle_rows 가
+            # detail 을 JSON 으로 파싱한다). 재연결은 회차 스냅샷이 아니므로
+            # 그 종류를 쓰면 이전 회차의 측정치가 창에서 빠지면서 기록되지도
+            # 않고, 사유가 JSON 처럼 생기면 가짜 회차로 집계된다 — 리뷰가
+            # 둘 다 찾았다. 접두사를 바꾸는 것이 목적이었으므로 측정은 건드리지
+            # 않는다. 별개 종류로 기록만 남긴다.
+            record_event(con, want, cfg["stages"][0]["id"], "cycle_adopt",
+                         str(existed["cycle"] or 1),
+                         "%s-%s" % (want, existed["cycle"] or 1),
+                         argv_value(argv, "reason") or "")
+            con.execute("UPDATE loop SET cycle=?, closed_at=NULL WHERE id=?",
+                        (new_cycle, want))
+            create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
         else:
-            print(t("작업 %s 는 기록에 없어 **새로 만들었다**(사용자 승인). "
-                    "회차 1 · 단계 1부터 시작한다.") % want)
-        return 0
+            # 없던 ID 다. 새로 만드는 것이므로 1회차에서 시작한다.
+            new_cycle = 1
+            create_loop(con, cfg, root, argv_value(argv, "reason"), loop_id=want)
+    if existed:
+        print(t("작업 %s 재연결(사용자 승인). 단계는 1단계부터, 회차 %d 로 다시 "
+                "추적한다 — 지난 회차의 산출물은 이번 조건을 채우지 않는다.")
+              % (want, new_cycle))
+    else:
+        print(t("작업 %s 는 기록에 없어 **새로 만들었다**(사용자 승인). "
+                "회차 1 · 단계 1부터 시작한다.") % want)
+    return 0
+
+
+@loop_sub("show")
+def _loop_show(ctx, argv, pos):
+    con, lid = ctx.con, ctx.lid
     row = con.execute("SELECT * FROM loop WHERE id=?", (lid,)).fetchone()
     print("loop %s · branch %s · created %s"
           % (lid, row["branch"] if row else "-", row["created_at"] if row else "-"))
     if row and row["intent"]:
         print("  intent: %s" % row["intent"])
     return 0
+
+
+def cli_loop(ctx, argv):
+    """서브명령을 **표에서** 찾는다. if 체인이었을 때 오타가 조용히 `show` 로
+    떨어져 `harness loop inetnt "작업 내용"` 이 rc=0 을 냈다 — 사용자는
+    기록됐다고 믿었다."""
+    pos = argv_positional(argv)
+    return dispatch(LOOP_SUBS, "loop", pos[0] if pos else "show")(ctx, argv, pos)
 
 
 CLI = {
@@ -5519,9 +5570,21 @@ def main():
     if not argv or argv[0] in ("help", "-h", "--help"):
         print(t(USAGE))
         return 0
-    if argv[0] == "hook":
-        return run_hook()
-    return run_cli(argv)
+    try:
+        return run_hook() if argv[0] == "hook" else run_cli(argv)
+    except Refuse as ref:
+        # **거절의 유일한 출구.** CLI 에서는 설명과 종료 코드가 그대로 나간다.
+        #
+        # 훅 경로에서는 stdout 이 JSON 채널이라 그리로 낼 수 없다. 그리고 훅이
+        # 거절을 던지는 것은 애초에 프로그래밍 실수다 — 그때 traceback 으로
+        # 죽으면 훅이 아무것도 막지 않는데 **아무도 그 사실을 모른다.** 이미
+        # 있는 어휘로 "게이트가 꺼졌다"고 말한다.
+        if argv[0] == "hook":
+            return inactive(t("거절이 훅 경로로 새어 나왔다: %s")
+                            % (ref.lines[0] if ref.lines else ref))
+        for line in ref.lines:
+            print(line)
+        return ref.code
 
 
 # ---------------------------------------------------------------- 게이트 적재
