@@ -298,7 +298,9 @@ HOOK_TIMEOUT_S = 10
 # 강제 종료되면 fail-open 경고조차 내지 못하고, 사용자는 게이트가 꺼진 줄도 모른다.
 DB_WAIT_S = 4
 
-ADDED_COLUMNS = (("evidence", "digest", "TEXT"),)
+ADDED_COLUMNS = (("evidence", "digest", "TEXT"),
+                 # 승격 시점의 **이벤트 id**. 재발 판정을 벽시계에서 여기로 옮긴다.
+                 ("promotion", "after_id", "INTEGER"))
 
 
 def migrate(con):
@@ -940,10 +942,21 @@ def skips_of(con, lid):
 # --------------------------------------------------------------------- evidence
 
 def record_event(con, lid, sid, kind, rule=None, target=None, detail=None):
-    con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (now(), lid, sid, kind, rule, target,
-                 detail[:400] if detail else None))
+    """관측을 적는다. **적는 것이 판정을 막지 않는다.**
+
+    이 INSERT 가 터지면 예외가 훅까지 올라가 `inactive()` 로 빠졌다 — 즉
+    **판정을 이미 알고 있으면서 적을 수 없다는 이유로 그 답을 버렸다.**
+    읽기 전용 파일시스템·디스크 꽉 참·권한 사고에서 게이트가 통째로 열렸다
+    (4회차 C⑥ 실측: `chmod a-w` 뒤 `docs/b.md` 쓰기가 허용됐다).
+
+    기록은 복리의 원료이지 강제의 조건이 아니다. 삼키되 `swallow` 로 삼켜
+    사실이 `status` 에 남는다. **적지 못한 것과 막지 못한 것은 다른 일이다.**
+    """
+    with swallow(t("관측 기록(%s)") % kind):
+        con.execute("INSERT INTO event(at,loop_id,stage,kind,rule,target,detail) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (now(), lid, sid, kind, rule, target,
+                     detail[:400] if detail else None))
 
 
 def norm_cmd(cmd):
@@ -1203,18 +1216,39 @@ def repeated_items(con, cfg):
     return out
 
 
+def last_event_id(con):
+    """지금까지 기록된 마지막 이벤트 id. 순서의 기준점이다 — 시계가 아니다."""
+    row = con.execute("SELECT MAX(id) i FROM event").fetchone()
+    return (row["i"] or 0) if row else 0
+
+
 def recurrence(con, p):
     """승격 이후 같은 항목이 다시 걸렸는지 → (횟수, 작업 수).
 
-    승격이 통했는지의 유일한 객관 증거다. 경계를 1초 뒤로 두는 이유: 승격을
-    기록한 그 초에 남은 이벤트는 승격 **이전**의 사실이므로, 재발로 세면 방금
-    내린 결정이 즉시 무효화된다.
+    승격이 통했는지의 유일한 객관 증거다.
+
+    **경계는 시각이 아니라 id 다.** 회차 경계는 전부 id 로 옮겼는데 여기 하나만
+    벽시계에 남아 있었고, 그래서 두 가지가 함께 틀렸다(4회차 C④):
+      · 시계가 앞섰다 되돌아오면(NTP 보정·VM 재개) 승격 **이후**의 재발이
+        영원히 보이지 않는다 → `metrics` 가 "재발 0%" 라고 거짓 보고한다.
+      · 시계가 정상이어도 승격과 **같은 초**에 일어난 재발은 `+1초` 경계에
+        걸려 사라진다. `events_where` 가 바로 그 `+1초` 를 없애려고 만든 것인데
+        여기만 남았다.
+    id 는 단조 증가하므로 순서 판정에 시계가 필요 없다.
+
+    `after_id` 가 없는 낡은 행은 시각으로 떨어진다 — 그 행들은 이 열이 생기기
+    전에 쓰였고, 없는 것을 지어내지 않는다.
     """
     item = {"kind": p["kind"], "name": p["key"].split(":", 1)[1]}
-    base = p["recheck_at"] or p["at"]
-    hits = events_where(con, kinds=(item["kind"],),
-                        from_epoch=(ts_epoch(base) + 1) if base else 0.0,
-                        **promo_match(item))
+    aid = p["after_id"] if "after_id" in p.keys() else None
+    if aid is not None:
+        hits = events_where(con, kinds=(item["kind"],), after_id=aid,
+                            **promo_match(item))
+    else:
+        base = p["recheck_at"] or p["at"]
+        hits = events_where(con, kinds=(item["kind"],),
+                            from_epoch=(ts_epoch(base) + 1) if base else 0.0,
+                            **promo_match(item))
     return len(hits), len({r["loop_id"] for r in hits})
 
 
@@ -4984,12 +5018,14 @@ def cli_promote(ctx, argv):
     seen = promote_change_seen(con, cfg, lid, as_kind)
     with con:
         con.execute(
-            "INSERT INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) "
-            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+            "INSERT INTO promotion(key,kind,decision,maturity,note,loop_id,at,"
+            "recheck_at,after_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
             "decision=excluded.decision, maturity=excluded.maturity, "
             "note=excluded.note, loop_id=excluded.loop_id, at=excluded.at, "
-            "recheck_at=excluded.recheck_at",
-            (key, kind, as_kind, maturity, note, lid, now(), now()))
+            "recheck_at=excluded.recheck_at, after_id=excluded.after_id",
+            (key, kind, as_kind, maturity, note, lid, now(), now(),
+             last_event_id(con)))
         record_event(con, lid, sid,
                      "promote_declined" if as_kind == "declined" else "promote",
                      as_kind, key, note)
@@ -5542,18 +5578,34 @@ def install_templates(root, pr):
     return made
 
 
+# 우리 표 이름. **스키마에서 뽑는다** — 손으로 적으면 표가 늘 때 갈린다.
+SCHEMA_TABLES = tuple(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
+
+
 def quarantine_db(root):
-    """DB 를 열 수 없으면 옆으로 치우고 그 경로를 돌려준다. 멀쩡하면 None."""
+    """**하네스 DB 로 쓸 수 없으면** 옆으로 치우고 그 경로를 돌려준다. 멀쩡하면 None.
+
+    예전에는 "열리나" 만 물었다(`PRAGMA schema_version`). 0바이트 파일은 **유효한
+    빈 SQLite** 라 그 탐침을 통과했고, 그래서 `python3 -c "open(<DB>,'w')"` 한 줄로
+    상태를 날려도 격리되지 않고 `.corrupt-N` 백업 없이 조용히 재초기화됐다 —
+    기록이 전소되는데 아무 흔적이 없다(4회차 C②).
+
+    질문을 바꾼다: **이게 우리 DB 인가.** 하네스 DB 라면 우리 표가 하나는 있다.
+    (전부를 요구하지 않는다 — `CREATE TABLE IF NOT EXISTS` 가 업그레이드 경로라
+    낡은 DB 는 새 표가 없는 것이 정상이다.)
+    """
     path = os.path.join(root, DB_REL)
     if not os.path.isfile(path):
         return None
     try:
         probe = sqlite3.connect(path)
         try:
-            probe.execute("PRAGMA schema_version").fetchone()
+            names = {r[0] for r in probe.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
         finally:
             probe.close()
-        return None
+        if names & set(SCHEMA_TABLES):
+            return None
     except sqlite3.Error:
         pass
     for n in range(1, 100):

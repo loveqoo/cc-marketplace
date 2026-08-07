@@ -656,7 +656,7 @@ python3 - "$WORK/.claude/harness/harness.db" <<'PYEOF'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
 for n in range(20):
-    con.execute("INSERT OR REPLACE INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+    con.execute("INSERT OR REPLACE INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) VALUES(?,?,?,?,?,?,?,?)",
                 ("filler:%d" % n, "block", "rule", "established",
                  "채움 %d" % n, "x", "2025-01-01T00:00:00+0900",
                  "2025-01-01T00:00:00+0900"))
@@ -760,7 +760,7 @@ sql "INSERT INTO loop(id,created_at,closed_at) VALUES
  ('2025-03-03T11:00:00+0900','250303-s00003','execution','block','syncrule','c'),
  ('2025-04-01T11:00:00+0900','250401-s00004','execution','block','syncrule','d'),
  ('2025-04-02T11:00:00+0900','250402-s00005','execution','block','syncrule','e');
- INSERT INTO promotion VALUES('block:syncrule','block','rule','established',
+ INSERT INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) VALUES('block:syncrule','block','rule','established',
    '동기화 확인용','x','2025-03-15T00:00:00+0900','2025-03-15T00:00:00+0900');" >/dev/null
 check "저장값이 established 인 것을 확인" 'established' \
   "$(sql "SELECT maturity FROM promotion WHERE key='block:syncrule'")"
@@ -886,7 +886,7 @@ check "반복 실패 절이 있다" '반복 실패 비율' "$MM"
 check "측정 못 하는 것을 명시한다" '측정하지 못하는 것' "$MM"
 check "점수를 만들지 않는 이유를 적는다" '점수를 만들지 않는' "$MM"
 check "표본이 작으면 경고한다" '비율을 믿지 마라' \
-  "$(msql "INSERT OR REPLACE INTO promotion VALUES('block:m1','block','hook','established','n','x',datetime('now'),datetime('now'))" >/dev/null; mcli metrics)"
+  "$(msql "INSERT OR REPLACE INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) VALUES('block:m1','block','hook','established','n','x',datetime('now'),datetime('now'))" >/dev/null; mcli metrics)"
 
 echo "== Goodhart 가드"
 # 마찰은 줄지만 우회가 느는 이력을 심는다 -> 경고가 떠야 한다
@@ -997,7 +997,7 @@ RW="$(mktemp -d)"
 python3 - "$RW/.claude/harness/harness.db" <<'PYR'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
-con.execute("INSERT INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+con.execute("INSERT INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) VALUES(?,?,?,?,?,?,?,?)",
             ("tool_fail:cargo test", "tool_fail", "declined", "declined",
              "환경 문제", "x", "2026-01-01T00:00:00+0900", "2026-01-01T00:00:00+0900"))
 for i, l in enumerate(("r1", "r2", "r3")):
@@ -1493,7 +1493,7 @@ with con:
                     "VALUES(?,?,?,?,?,?)",
                     ("2025-06-0%dT11:00:00+0900" % (i + 1), l, "execution",
                      "block", "docs_readonly", "docs/a.md"))
-    con.execute("INSERT OR REPLACE INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+    con.execute("INSERT OR REPLACE INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) VALUES(?,?,?,?,?,?,?,?)",
                 ("block:loop_prefix", "block", "hook", "regressed", "n", "x",
                  "2025-05-01T00:00:00+0900", "2025-05-01T00:00:00+0900"))
 PYW

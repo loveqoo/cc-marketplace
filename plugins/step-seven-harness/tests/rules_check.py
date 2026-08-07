@@ -430,6 +430,49 @@ finally:
     os.chmod(wp, 0o755)
 ck("쓸 수 있게 되면 복구한다", h.wrapper_intact(root) is False)
 
+# --- 적는 것이 판정을 막지 않는다 -------------------------------------------
+# 읽기 전용 FS·디스크 꽉 참에서 `record_event` 가 터지면 예외가 훅까지 올라가
+# `inactive()` 로 빠졌다 — **판정을 알고 있으면서 적을 수 없다는 이유로 버렸다.**
+print("== 적지 못해도 막는다")
+import sqlite3 as _sq  # noqa: E402
+_ro = _sq.connect("file:%s?mode=ro" % os.path.join(root, ".claude/harness/harness.db"),
+                  uri=True)
+_ro.row_factory = _sq.Row
+del h.SWALLOWED[:]
+_d, _why = h.check_write(h.Ctx(_ro, cfg, root, lid, ctx.sid), "docs/probe.md")
+ck("읽기 전용 DB 에서도 판정이 나온다", _d == "deny", (_d, _why))
+ck("적지 못한 사실은 남는다", any("관측 기록" in w for w in h.SWALLOWED), h.SWALLOWED)
+_ro.close()
+del h.SWALLOWED[:]
+
+# --- 재발 판정은 시계가 아니라 id 로 ----------------------------------------
+# 회차 경계는 전부 id 로 옮겼는데 `recurrence` 하나만 벽시계에 남아 있었다.
+# 시계가 앞섰다 되돌아오면 승격 이후의 재발이 영원히 보이지 않는다(4회차 C④).
+print("== 재발 판정은 id 로 한다")
+ck("승격이 이벤트 id 를 남긴다", "after_id" in h.SCHEMA or
+   any(c[1] == "after_id" for c in h.ADDED_COLUMNS))
+ck("last_event_id 가 단조 증가", h.last_event_id(con) >= 0)
+_before = h.last_event_id(con)
+with con:
+    h.record_event(con, lid, ctx.sid, "block", "probe_rule", "x")
+ck("이벤트를 남기면 id 가 오른다", h.last_event_id(con) > _before)
+
+# --- 하네스 DB 가 아니면 격리한다 -------------------------------------------
+# 0바이트 파일은 **유효한 빈 SQLite** 라 "열리나" 탐침을 통과했다(4회차 C②).
+print("== 우리 DB 가 아니면 격리한다")
+ck("표 이름을 스키마에서 뽑는다",
+   set(h.SCHEMA_TABLES) >= {"meta", "loop", "event", "promotion"}, h.SCHEMA_TABLES)
+import tempfile as _tf  # noqa: E402
+_qr = _tf.mkdtemp()
+os.makedirs(os.path.join(_qr, ".claude", "harness"))
+_dbp = os.path.join(_qr, h.DB_REL)
+open(_dbp, "w").close()                      # 0바이트
+ck("0바이트 DB 는 격리된다", h.quarantine_db(_qr) is not None)
+_c = _sq.connect(_dbp); _c.execute("CREATE TABLE other(x)"); _c.commit(); _c.close()
+ck("남의 sqlite 도 격리된다", h.quarantine_db(_qr) is not None)
+_c = _sq.connect(_dbp); _c.executescript(h.SCHEMA); _c.commit(); _c.close()
+ck("우리 DB 는 격리되지 않는다", h.quarantine_db(_qr) is None)
+
 # --- 조용한 실패의 출구도 하나다 --------------------------------------------
 # 게이트가 꺼지는 출구는 `inactive()` 하나로 모았는데, **실패를 삼키는 출구는
 # 열한 개** 그대로였다 (`except Exception: pass`). 이 플러그인이 스스로 최악이라고

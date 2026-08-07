@@ -98,7 +98,7 @@ for k, want in sorted(EXPECT.items()):
 
 # --- _survival
 def promo(key, kind, decision, at, recheck=None):
-    con.execute("INSERT OR REPLACE INTO promotion VALUES(?,?,?,?,?,?,?,?)",
+    con.execute("INSERT OR REPLACE INTO promotion(key,kind,decision,maturity,note,loop_id,at,recheck_at) VALUES(?,?,?,?,?,?,?,?)",
                 (key, kind, decision, "established", "n", LID, at, recheck or at))
 
 def verify(key, decision, yes):
