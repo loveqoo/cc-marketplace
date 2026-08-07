@@ -283,5 +283,3 @@ def protected_pats(cfg):
         if isinstance(p, str) and p not in out:
             out.append(p)
     return out
-
-

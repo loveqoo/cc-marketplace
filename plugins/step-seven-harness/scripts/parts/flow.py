@@ -625,5 +625,3 @@ def next_cycle(ctx):
     con.execute("UPDATE loop SET cycle=cycle+1 WHERE id=?", (lid,))
     stage_set(con, "enter", (now(), lid, ids[1]))
     return ids[1]
-
-

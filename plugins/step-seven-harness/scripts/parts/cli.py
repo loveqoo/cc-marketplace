@@ -873,5 +873,3 @@ def cli_init(argv):
                 con2.close()
     render_init(root, created, lid, label)
     return 0
-
-

@@ -493,7 +493,6 @@ def cycle_search_keys(con, lid, lo, limit=6):
 SCHEMA_TABLES = tuple(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
 
 
-
 def grant_write(con, lid, glob, reason, uses):
     """쓰기 예외를 하나 남긴다. `allow` 명령과 자기검사 탐침이 같은 문장을 쓰던
     자리다 — 파일이 갈라지니 그 중복이 비로소 보였다."""

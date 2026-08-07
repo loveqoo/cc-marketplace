@@ -125,7 +125,6 @@ WRITE_TOOLS = {
 }
 
 
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS loop (
@@ -274,11 +273,6 @@ HOOK_TIMEOUT_S = 10
 DB_WAIT_S = 4
 
 
-
-
-
-
-
 # ----------------------------------------------------------------------- config
 
 class Cfg(dict):
@@ -386,13 +380,6 @@ def dispatch(table, cmd, sub):
     return fn
 
 
-
-
-
-
-
-
-
 # 아래 다섯 개는 **정책·내용**이라 설정이 정한다. 엔진에 박아 두면 프로젝트마다 다른
 # 것을 하나로 강요하게 되고, 특히 recall_dirs 는 조용한 결함이었다 — 설정에 폴더를
 # 더해도 recall 이 그 폴더를 못 봐서, 안내대로 고친 사람이 **다시 안 읽히는 기록**을
@@ -418,36 +405,6 @@ def recall_read_bytes(cfg):
     return cfg.num("recall.read_bytes", 50000, low=1000)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ------------------------------------------------------------------- loop/stage
 
 def new_loop_id():
@@ -471,39 +428,9 @@ def git_branch(root):
         return None
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def stage_rows(con, lid):
     return {r["stage"]: r for r in
             con.execute("SELECT * FROM stage WHERE loop_id=?", (lid,))}
-
-
-
-
 
 
 def norm_cmd(cmd):
@@ -517,8 +444,6 @@ def norm_cmd(cmd):
     if head in multi and len(toks) > 1 and not toks[1].startswith("-"):
         return "%s %s" % (head, toks[1])
     return head
-
-
 
 
 # 곁다리 작업이 실패한 사실. `swallow` 가 채우고 `status` 가 보여준다.
@@ -582,79 +507,15 @@ def swallow(what):
         swallow_note(line)
 
 
-
-
-
-
-
-
-
-
-
-
 def has_evidence(con, lid, kind):
     return con.execute("SELECT 1 FROM evidence WHERE loop_id=? AND kind=? LIMIT 1",
                        (lid, kind)).fetchone() is not None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def promotion_summary(con, cfg):
     rows = con.execute("SELECT maturity, COUNT(*) c FROM promotion "
                        "GROUP BY maturity").fetchall()
     return {r["maturity"]: r["c"] for r in rows}
-
-
-
-
 
 
 LEARNED_HEAD = """# 승격된 규칙
@@ -665,25 +526,11 @@ LEARNED_HEAD = """# 승격된 규칙
 """
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def human_criteria(cfg):
     """사람만 채울 수 있는 조건. 이것이 남았으면 턴을 밀지 않는다 —
     밀면 모델이 만들 수 없는 것을 만들려 애쓰고, 그 시도가 매번 다이얼로그가 된다."""
     return tuple(k for k, v in (cfg.obj("criteria") or {}).items()
                  if isinstance(v, dict) and v.get("human"))
-
-
 
 
 # ------------------------------------------------------------------- path logic
@@ -966,14 +813,6 @@ def self_lock_hit(rel):
     return False
 
 
-
-
-
-
-
-
-
-
 def check_write(ctx, rel):
     """(decision, reason). decision None 이면 판정하지 않음.
 
@@ -1015,36 +854,6 @@ def check_write(ctx, rel):
 # 정상 동작이므로 변경 시도로 오인해서는 안 된다.
 # 읽기만 하는 명령은 막지 않는다. 과잉 차단은 마찰이 되고, 마찰은 게이트를 끄게 만든다.
 # find 는 없다 — `-delete`/`-exec` 로 파일을 지운다.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ------------------------------------------------------------------ hook output
@@ -1114,12 +923,6 @@ def hook_session_start(inp, ctx):
     emit(out)
 
 
-
-
-
-
-
-
 def consume_auto_skip(con):
     """자동 승인 1회 소진. (차지했나, 남은 횟수) — 무제한이면 (True, None).
 
@@ -1133,22 +936,8 @@ def consume_auto_skip(con):
     return won, auto_skip_uses_left(con)
 
 
-
-
-
-
 PLAN_PREVIEW_LINES = 24
 PLAN_PREVIEW_CHARS = 1400
-
-
-
-
-
-
-
-
-
-
 
 
 def hook_pre_tool_use(inp, ctx):
@@ -1319,10 +1108,6 @@ def hook_post_tool_use(inp, ctx):
                 record_evidence(con, lid, sid, "verification_evidence", "tool:" + tool)
 
 
-
-
-
-
 def hook_post_tool_use_failure(inp, ctx):
     """도구 실패를 적립한다. 같은 실패가 반복되는 것이 '동일한 실수'의 직접 증거다.
 
@@ -1465,16 +1250,6 @@ def hook_stop(inp, ctx):
         # 조용히 통과시키지 않는다 — 우회 사실을 사용자에게 노출한다
         emit({"systemMessage": t("harness: %s 단계를 미충족 상태로 종료했다 (%s). "
                                "차단 상한 소진.") % (stage["label"], ", ".join(exhausted))})
-
-
-
-
-
-
-
-
-
-
 
 
 HOOKS = {
@@ -1689,31 +1464,7 @@ exec python3 "$P" "$@"
 """
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ENGINE_LINE_RE = re.compile(r'^P="[^"]*"$', re.M)
-
-
-
-
-
-
-
-
 
 
 def known_classes(cfg):
@@ -1764,8 +1515,6 @@ def rule_reachable(cfg, rule):
 # 차단자인 단계를 골라야 "이 규칙이 살아 있나"를 실제로 묻게 된다.
 #
 # (설명, 종류, 대상, 막혀야 하나, 어느 단계에서 볼까 — None 이면 현재 단계)
-
-
 
 
 # ============================================================ 게이트
@@ -2064,20 +1813,9 @@ def gate_problems(cfg):
     return out
 
 
-
-
-
-
-
-
-
-
-
-
 def _bind(fn, *a):
     """인자를 묶어 둔다. 탐침은 **나중에** 돌아야 한다 (돌려 본 결과가 결과다)."""
     return lambda: fn(*a)
-
 
 
 def selftest(ctx):
@@ -2105,12 +1843,6 @@ def enforcing_summary(cfg):
         "gates": gate_states(cfg),
         "language": cfg.at("language") or "ko",
     }
-
-
-
-
-
-
 
 
 def _panel_work_candidates(ctx, lid):
@@ -2145,21 +1877,7 @@ PANELS = {
 }
 
 
-
-
-
-
-
-
-
-
 SHELL_META = set(";|&<>$`(){}\n")
-
-
-
-
-
-
 
 
 # 회고 파일에서 읽는 범위. 이 밖의 내용은 `recall` 이 못 본다 — 즉 존재하지 않는
@@ -2194,12 +1912,6 @@ def _expand_keywords(keywords):
     return out
 
 
-
-
-
-
-
-
 def tidy_headline(con, cfg, root):
     """Scaffolding 에서 한 줄로 보여줄 요약. 할 일이 없으면 None."""
     try:
@@ -2222,23 +1934,11 @@ def tidy_headline(con, cfg, root):
     return t("정리 후보: %s — `harness tidy` 로 목록을 본다") % ", ".join(bits)
 
 
-
-
-
-
-
-
-
-
-
-
 # 사전승인(preauth)은 표에는 보이지만 **판정에는 들어가지 않는다.** 무인 실행을
 # 회피로 세면 그 판정은 모드 선택을 비난하는 것이 된다.
 TREND_KEYS = (("blocks", "차단"), ("refails", "반복실패"), ("churn", "재편집"),
               ("bypass", "우회"), ("skips", "스킵"), ("declines", "보류"),
               ("preauth", "사전승인"))
-
-
 
 
 VERDICT_TEXT = {
@@ -2250,41 +1950,7 @@ VERDICT_TEXT = {
 }
 
 
-
-
 NO_CYCLES = "  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done` 때 쌓인다)"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def run_cli(argv):
@@ -2350,20 +2016,6 @@ def run_cli(argv):
         con.close()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 AGENTS_MARK = "<!-- step-seven-harness -->"
 AGENTS_BLOCK = """%s
 ## 작업 절차 — 이 저장소는 하네스로 절차를 강제한다
@@ -2388,18 +2040,6 @@ AGENTS_BLOCK = """%s
 이 게이트는 훅 없이 CLI 만으로 동작하므로 어떤 에이전트 도구에서도 같다.
 """ % (AGENTS_MARK, POLICY_REL.replace(os.sep, "/"), LEARNED_REL.replace(os.sep, "/"),
        WRAPPER_CMD, WRAPPER_CMD, WRAPPER_CMD)
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def dump_json(data):

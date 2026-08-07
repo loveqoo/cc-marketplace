@@ -98,4 +98,3 @@ def register(h):
                              "(%s) — 승격 게이트가 늘 충족된 상태가 된다")
                            % ", ".join(sorted(gone)))
             return out
-    

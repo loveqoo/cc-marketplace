@@ -526,5 +526,3 @@ def render_init(root, created, lid, stage_label=None):
     print(t("활성 작업: %s%s") % (lid, t(" · 단계 %s") % stage_label if stage_label else ""))
     print(t("커밋 대상: .claude/harness/{POLICY.md,LEARNED.md,stages.json,rationale.md}, "
           "CLAUDE.md, AGENTS.md"))
-
-

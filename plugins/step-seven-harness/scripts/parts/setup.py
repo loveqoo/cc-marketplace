@@ -480,5 +480,3 @@ def install_anchors(root):
             fh.write("\n")
         fh.write("\n" + "\n".join(add) + "\n")
     return [t("CLAUDE.md (앵커 %d줄)") % len(add)]
-
-

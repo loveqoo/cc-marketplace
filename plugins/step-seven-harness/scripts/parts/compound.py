@@ -280,5 +280,3 @@ def trend_verdict(avgs):
     if evasion:
         return "mismatch"
     return "flat"
-
-

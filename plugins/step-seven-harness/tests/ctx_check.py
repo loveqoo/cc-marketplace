@@ -70,6 +70,28 @@ def walk_scopes(table, path=()):
             yield it
 
 
+def blanks(files, bad):
+    """빈 줄이 세 줄 넘게 이어지는 곳. **구멍은 코드를 옮긴 자리다.**
+
+    구현을 `parts/` 로 도려내면서 빈 자리가 그대로 남아 한 파일에 52줄 연속
+    공백까지 생겼다. 눈으로는 안 보이고(스크롤로 지나간다) 줄 수만 부풀린다.
+    PEP8 은 최상위 사이 2줄, 그 안은 1줄이다.
+    """
+    n = 0
+    for f in files:
+        run = 0
+        for i, line in enumerate(open(f, encoding="utf-8").read().splitlines(), 1):
+            if line.strip():
+                if run > 2:
+                    bad.append("%s:%d 앞에 빈 줄이 %d 줄 이어진다"
+                               % (os.path.basename(f), i, run))
+                run = 0
+            else:
+                run += 1
+                n += 1
+    return n
+
+
 def cross_names(files, bad):
     """엔진과 조각이 **합쳐진 이름공간**에서 없는 이름을 쓰는가.
 
@@ -164,8 +186,9 @@ def main():
         checked += scan(src_path, bad)
     ncall = arity(files, bad)
     nname = cross_names(files, bad)
-    print("  파일 %d개 · 스코프 %d개 · 호출 %d개 인자 · 이름 %d개 대조"
-          % (len(files), checked, ncall, nname))
+    nblank = blanks(files, bad)
+    print("  파일 %d개 · 스코프 %d개 · 호출 %d개 인자 · 이름 %d개 · 빈줄 %d"
+          % (len(files), checked, ncall, nname, nblank))
     if ncall < 200:
         print("  대조한 호출이 너무 적다 (%d) — 추출이 깨졌다" % ncall)
         return 1

@@ -102,4 +102,3 @@ def register(h):
                 out.append(h.t("어떤 단계도 stop_requires 가 없다 — 검증 증거·회고·승격 "
                              "결정을 미충족 상태로 턴을 끝낼 수 있다"))
             return out
-    

@@ -616,5 +616,3 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
             % (sub, t(" (사유: %s)") % reason if reason else ""))
         return out
     return pre_decision("ask", detail)
-
-
