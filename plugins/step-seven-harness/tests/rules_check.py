@@ -490,6 +490,37 @@ with h.swallow("실험2"):
 ck("성공하면 아무것도 안 남는다", len(h.SWALLOWED) == 1)
 del h.SWALLOWED[:]
 
+# **프로세스를 넘어야 한다.** 훅은 매번 새 프로세스로 떠서 즉시 죽으므로
+# 모듈 전역 리스트만으로는 삼킨 사실이 영영 사라진다(5회차 D-H1·C⑤).
+_old_log = h.SWALLOW_LOG
+h.SWALLOW_LOG = os.path.join(root, h.SWALLOW_LOG_REL)
+try:
+    with h.swallow("파일에 남는다"):
+        raise RuntimeError("경계를 넘어라")
+    ck("삼킨 사실이 파일로 남는다",
+       any("경계를 넘어라" in x for x in h.swallowed_recent(root)),
+       h.swallowed_recent(root))
+    ck("status 가 그것을 읽는다",
+       "swallowed" in h.status_report(ctx))
+    for _i in range(h.SWALLOW_KEEP + 20):
+        with h.swallow("넘침"):
+            raise RuntimeError("x%d" % _i)
+    ck("무한히 자라지 않는다",
+       len(h.swallowed_recent(root)) <= h.SWALLOW_KEEP,
+       len(h.swallowed_recent(root)))
+finally:
+    h.SWALLOW_LOG = _old_log
+    del h.SWALLOWED[:]
+    try:
+        os.remove(os.path.join(root, h.SWALLOW_LOG_REL))
+    except OSError:
+        pass
+
+# 손상 판정은 **SQLite 자신의 답**을 쓴다. `sqlite_master` 는 1페이지에 있어
+# 데이터 페이지가 깨져도 읽히므로 표 목록만으로는 부족했다(5회차 C⑦).
+ck("손상 판정에 quick_check 를 쓴다",
+   "quick_check" in inspect.getsource(h.quarantine_db))
+
 _bare = []
 for _fn in [n for n in ast.walk(ast.parse(inspect.getsource(h)))
             if isinstance(n, ast.FunctionDef)]:

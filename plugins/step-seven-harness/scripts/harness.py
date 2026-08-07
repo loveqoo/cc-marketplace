@@ -1108,6 +1108,43 @@ def events_where(con, kinds=None, loop_id=None, rule=None, target=None,
 
 # 곁다리 작업이 실패한 사실. `swallow` 가 채우고 `status` 가 보여준다.
 SWALLOWED = []
+# 삼킨 사실을 적는 곳. `run_hook`/`run_cli` 가 root 를 알게 되면 채운다.
+SWALLOW_LOG = None
+SWALLOW_LOG_REL = os.path.join(HARNESS_DIR, "swallowed.log")
+SWALLOW_KEEP = 50          # 최근 N 줄만 남긴다. 무한히 자라지 않는다.
+
+
+def swallow_note(line):
+    """삼킨 사실을 **프로세스 밖으로** 남긴다.
+
+    `SWALLOWED` 는 모듈 전역 리스트고 훅은 매번 새 프로세스로 떠서 즉시 죽는다.
+    그래서 훅에서 삼킨 것은 **어디에도 남지 않았다** — 읽기 전용 FS 에서 모든
+    관측 기록이 사라지는 중인데 `status` 는 초록이었다(5회차 D-H1·C⑤).
+
+    DB 가 아니라 파일에 적는다. 삼킴이 가장 많이 일어나는 때가 바로 DB 를 쓸 수
+    없을 때이기 때문이다. 파일도 못 쓰면 그때는 정말 할 수 있는 것이 없다 —
+    그 실패는 조용히 넘긴다(중첩 삼킴).
+    """
+    if not SWALLOW_LOG:
+        return
+    try:
+        old = []
+        if os.path.isfile(SWALLOW_LOG):
+            with open(SWALLOW_LOG, encoding="utf-8") as fh:
+                old = fh.read().splitlines()[-(SWALLOW_KEEP - 1):]
+        with open(SWALLOW_LOG, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(old + ["%s  %s" % (now(), line)]) + "\n")
+    except OSError:
+        pass
+
+
+def swallowed_recent(root):
+    """파일에 남은 삼킨 사실. 프로세스를 넘어 온 것들이다."""
+    try:
+        with open(os.path.join(root, SWALLOW_LOG_REL), encoding="utf-8") as fh:
+            return [x for x in fh.read().splitlines() if x.strip()]
+    except OSError:
+        return []
 
 
 @contextlib.contextmanager
@@ -1125,7 +1162,9 @@ def swallow(what):
     try:
         yield
     except Exception as exc:                  # noqa: BLE001 - 삼키는 것이 목적이다
-        SWALLOWED.append("%s: %s: %s" % (what, type(exc).__name__, exc))
+        line = "%s: %s: %s" % (what, type(exc).__name__, exc)
+        SWALLOWED.append(line)
+        swallow_note(line)
 
 
 def loop_row(con, lid):
@@ -3519,6 +3558,7 @@ def run_hook():
                             % (", ".join(gone), gate_load_why()),
                             t("플러그인 설치가 온전한지 확인하라 (`scripts/` 아래 "
                               "파일이 빠졌을 수 있다)"))
+        globals()["SWALLOW_LOG"] = os.path.join(root, SWALLOW_LOG_REL)
         cfg = load_config(root, plugin_root())
         load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
         # 손상된 문서를 템플릿으로 갈아치우지는 않는다 — 덜어낸 규칙이 되살아난다.
@@ -3873,6 +3913,7 @@ def status_report(ctx):
         "promoted": promotion_summary(con, cfg),
         "tidy": tidy_headline(con, cfg, root),
         "enforcing": enforcing_summary(cfg),
+        "swallowed": swallowed_recent(ctx.root),
         "selftest": [{"what": w, "ok": o, "got": g}
                      for w, o, g in selftest(ctx)],
         # 작업이 정해지지 않았을 때만. 정해졌으면 후보는 소음이다.
@@ -4308,10 +4349,13 @@ def render_status(d, cfg):
         print()
     # 삼킨 실패도 사실이다. 곁다리 작업이라 판정은 안 막았지만, **아무도 모르는
     # 실패**를 남기지 않는 것이 이 플러그인의 전제다.
-    if SWALLOWED:
-        print(t("⚠ 곁다리 작업 %d건이 실패했다 (판정은 계속됐다):") % len(SWALLOWED))
-        for w in SWALLOWED:
+    seen = d.get("swallowed") or []
+    if seen or SWALLOWED:
+        rows = list(dict.fromkeys(seen + SWALLOWED))
+        print(t("⚠ 곁다리 작업 %d건이 실패했다 (판정은 계속됐다):") % len(rows))
+        for w in rows[-8:]:
             print("  - %s" % w)
+        print(t("   지우려면 `rm %s`") % SWALLOW_LOG_REL.replace(os.sep, "/"))
         print()
     st = d.get("selftest") or []
     fails = [x for x in st if not x.get("ok")]
@@ -5714,6 +5758,7 @@ def run_cli(argv):
                 "막지 않는다%s. 플러그인 설치가 온전한지 확인하라.")
               % (", ".join(gone), gate_load_why()), file=sys.stderr)
         return 1
+    globals()["SWALLOW_LOG"] = os.path.join(root, SWALLOW_LOG_REL)
     cfg = load_config(root, plugin_root())
     load_messages(root, cfg.at("language") if isinstance(cfg, dict) else None)
     if con is None or not isinstance(cfg, dict) or not cfg.get("stages"):
@@ -5868,6 +5913,15 @@ def quarantine_db(root):
     질문을 바꾼다: **이게 우리 DB 인가.** 하네스 DB 라면 우리 표가 하나는 있다.
     (전부를 요구하지 않는다 — `CREATE TABLE IF NOT EXISTS` 가 업그레이드 경로라
     낡은 DB 는 새 표가 없는 것이 정상이다.)
+
+    그런데 표 목록만 보는 것도 부족했다. **`sqlite_master` 는 1페이지에 있어서
+    데이터 페이지가 깨져도 멀쩡히 읽힌다.** 그래서 "열리지만 읽을 수 없는" —
+    훨씬 흔한 손상 모양이 통과했고, 곧이어 `install_db` 의 `head_loop` 이
+    `DatabaseError` 로 죽었다. `init`·`status`·훅이 전부 사망하고 안내 메시지는
+    **죽는 명령을 실행하라고** 했다. 격리도 백업도 없었다(5회차 C⑦).
+
+    손상 판정을 손으로 만들지 않는다 — `PRAGMA quick_check` 가 SQLite 자신의
+    답이다. 근사를 재구현하지 말고 진짜 도구를 쓴다.
     """
     path = os.path.join(root, DB_REL)
     if not os.path.isfile(path):
@@ -5877,9 +5931,10 @@ def quarantine_db(root):
         try:
             names = {r[0] for r in probe.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
+            ok = probe.execute("PRAGMA quick_check(1)").fetchone()
         finally:
             probe.close()
-        if names & set(SCHEMA_TABLES):
+        if names & set(SCHEMA_TABLES) and ok and ok[0] == "ok":
             return None
     except sqlite3.Error:
         pass
