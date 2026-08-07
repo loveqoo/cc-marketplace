@@ -19,6 +19,7 @@
 
 import calendar
 import abc
+import contextlib
 import fnmatch
 import glob as globlib
 import hashlib
@@ -810,7 +811,7 @@ def head_loop(con):
 
 def cycle_of(con, lid):
     """이 작업의 현재 회차. Compounding → Scaffolding 으로 돌 때마다 늘어난다."""
-    row = con.execute("SELECT cycle FROM loop WHERE id=?", (lid,)).fetchone()
+    row = loop_row(con, lid)
     try:
         return int(row["cycle"]) if row and row["cycle"] else 1
     except (TypeError, ValueError, IndexError):
@@ -851,6 +852,24 @@ def create_loop(con, cfg, root, intent=None, loop_id=None, only_if_none=False):
     return lid
 
 
+def end_cycle(con, cfg, lid, kind):
+    """회차를 끝내는 **공통 절차**: 집계를 남기고 진행 중 상태를 버린다.
+
+    `rotate_loop` 과 `close_loop` 이 이것을 각자 갖고 있었다. 그래서 한쪽에만
+    스냅샷을 넣었을 때 다른 쪽(`loop adopt`)이 옆문이 됐고, 마찰이 쌓인 회차를
+    한 줄로 지울 수 있었다(4회차 C③). **"회차를 끝낸다" 의 뜻은 한 곳에 있다.**
+
+    닫기 자체(누가 이겼나)는 호출자가 정한다 — `rotate_loop` 은 claim 으로,
+    `close_loop` 은 무조건. 그것만이 둘의 진짜 차이다.
+    """
+    stages = cfg.get("stages") or [{}]
+    with swallow(t("회차 스냅샷")):
+        record_cycle_close(con, cfg, lid,
+                           active_stage(con, lid) or stages[0].get("id") or "-", kind)
+    for tbl in ("stage", "evidence", "wgrant"):
+        con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
+
+
 def rotate_loop(con, cfg, root, lid, intent=None):
     """이 작업을 닫고 다음을 연다. **닫기를 차지한 쪽만 연다** (진 쪽에는 None).
 
@@ -860,15 +879,7 @@ def rotate_loop(con, cfg, root, lid, intent=None):
     if not claim(con, "UPDATE loop SET closed_at=? WHERE id=? AND closed_at IS NULL",
                  (now(), lid)):
         return None
-    # **포기한 회차도 스냅샷을 남긴다.** `advance --cycle/--done` 만 남겼더니 마찰이
-    # 가장 큰 회차(포기)가 표본에서 통째로 빠져, `loop new` 를 치는 것이 추세를 좋게
-    # 만드는 가장 쉬운 방법이 됐다.
-    try:
-        record_cycle_close(con, cfg, lid, active_stage(con, lid) or cfg["stages"][0]["id"])
-    except Exception:
-        pass
-    for tbl in ("stage", "evidence", "wgrant"):
-        con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
+    end_cycle(con, cfg, lid, "cycle_close")
     return create_loop(con, cfg, root, intent)
 
 
@@ -885,13 +896,29 @@ def close_loop(con, cfg, lid, kind):
     (4회차 C③ 실측). 스냅샷은 회차당 하나이므로(`record_cycle_close`) 이미
     남겼으면 여기서 두 번 남지 않는다.
     """
-    try:
-        record_cycle_close(con, cfg, lid, active_stage(con, lid) or "-", kind)
-    except Exception:
-        pass
-    for tbl in ("stage", "evidence", "wgrant"):
-        con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
+    end_cycle(con, cfg, lid, kind)
     con.execute("UPDATE loop SET closed_at=? WHERE id=?", (now(), lid))
+
+
+# 단계 전이 SQL. 여섯 자리에 흩어져 있었고 셋은 `claim` 안, 셋은 무조건이었다.
+# **문장은 한 곳에, 경쟁 판정은 호출자가.** 흩어져 있으면 열이 늘 때 하나가 빠진다.
+STAGE_SET = {
+    "enter":   ("UPDATE stage SET status='active', entered_at=? "
+                "WHERE loop_id=? AND stage=?"),
+    "done":    ("UPDATE stage SET status='done', left_at=? "
+                "WHERE loop_id=? AND stage=? AND status='active'"),
+    "skipped": ("UPDATE stage SET status='skipped', left_at=?, reason=?, "
+                "authorized_by=? WHERE loop_id=? AND stage=? AND status='active'"),
+    "skip_ahead": ("UPDATE stage SET status='skipped', left_at=?, reason=?, "
+                   "authorized_by=? WHERE loop_id=? AND stage=?"),
+    "reset":   ("UPDATE stage SET status='pending', entered_at=NULL, left_at=NULL, "
+                "reason=NULL, authorized_by=NULL WHERE loop_id=? AND stage != ?"),
+}
+
+
+def stage_set(con, what, params):
+    """단계 전이 하나. **차지했으면 True** — `claim` 과 같은 뜻이다."""
+    return claim(con, STAGE_SET[what], params)
 
 
 def active_stage(con, lid):
@@ -980,6 +1007,66 @@ def events_where(con, kinds=None, loop_id=None, rule=None, target=None,
             continue
         out.append(r)
     return out
+
+
+# 곁다리 작업이 실패한 사실. `swallow` 가 채우고 `status` 가 보여준다.
+SWALLOWED = []
+
+
+@contextlib.contextmanager
+def swallow(what):
+    """**곁다리 작업의 실패를 삼킨다 — 그러나 조용히는 아니다.**
+
+    본 판정을 망가뜨리면 안 되는 부수 작업(스냅샷 기록, 후보 수집, 임시 파일
+    정리)이 열한 곳에서 `try/except Exception: pass` 로 쓰여 있었다. 그 열한
+    곳은 **실패해도 아무도 모르는 자리**다 — 이 플러그인이 스스로 최악이라고
+    적어 둔 실패 모드(조용한 실패)를 자기 코드가 열한 번 하고 있었다.
+
+    게이트가 꺼지는 출구를 `inactive()` 하나로 모은 것과 같은 이유로 모은다.
+    삼키되 **사실은 남긴다.**
+    """
+    try:
+        yield
+    except Exception as exc:                  # noqa: BLE001 - 삼키는 것이 목적이다
+        SWALLOWED.append("%s: %s: %s" % (what, type(exc).__name__, exc))
+
+
+def loop_row(con, lid):
+    """작업 한 행. **컬럼을 골라 뽑던 일곱 자리를 여기로 모은다.**
+
+    `SELECT cycle`, `SELECT intent`, `SELECT created_at`, `SELECT *` 가 제각각
+    있었다. 열이 늘거나 뜻이 바뀌면 일곱 곳을 다 찾아야 하고, 실제로 그 종류의
+    누락이 이 리포에서 반복됐다 — 회차 경계를 id 로 옮겼을 때 `recurrence`
+    한 곳만 벽시계에 남은 것이 같은 모양이다(4회차 C④).
+    """
+    return con.execute("SELECT * FROM loop WHERE id=?", (lid,)).fetchone()
+
+
+def promotion_rows(con, key=None, decision=None, maturity=None,
+                   order="at", limit=None):
+    """승격 결정. 없으면 빈 목록, `key` 를 주면 한 행 또는 None."""
+    sql, params = ["SELECT * FROM promotion WHERE 1=1"], []
+    for col, val in (("key", key), ("decision", decision), ("maturity", maturity)):
+        if val is not None:
+            sql.append("AND %s = ?" % col)
+            params.append(val)
+    sql.append("ORDER BY %s" % order)
+    if limit:
+        sql.append("LIMIT %d" % int(limit))
+    rows = con.execute(" ".join(sql), params).fetchall()
+    return (rows[0] if rows else None) if key is not None else rows
+
+
+def live_grants(con, lid):
+    """아직 쓸 수 있는 쓰기 예외."""
+    return con.execute("SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0",
+                       (lid,)).fetchall()
+
+
+def open_loops(con):
+    """열린 작업의 id 들."""
+    return {r["id"] for r in con.execute(
+        "SELECT id FROM loop WHERE closed_at IS NULL")}
 
 
 def loops_created_after(con, epoch):
@@ -1153,7 +1240,7 @@ def sync_promotions(con, cfg):
     proven_after = cfg.num("promotion.proven_after_loops", 3, low=1)
     reopen_after = cfg.num("promotion.reopen_after_loops", 2, low=1)
     changed = []
-    for p in con.execute("SELECT * FROM promotion").fetchall():
+    for p in promotion_rows(con):
         if p["maturity"] == "regressed":
             continue
         _, loops = recurrence(con, p)
@@ -1173,7 +1260,7 @@ def sync_promotions(con, cfg):
 
 def pending_promotions(con, cfg, limit=None):
     """결정이 필요한 항목. regressed 는 결정이 무효화됐으므로 다시 포함한다."""
-    decided = {r["key"]: r for r in con.execute("SELECT * FROM promotion")}
+    decided = {r["key"]: r for r in promotion_rows(con)}
     out = []
     for item in repeated_items(con, cfg):
         p = decided.get(item["key"])
@@ -1211,9 +1298,13 @@ def cycle_window_start(con, lid):
 
 def cycle_seconds(con, lid, lo):
     """회차 창이 열린 뒤 흐른 초. 1회차는 경계 이벤트가 없으므로 작업 생성 시각을 쓴다."""
-    row = (con.execute("SELECT at FROM event WHERE id=?", (lo,)).fetchone() if lo
-           else con.execute("SELECT created_at at FROM loop WHERE id=?", (lid,)).fetchone())
-    return max(0, int(time.time() - ts_epoch(row["at"]))) if row else 0
+    if lo:
+        row = con.execute("SELECT at FROM event WHERE id=?", (lo,)).fetchone()
+        when = row["at"] if row else None
+    else:
+        row = loop_row(con, lid)
+        when = row["created_at"] if row else None
+    return max(0, int(time.time() - ts_epoch(when))) if when else 0
 
 
 def retro_window_start(con, lid):
@@ -1439,22 +1530,17 @@ def work_candidates(con, cfg, root, limit=6):
         if len(out) < limit:
             out.append({"kind": kind, "what": what, "how": how})
 
-    try:
+    with swallow(t("할 일 후보")):
         for it in pending_promotions(con, cfg):
             add(t("승격 결정"), t("'%s' 가 작업 %d개에서 반복된다 — 훅·구조로 올릴지 결정")
                 % (it["key"], it["loops"]),
                 "harness promote %s --as hook --note \"...\"" % it["key"])
-    except Exception:
-        pass
-    try:
-        for r in con.execute("SELECT key, decision, note FROM promotion "
-                             "WHERE maturity='regressed'"):
+    with swallow(t("할 일 후보")):
+        for r in promotion_rows(con, maturity="regressed"):
             add(t("재발한 승격"), t("'%s' 는 %s 로 승격했는데 다시 걸렸다 — 그 방법이 통하지 "
                 "않았다") % (r["key"], r["decision"]),
                 t("원인을 다시 보고 `harness promote %s` 로 다시 결정") % r["key"])
-    except Exception:
-        pass
-    try:
+    with swallow(t("할 일 후보")):
         rep = tidy_report(con, cfg, root)
         for d, note in rep["dirs"]:
             add(t("기록 정리"), "%s %s" % (d, note), t("인덱스를 만들거나 갱신 (Scaffolding)"))
@@ -1467,8 +1553,6 @@ def work_candidates(con, cfg, root, limit=6):
         if rep["learned"] and rep["learned"][0] >= rep["learned"][1]:
             add(t("예산"), t("LEARNED.md 가 %d/%d 줄로 찼다 — 한 줄을 비워야 새 규칙이 들어간다")
                 % rep["learned"], t("harness promote <기존키> --decline --reason \"...\""))
-    except Exception:
-        pass
     return out
 
 
@@ -1497,9 +1581,8 @@ def learned_lines(con, cfg):
     저장된 maturity 가 아니라 실시간 판정을 쓴다 — 그러지 않으면 재발한 규칙이
     항상 로드되는 문서에 계속 남는다(실제로 남았다).
     """
-    rows = con.execute(
-        "SELECT * FROM promotion WHERE decision='rule' ORDER BY at").fetchall()
-    return [r for r in rows if not is_regressed(con, cfg, r)]
+    return [r for r in promotion_rows(con, decision="rule")
+            if not is_regressed(con, cfg, r)]
 
 
 def learned_budget(cfg):
@@ -1710,7 +1793,7 @@ def classify(rel, cfg):
 
 
 def find_grant(con, lid, rel):
-    for g in con.execute("SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0", (lid,)):
+    for g in live_grants(con, lid):
         if glob_match(rel, g["glob"]):
             return g
     return None
@@ -2337,12 +2420,10 @@ def hook_session_start(inp, ctx):
     refresh_wrapper(root)
     # LEARNED.md 는 CLAUDE.md 앵커로 **이 순간** 로드된다. 그러니 여기서 맞춰야 한다.
     # promote 에서만 재생성하면 그 사이 재발한 규칙이 계속 실린다.
-    try:
+    with swallow(t("세션 시작 갱신")):
         with con:
             sync_promotions(con, cfg)
         refresh_learned(con, cfg, root)
-    except Exception:
-        pass  # 복리 장치가 세션 시작을 막지는 않는다
     stage = stage_obj(cfg, sid)
     lines = [
         t("[harness] 작업 %s · 회차 %d · 단계 %s — %s")
@@ -2960,8 +3041,7 @@ def emit_failure_recall(con, cfg, root, target, n, loops, prev):
 
     # 전체 행을 가져온다. is_regressed 가 kind/key/recheck_at 을 쓰므로 일부 열만
     # 고르면 sqlite3.Row 가 IndexError 를 낸다 — 훅이 fail-open 이라 조용히 죽었다.
-    p = con.execute("SELECT * FROM promotion WHERE key=?",
-                    ("tool_fail:%s" % target,)).fetchone()
+    p = promotion_rows(con, key="tool_fail:%s" % target)
     if p and p["decision"] == "declined":
         lines.append(t("이 항목은 승격을 보류한 적이 있다: %s — 또 걸린다면 그 판단이 "
                      "틀렸다는 증거다. 회고에 쓰라.") % (p["note"] or "-"))
@@ -3292,10 +3372,8 @@ def run_hook():
                           "그대로 보고하라") % WRAPPER_CMD)
     finally:
         if con is not None:
-            try:
+            with swallow(t("DB 닫기")):
                 con.close()
-            except Exception:
-                pass
     return 0
 
 
@@ -3459,11 +3537,9 @@ def refresh_engine(root):
             (n, os.path.join(root, HARNESS_DIR, "bin", n))
             for n in sorted(os.listdir(tdir)) if n.startswith("messages.")
     ] if os.path.isdir(tdir) else []:
-        try:
+        with swallow(t("엔진 사본 갱신")):
             with open(os.path.join(tdir, src_rel), encoding="utf-8") as fh:
                 _write_if_changed(dst_abs, fh.read(), 0o644)
-        except Exception:
-            pass  # 사본이 없어도 프로젝트 문서만으로 동작해야 한다
     return changed
 
 
@@ -3528,7 +3604,7 @@ def wrapper_intact(root):
 def status_report(ctx):
     """현재 상태. 출력하지 않는다 — 테스트가 값을 검사할 수 있어야 한다."""
     con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
-    row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+    row = loop_row(con, lid)
     rows = stage_rows(con, lid)
     stage = stage_obj(cfg, sid)
     missing = exit_blockers(con, cfg, root, lid, sid)
@@ -3553,8 +3629,7 @@ def status_report(ctx):
             (lid,))},
         "skips": [dict(r) for r in skips_of(con, lid)],
         "grants": [{"glob": g["glob"], "uses_left": g["uses_left"],
-                    "reason": g["reason"]} for g in con.execute(
-            "SELECT * FROM wgrant WHERE loop_id=? AND uses_left>0", (lid,))],
+                    "reason": g["reason"]} for g in live_grants(con, lid)],
         "auto_skip": (auto_skip_scope_note(con) if auto_skip_on(con) else None),
         "auto_skip_reason": get_meta(con, "auto_skip_reason", "-"),
         "pending_promotions": [it["key"] for it in pending_promotions(con, cfg)],
@@ -3939,6 +4014,13 @@ def render_status(d, cfg):
         for p in d["config_problems"]:
             print("  - %s" % p)
         print()
+    # 삼킨 실패도 사실이다. 곁다리 작업이라 판정은 안 막았지만, **아무도 모르는
+    # 실패**를 남기지 않는 것이 이 플러그인의 전제다.
+    if SWALLOWED:
+        print(t("⚠ 곁다리 작업 %d건이 실패했다 (판정은 계속됐다):") % len(SWALLOWED))
+        for w in SWALLOWED:
+            print("  - %s" % w)
+        print()
     st = d.get("selftest") or []
     fails = [x for x in st if not x.get("ok")]
     if fails:
@@ -4023,8 +4105,7 @@ def _enter(ctx, dest_idx):
     # **들어가는 쪽도 차지해야 한다.** 떠나는 쪽에만 claim 을 붙였더니, 대상 단계 행이
     # 없을 때(설정에서 id 가 바뀐 경우) 0행 갱신인데도 "→ 단계 N" 이라고 말하고
     # 활성 단계가 0개인 루프가 남았다. 다음 명령이 그 작업을 말없이 버렸다.
-    if not claim(con, "UPDATE stage SET status='active', entered_at=? "
-                      "WHERE loop_id=? AND stage=?", (now(), lid, sid)):
+    if not stage_set(con, "enter", (now(), lid, sid)):
         return lid, None, False
     return lid, sid, False
 
@@ -4032,7 +4113,7 @@ def _enter(ctx, dest_idx):
 def _panel_work_candidates(ctx, lid):
     """작업이 정해지지 않았으면 하네스가 아는 할 일을 후보로 내놓는다.
     무인 실행에는 물을 사람이 없으므로, 고를 것을 주지 않으면 거기서 멈춘다."""
-    row = ctx.con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+    row = loop_row(ctx.con, lid)
     if not (row and row["intent"]):
         render_work_candidates(work_candidates(ctx.con, ctx.cfg, ctx.root))
 
@@ -4151,12 +4232,9 @@ def next_cycle(ctx):
     con.execute("DELETE FROM evidence WHERE loop_id=? "
                 "AND kind NOT IN ('intent_set','acceptance')", (lid,))
     con.execute("DELETE FROM wgrant WHERE loop_id=?", (lid,))
-    con.execute("UPDATE stage SET status='pending', entered_at=NULL, left_at=NULL, "
-                "reason=NULL, authorized_by=NULL WHERE loop_id=? AND stage != ?",
-                (lid, ids[0]))
+    stage_set(con, "reset", (lid, ids[0]))
     con.execute("UPDATE loop SET cycle=cycle+1 WHERE id=?", (lid,))
-    con.execute("UPDATE stage SET status='active', entered_at=? "
-                "WHERE loop_id=? AND stage=?", (now(), lid, ids[1]))
+    stage_set(con, "enter", (now(), lid, ids[1]))
     return ids[1]
 
 
@@ -4196,7 +4274,7 @@ def cli_advance(ctx, argv):
     # 기계적 사실이라 확인할 수 있다. 막지는 않는다 — 무엇을 쓸지는 판단이다.
     retro_note = None
     if sid == last:
-        try:
+        with swallow(t("회고 키 확인")):
             keys, found, missing = retro_key_report(
                 con, cfg, root, lid, retro_window_start(con, lid))
             if keys:
@@ -4206,17 +4284,13 @@ def cli_advance(ctx, argv):
                                  "%s-%d" % (lid, cycle_of(con, lid)),
                                  "found=%d/%d missing=%s"
                                  % (len(found), len(keys), ",".join(missing) or "-"))
-        except Exception:
-            pass
 
     snap = None
     with con:
         # **이 단계를 끝내는 것은 한 번뿐이다.** 무조건 UPDATE 였을 때는 병렬 advance
         # 둘이 모두 성공해 열린 작업이 둘 생기거나 가짜 회차 스냅샷이 남았다.
         # 판단을 WHERE 절 안으로 옮겨 rowcount 가 승자를 정하게 한다.
-        if not claim(con, "UPDATE stage SET status='done', left_at=? "
-                          "WHERE loop_id=? AND stage=? AND status='active'",
-                     (now(), lid, sid)):
+        if not stage_set(con, "done", (now(), lid, sid)):
             raise Refuse(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
                            "`harness status` 로 현재 단계를 확인하라.")
                          % stage_obj(cfg, sid)["label"], code=1)
@@ -4310,22 +4384,16 @@ def cli_skip(ctx, argv):
         # 소비점이다 — 자동 승인 `--uses 1` 을 둘이 동시에 써도 하나만 통과한다.
         # 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다.
         if dest == cur or exit_blockers(con, cfg, root, lid, sid):
-            won = claim(con, "UPDATE stage SET status='skipped', left_at=?, reason=?, "
-                             "authorized_by=? WHERE loop_id=? AND stage=? "
-                             "AND status='active'", (now(), reason, by, lid, sid))
+            won = stage_set(con, "skipped", (now(), reason, by, lid, sid))
             skipped.append(sid)
         else:
-            won = claim(con, "UPDATE stage SET status='done', left_at=? "
-                             "WHERE loop_id=? AND stage=? AND status='active'",
-                        (now(), lid, sid))
+            won = stage_set(con, "done", (now(), lid, sid))
         if not won:
             raise Refuse(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
                            "`harness status` 로 현재 단계를 확인하라.")
                          % stage_obj(cfg, sid)["label"], code=1)
         for i in range(cur + 1, dest + 1):
-            con.execute("UPDATE stage SET status='skipped', left_at=?, reason=?, "
-                        "authorized_by=? WHERE loop_id=? AND stage=?",
-                        (now(), reason, by, lid, ids[i]))
+            stage_set(con, "skip_ahead", (now(), reason, by, lid, ids[i]))
             skipped.append(ids[i])
         for s in skipped:
             record_event(con, lid, s, "skip", s, by, reason)
@@ -4516,11 +4584,9 @@ def _recall_files(cfg, root, keywords, limit=6):
                 hits.append(rel)
                 continue
             hay = name.lower()
-            try:
+            with swallow(t("파일 읽기")):
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     hay += "\n" + fh.read(recall_read_bytes(cfg)).lower()
-            except Exception:
-                pass
             if any(kw.lower() in hay for kw in keywords):
                 hits.append(rel)
     return indexes, hits[:max(0, limit - len(indexes))]
@@ -4536,8 +4602,7 @@ def tidy_report(con, cfg, root):
     age_days = cfg.num("tidy.age_days", 30, low=1)
     group_min = cfg.num("tidy.merge_group", 3, low=2)
     cutoff = time.time() - age_days * 86400
-    open_loops = {r["id"] for r in
-                  con.execute("SELECT id FROM loop WHERE closed_at IS NULL")}
+    live = open_loops(con)
 
     out = {"dirs": [], "stale": [], "groups": [], "learned": None, "regressed": []}
     for sub in recall_dirs(cfg):
@@ -4583,19 +4648,18 @@ def tidy_report(con, cfg, root):
             except OSError:
                 continue
             # 열려 있는 작업의 파일은 후보가 아니다 — 아직 쓰이는 중이다.
-            if mt < cutoff and lid_of not in open_loops:
+            if mt < cutoff and lid_of not in live:
                 out["stale"].append((".dev/%s/%s" % (sub, n),
                                      int((time.time() - mt) // 86400)))
         for k, v in groups.items():
-            if len(v) >= group_min and k not in open_loops:
+            if len(v) >= group_min and k not in live:
                 out["groups"].append((k, sorted(v)))
 
     budget = learned_budget(cfg)
     used = len(learned_lines(con, cfg))
     if used:
         out["learned"] = (used, budget)
-    out["regressed"] = con.execute(
-        "SELECT key, decision, note FROM promotion WHERE maturity='regressed'").fetchall()
+    out["regressed"] = promotion_rows(con, maturity="regressed")
     out["stale"].sort(key=lambda it: -it[1])
     return out
 
@@ -4686,7 +4750,7 @@ def _survival(con, cfg):
                          "WHERE kind='promote_verify' ORDER BY id"):
         verified[r["target"]] = (r["detail"] or "").endswith("yes")
     agg = {}
-    for p in con.execute("SELECT * FROM promotion"):
+    for p in promotion_rows(con):
         d = agg.setdefault(p["decision"], {"n": 0, "re": 0, "vn": 0, "vy": 0})
         d["n"] += 1
         if is_regressed(con, cfg, p):
@@ -4906,8 +4970,7 @@ def cli_promote(ctx, argv):
 
     if as_kind == "rule":
         used = len(learned_lines(con, cfg))
-        existing = con.execute("SELECT decision FROM promotion WHERE key=?",
-                               (key,)).fetchone()
+        existing = promotion_rows(con, key=key)
         grows = not (existing and existing["decision"] == "rule")
         if grows and used >= learned_budget(cfg):
             raise Refuse(t("LEARNED.md 예산이 찼다 (%d/%d줄). 항상 로드되는 문서라 상한이 있다.")
@@ -4977,7 +5040,7 @@ def cli_recall(ctx, argv):
     from_intent = False
     if not keywords:
         # Scaffolding 에서 정한 작업을 기본 키워드로 쓴다. 6→2 링크의 연결점.
-        row = con.execute("SELECT intent FROM loop WHERE id=?", (lid,)).fetchone()
+        row = loop_row(con, lid)
         intent = (row["intent"] if row else None) or ""
         picked = [it for it in re.split(r"[\s,·/]+", intent)
                   if len(it) >= 2 and it.lower() not in STOPWORDS][:6]
@@ -5097,8 +5160,7 @@ def cli_stats(ctx, argv):
     with con:
         sync_promotions(con, cfg)
     refresh_learned(con, cfg, root)
-    rows = con.execute("SELECT key, decision, maturity, note FROM promotion "
-                       "ORDER BY maturity, at").fetchall()
+    rows = promotion_rows(con, order="maturity, at")
     if rows:
         print(t("\n승격 이력 — 반복을 기계화한 기록"))
         for r in rows:
@@ -5247,8 +5309,7 @@ def _loop_adopt(ctx, argv, pos):
     # 뿌리는 하나다. `INSERT OR IGNORE` 가 "만들기"와 "이어받기"를 뭉갰고,
     # `cycle` 이 **접두사 구분자**와 **측정 창 번호** 두 일을 겸했다.
     # 그래서 둘을 갈라 명시적으로 처리한다.
-    existed = con.execute("SELECT cycle, closed_at FROM loop WHERE id=?",
-                          (want,)).fetchone()
+    existed = loop_row(con, want)
     with con:
         # **버리는 것도 끝내는 것이다 — 집계는 남는다.** 3회차에는 재연결이
         # `cycle_close` 를 쓰면 회고 창까지 옮겨 가는 것이 문제라 아예 집계를
@@ -5286,7 +5347,7 @@ def _loop_adopt(ctx, argv, pos):
 @loop_sub("show")
 def _loop_show(ctx, argv, pos):
     con, lid = ctx.con, ctx.lid
-    row = con.execute("SELECT * FROM loop WHERE id=?", (lid,)).fetchone()
+    row = loop_row(con, lid)
     print("loop %s · branch %s · created %s"
           % (lid, row["branch"] if row else "-", row["created_at"] if row else "-"))
     if row and row["intent"]:
@@ -5664,7 +5725,7 @@ def cli_init(argv):
     created += install_anchors(root)
     created += install_agents_md(root)
     label = None
-    try:
+    with swallow(t("설치 후 점검")):
         con2 = connect(root)
         if con2 is not None:
             try:
@@ -5673,8 +5734,6 @@ def cli_init(argv):
                     label = label_of(load_config(root, pr), sid2)
             finally:
                 con2.close()
-    except Exception:
-        pass
     render_init(root, created, lid, label)
     return 0
 
@@ -5691,9 +5750,8 @@ def promote_report(ctx):
     return {
         "pending": pending_promotions(ctx.con, ctx.cfg),
         "options": [{"as": k, "why": v} for k, v in promote_as(ctx.cfg).items()],
-        "decided": [dict(r) for r in ctx.con.execute(
-            "SELECT key, decision, maturity, note FROM promotion "
-            "ORDER BY at DESC LIMIT 8")],
+        "decided": [dict(r) for r in
+                    promotion_rows(ctx.con, order="at DESC", limit=8)],
     }
 
 

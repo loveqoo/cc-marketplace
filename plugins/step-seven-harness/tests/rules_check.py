@@ -9,6 +9,8 @@
 탈출 해치(`predicate`)는 특히 이 방식이어야 한다 — WRITE_PREDICATES 는 비어 있는
 것이 정상이므로, 등록해서 돌려보는 것 말고는 동작을 확인할 방법이 없다.
 """
+import ast
+import inspect
 import os
 import sys
 
@@ -428,6 +430,60 @@ finally:
     os.chmod(wp, 0o755)
 ck("쓸 수 있게 되면 복구한다", h.wrapper_intact(root) is False)
 
+# --- 조용한 실패의 출구도 하나다 --------------------------------------------
+# 게이트가 꺼지는 출구는 `inactive()` 하나로 모았는데, **실패를 삼키는 출구는
+# 열한 개** 그대로였다 (`except Exception: pass`). 이 플러그인이 스스로 최악이라고
+# 적어 둔 실패 모드를 자기 코드가 열한 번 하고 있었다.
+print("== 삼킨 실패도 사실로 남는다")
+del h.SWALLOWED[:]
+with h.swallow("실험"):
+    raise RuntimeError("터졌다")
+ck("삼키고 계속 간다", True)
+ck("삼킨 사실이 남는다", len(h.SWALLOWED) == 1, h.SWALLOWED)
+ck("무엇이 왜 실패했는지 적는다",
+   "실험" in h.SWALLOWED[0] and "터졌다" in h.SWALLOWED[0], h.SWALLOWED)
+with h.swallow("실험2"):
+    pass
+ck("성공하면 아무것도 안 남는다", len(h.SWALLOWED) == 1)
+del h.SWALLOWED[:]
+
+_bare = []
+for _fn in [n for n in ast.walk(ast.parse(inspect.getsource(h)))
+            if isinstance(n, ast.FunctionDef)]:
+    for _n in ast.walk(_fn):
+        if (isinstance(_n, ast.ExceptHandler) and _n.type is not None
+                and getattr(_n.type, "id", "") == "Exception"
+                and len(_n.body) == 1 and isinstance(_n.body[0], ast.Pass)):
+            _bare.append("%s:%d" % (_fn.name, _n.lineno))
+ck("넓은 except 로 조용히 삼키는 자리가 없다", not _bare, _bare)
+
+# --- 반복된 질의는 접근자로 모은다 -------------------------------------------
+# 같은 SQL 이 일곱 자리에 흩어져 있으면 뜻이 바뀔 때 하나가 빠진다 — 회차 경계를
+# id 로 옮겼을 때 `recurrence` 한 곳만 벽시계에 남은 것이 그 모양이다(4회차 C④).
+print("== 반복된 질의는 한 곳에서만 쓴다")
+# **같은 질의가 두 자리에 있으면 안 된다.** 원시 SQL 개수 자체는 문제가 아니다 —
+# 집계·정렬이 다른 질의는 진짜로 다른 질의다. 문제는 **같은 것이 흩어진 것**이고,
+# 흩어지면 뜻이 바뀔 때 하나가 빠진다.
+# 문자열은 **ast 로** 뽑는다. 정규식으로 뽑으면 여러 줄로 이어 붙인 SQL 이
+# 조각으로 세어져 없는 중복이 보인다 — 파이썬이 이미 인접 리터럴을 합쳐 준다.
+import collections  # noqa: E402
+import re as _re  # noqa: E402
+_shapes = collections.Counter()
+for _n in ast.walk(ast.parse(inspect.getsource(h))):
+    if not (isinstance(_n, ast.Constant) and isinstance(_n.value, str)):
+        continue
+    _y = _re.sub(r"\s+", " ", _n.value).strip()
+    if _re.match(r"(SELECT|INSERT|UPDATE|DELETE)\b", _y, _re.I) and len(_y) > 20:
+        _shapes[_y] += 1
+_dupes = {k: v for k, v in _shapes.items() if v > 1}
+ck("같은 SQL 이 두 자리에 있지 않다", not _dupes,
+   "; ".join("%d× %s" % (v, k[:60]) for k, v in _dupes.items()))
+ck("loop_row 가 행을 돌려준다", h.loop_row(con, lid) is not None)
+ck("없는 작업이면 None", h.loop_row(con, "__nope__") is None)
+ck("promotion_rows(key=) 는 한 행 또는 None",
+   h.promotion_rows(con, key="__nope__") is None)
+ck("promotion_rows() 는 목록", isinstance(h.promotion_rows(con), list))
+
 # --- 회차 경계당 스냅샷 하나 ------------------------------------------------
 # 4회차 C①: `advance --done` 은 `record_cycle_close` 를 부르고 곧이어
 # `rotate_loop` 을 부르는데 그것도 부른다 → 전부 0 인 유령 회차가 쌓여 지표가
@@ -447,7 +503,6 @@ ck("유령이 아니라 진짜 집계다", first and first.get("blocks", 0) >= 1
 
 # 4회차 C③: `loop adopt` 는 `close_loop` 을 직접 불러 스냅샷 없이 회차를 버렸다 —
 # 마찰이 쌓인 회차를 지우는 가장 싼 방법이었다. `close_loop` 이 남기게 했다.
-import inspect  # noqa: E402
 ck("close_loop 이 cfg 를 요구한다 (빠뜨릴 자리를 없앤다)",
    "cfg" in inspect.signature(h.close_loop).parameters)
 ck("close_loop 이 스냅샷을 남긴다",
