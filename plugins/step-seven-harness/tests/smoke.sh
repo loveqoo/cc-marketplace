@@ -1182,7 +1182,7 @@ OPQ="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","to
   | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
 check "대상을 모르면 훅이 사람에게 묻는다" '"permissionDecision": "ask"' "$OPQ"
 check "무엇을 모르는지 말한다" '무엇을 바꿀지 하네스가 알 수 없다' "$OPQ"
-check "끄는 방법을 알려준다" 'opaque_ask' "$OPQ"
+check "무엇을 하면 되는지 알려준다" '대상이 분명한 형태로' "$OPQ"
 check_absent "정상 명령에는 묻지 않는다" '"ask"' \
   "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls | xargs cat"}}' "$SYMW" \
      | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"

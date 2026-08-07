@@ -26,6 +26,9 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 | 명령 | 용도 | 사용자 승인 |
 | --- | --- | --- |
 | `status` | 현재 작업·회차·단계, 종료 조건 충족 여부, 증거, 스킵·예외 기록 | |
+| `loop intent "<작업>"` | 이번에 할 작업을 기록. **Selection 의 종료 조건** | |
+| `loop done-when "<조건>" ...` | 무엇이 '끝' 인지 기록. **Selection 의 종료 조건** (Verification 이 이것과 대조한다) | |
+| `verify -- <검증 명령>` | 하네스가 직접 돌리고 **통과했을 때만** 증거로 남긴다. 관측이 안 잡힐 때의 확실한 경로 | |
 | `advance` | 다음 단계로. 종료 조건이 남아 있으면 **거부되고 무엇이 남았는지 알려준다** | |
 | `advance --done` | (Compounding 에서만) 작업 종료 → Selection | |
 | `advance --cycle` | (Compounding 에서만) 다음 회차 → Scaffolding, 같은 작업 유지 | |

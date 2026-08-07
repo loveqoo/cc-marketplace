@@ -753,6 +753,12 @@ def config_problems(cfg):
         out.append(t("consent 의 %s 는 실제 명령 이름이 아니다 — 그 항목은 아무것도 "
                      "막지 않는다 (이름: %s)")
                    % (", ".join(sorted(unknown)), ", ".join(sorted(known))))
+    known_kinds = ("block", "tool_fail", "stop_gate", "bypass", "skip")
+    bad_kinds = [k for k in cfg.seq("promotion.kinds") if k not in known_kinds]
+    if bad_kinds:
+        out.append(t("promotion.kinds 의 %s 는 기록되는 이벤트 종류가 아니다 "
+                     "(%s 중에서 골라라) — 그 종류는 아무것도 모으지 않는다")
+                   % (", ".join(sorted(bad_kinds)), ", ".join(known_kinds)))
     if not cfg.seq("promotion.kinds"):
         out.append(t("promotion.kinds 가 비어 있다 — 반복 항목을 하나도 모으지 않으므로 "
                      "Compounding 의 승격 게이트가 늘 충족된 상태가 된다"))
@@ -827,8 +833,15 @@ def new_loop_id():
 
 
 def git_branch(root):
+    """현재 브랜치. **워크트리의 `.git` 은 디렉터리가 아니라 파일**이라 예전에는 늘 None 이었다."""
     try:
-        with open(os.path.join(root, ".git", "HEAD"), encoding="utf-8") as fh:
+        dot = os.path.join(root, ".git")
+        if os.path.isfile(dot):                      # `gitdir: <실제 경로>`
+            with open(dot, encoding="utf-8") as fh:
+                dot = fh.read().split("gitdir:", 1)[1].strip()
+            if not os.path.isabs(dot):
+                dot = os.path.join(root, dot)
+        with open(os.path.join(dot, "HEAD"), encoding="utf-8") as fh:
             line = fh.read().strip()
         return line.split("refs/heads/", 1)[1] if "refs/heads/" in line else line[:12]
     except Exception:
@@ -912,6 +925,13 @@ def rotate_loop(con, cfg, root, lid, intent=None):
     if not claim(con, "UPDATE loop SET closed_at=? WHERE id=? AND closed_at IS NULL",
                  (now(), lid)):
         return None
+    # **포기한 회차도 스냅샷을 남긴다.** `advance --cycle/--done` 만 남겼더니 마찰이
+    # 가장 큰 회차(포기)가 표본에서 통째로 빠져, `loop new` 를 치는 것이 추세를 좋게
+    # 만드는 가장 쉬운 방법이 됐다.
+    try:
+        record_cycle_close(con, cfg, lid, active_stage(con, lid) or cfg["stages"][0]["id"])
+    except Exception:
+        pass
     for tbl in ("stage", "evidence", "wgrant"):
         con.execute("DELETE FROM %s WHERE loop_id=?" % tbl, (lid,))
     return create_loop(con, cfg, root, intent)
@@ -1253,11 +1273,10 @@ def cycle_window_start(con, lid):
     return (row["i"] or 0) if row else 0
 
 
-def cycle_seconds(con, lo):
-    """회차 창이 열린 뒤 흐른 초. 창 시작이 id 가 됐으므로 시각은 그 행에서 읽는다."""
-    if not lo:
-        return 0
-    row = con.execute("SELECT at FROM event WHERE id=?", (lo,)).fetchone()
+def cycle_seconds(con, lid, lo):
+    """회차 창이 열린 뒤 흐른 초. 1회차는 경계 이벤트가 없으므로 작업 생성 시각을 쓴다."""
+    row = (con.execute("SELECT at FROM event WHERE id=?", (lo,)).fetchone() if lo
+           else con.execute("SELECT created_at at FROM loop WHERE id=?", (lid,)).fetchone())
     return max(0, int(time.time() - ts_epoch(row["at"]))) if row else 0
 
 
@@ -1322,7 +1341,7 @@ def cycle_counters(con, lid, lo):
         seen_now.add(r["target"])
 
     return {
-        "dur": cycle_seconds(con, lo),
+        "dur": cycle_seconds(con, lid, lo),
         "blocks": tally.get("block", 0),
         "fails": tally.get("tool_fail", 0),
         "refails": refails,
@@ -2230,7 +2249,7 @@ def bash_writes(cfg, root, cmd):
             continue
         head = os.path.basename(toks[0].strip("\"'"))
         # 읽기 명령에 리다이렉트가 붙은 것(`cat a > b`)은 **b 만** 쓴다.
-        reads_only = head in cfg.seq("bash.readers", BASH_READERS_DEFAULT)
+        reads_only = benign_head(cfg, "readers", head, BASH_READERS_DEFAULT)
         args, k = [], 1
         while k < len(toks):
             tok = toks[k]
@@ -2488,52 +2507,61 @@ def plan_preview(root, cmd):
     return "%s%s\n%s" % (path, tail, text)
 
 
-# 하네스 호출을 **원문에서** 찾는다. 경로 부분은 있어도 없어도 된다.
-CTRL_CALL_RE = re.compile(r"(?:^|[\s'\"=;&|(])(?:[\w./\\-]*[/\\])?"
-                          r"(?:harness\.py|harness)(?=[\s\"\']|$)([^;&|\n]*)")
+# 하네스 호출을 찾는다. 경로 앞머리에 `$`·`~`·`{`·`}` 도 온다 (`$PWD/…/harness`).
+CTRL_CALL_RE = re.compile(r"(?:^|[\s=;&|(])(?:[\w./\\$~{}-]*[/\\])?"
+                          r"(?:harness\.py|harness)(?=\s|$)([^;&|\n]*)")
 
 
 def ctrl_requests(cmd):
-    """명령 문자열의 하네스 제어 호출을 **전부** 찾아 (subcommand, 세그먼트) 로 준다.
+    """제어 호출 전부 → `(sub, pos, direct, seg)`.
 
-    ## 토큰으로 쪼개지 않는다
+      sub    하위 명령. `argv_positional` 과 **같은 규칙**으로 뽑는다.
+      pos    위치 인자 전체. 판정하는 쪽이 다시 파싱하지 않게 함께 준다.
+      direct 세그먼트의 첫 토큰이 하네스인가. 아니면 무엇이 실행될지 확신할 수 없다.
 
-    이 판정은 두 번 뚫렸고 **두 번 다 토큰화가 원인**이었다.
+    ## 세 번 틀린 자리다
 
-      따옴표를 지웠더니   실행 경로가 사라져 게이트가 안 걸렸다 (0.41.0)
-      shlex 로 쪼갰더니   `sh -c '... harness auto-skip on'` 이 **한 토큰**이 되어
-                          basename 이 안 맞았다 — 동의 게이트 여섯 개가 그 한 줄로 사라졌다
+      따옴표 제거   실행 경로가 사라져 게이트가 안 걸렸다
+      shlex 토큰    `sh -c '… harness auto-skip on'` 이 한 토큰이라 안 걸렸다
+      원문 정규식   `sk''ip`·`$(echo skip)` 을 못 읽고, 반대로 커밋 메시지의 `harness`
+                    까지 제어 명령으로 봐서 그 뒤 검사가 통째로 꺼졌다
 
-    쪼개는 방식을 또 고르는 대신 쪼개지 않는다. "이 명령이 하네스를 부르는가" 는
-    셸이 어떻게 감쌌든 **원문에 그 이름이 있는가**의 문제다. 감싸면 감쌀수록 더 걸린다.
-
-    대가는 오탐이다 — `git commit -m "harness skip 구현"` 도 동의를 묻는다. 동의
-    게이트에서 오탐은 다이얼로그 한 번이고, 누락은 게이트가 사라지는 것이다.
+    셋의 공통점은 **모르면 통과**였다. 이제 모르면 묻는다 — 하네스를 부르는 것 같은데
+    하위 명령을 못 읽으면 그 사실 자체가 판정이다(`sub` 이 아는 이름이 아니면 호출자가
+    `ask` 를 낸다). 따옴표는 **지워서** 본다: 셸이 `sk''ip` 를 `skip` 으로 붙여 주므로
+    우리도 붙여야 같은 것을 본다.
     """
     out = []
     for seg in BASH_SPLIT.split(cmd):
-        for tail in CTRL_CALL_RE.findall(seg):
+        bare = seg.replace('"', "").replace("'", "")
+        head = (bare.split() or [""])[0]
+        for tail in CTRL_CALL_RE.findall(bare):
             pos, skip = [], False
             for a in tail.split():
-                a = a.strip("\"'")
                 if skip:
                     skip = False
                     continue
                 if a.startswith("--"):
-                    skip = "=" not in a  # `--flag value` 는 값도 건너뛴다
+                    skip = "=" not in a       # `--flag value` 는 값도 건너뛴다
                     continue
-                if a:
-                    pos.append(a)
-            if pos:
-                sub = pos[0]
-                if len(pos) > 1 and pos[1] in CTRL_SUB2.get(sub, ()):
-                    sub = "%s %s" % (sub, pos[1])
-                out.append((sub, seg))
-            break
+                pos.append(a)
+            if not pos:
+                continue
+            name = pos[0]
+            if len(pos) > 1 and pos[1] in CTRL_SUB2.get(name, ()):
+                name = "%s %s" % (name, pos[1])
+            direct = os.path.basename(head) in CTRL_NAMES or head.endswith(
+                tuple("/" + n for n in CTRL_NAMES))
+            out.append((name, pos, direct, seg))
     return out
 
 
-def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
+def ctrl_known(sub):
+    return sub in set(CLI) | {"%s %s" % (k, v)
+                              for k, vs in CTRL_SUB2.items() for v in vs}
+
+
+def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
     """제어 명령에 대한 판정을 **돌려준다**(emit 하지 않는다).
 
     한 Bash 명령에 제어 호출이 여러 개 있을 수 있어서, 호출자가 전부 순회하며
@@ -2543,7 +2571,9 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
     if sub == "auto-skip":
         # off 는 게이트 복원이므로 동의 없이 허용한다. on 은 게이트를 무력화하므로
         # 반드시 사람의 동의를 받는다 — 그러지 않으면 모델이 스스로 켤 수 있다.
-        if not re.search(r"auto-skip\s+on\b", cmd):
+        # 원문을 다시 뒤지지 않는다. `auto-skip --reason x on` 과 `auto-skip "on"` 이
+        # CLI 에서는 on 인데 이 정규식에서는 아니어서 게이트가 통째로 사라졌다.
+        if "on" not in pos[1:]:
             return
     elif sub not in consent_map(cfg):
         return
@@ -2551,12 +2581,9 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
     if sub == "skip":
         # 불가능한 스킵은 **묻지 않고** 거부한다. 승인을 받아봐야 거부되고,
         # 그러면 모델이 다시 시도해 다이얼로그만 반복된다.
-        pos = [it for it in sh_tokens(cmd)[1:] if not it.startswith("--")]
-        tgt = None
-        for i, it in enumerate(pos):
-            if it == "skip" and i + 1 < len(pos):
-                tgt = pos[i + 1]
-                break
+        # 훅이 `--reason` 의 **값**을 위치 인자로 세는 바람에 CLI 는 실행하는 명령을
+        # 훅이 "알 수 없는 대상: x" 로 막았다. 같은 pos 를 쓴다.
+        tgt = pos[1] if len(pos) > 1 else None
         if tgt:
             why = skip_block_reason(cfg, sid, tgt, con, root, lid)
             if why:
@@ -2564,6 +2591,13 @@ def ctrl_decision(con, cfg, root, sub, cmd, mode, lid, sid):
                 return pre_decision("deny", why)
 
     reason = raw_flag(cmd, "reason")
+    if not direct:
+        # 하네스를 부르는 것 같지만 세그먼트의 머리가 아니다 — 무엇이 실행될지
+        # 확신할 수 없다. **거부하지 않고 묻는다.** 여기서 거부하면 커밋 메시지에
+        # `harness skip` 을 쓴 것만으로 빠져나갈 길이 없어진다(막다른 길).
+        return pre_decision("ask", t("이 명령 안에 하네스 제어 호출(%s)이 보인다. "
+                                     "실제로 실행되는지 하네스가 확신할 수 없어 사람에게 "
+                                     "묻는다: `%s`") % (sub, cmd.strip()[:200]))
     if sub != "approve-plan" and not reason:
         record_event(con, lid, sid, "block", "no_reason", sub, cmd[:200])
         return pre_decision("deny",
@@ -2652,14 +2686,24 @@ def hook_pre_tool_use(inp, ctx):
                   "승인 없이 임의 코드가 실행된다. 그래서 실행하지 않았다. %s")
                 % (WRAPPER_CMD, restored))))
 
-        reqs = ctrl_requests(cmd)
-        for req_sub, seg in reqs:
+        for req_sub, req_pos, direct, seg in ctrl_requests(cmd):
+            if not ctrl_known(req_sub):
+                # 하네스를 부르는데 하위 명령을 읽을 수 없다(`$(echo skip)`, `$C`).
+                # **모르면 통과가 아니라 물음이다** — 이 판정이 세 번 뚫린 이유가
+                # 전부 "모르면 통과" 였다.
+                return emit(pre_decision("ask", t(
+                    "이 명령이 하네스를 부르는데 어떤 하위 명령인지 읽을 수 없다 "
+                    "(`%s`). 셸 치환이 섞이면 실행 시점에야 정해지므로 사람이 봐야 "
+                    "한다. 하위 명령을 그대로 적으면 하네스가 판정한다.")
+                    % cmd.strip()[:200]))
             with con:
-                out = ctrl_decision(con, cfg, root, req_sub, seg, mode, lid, sid)
+                out = ctrl_decision(con, cfg, root, req_sub, req_pos, direct,
+                                    seg, mode, lid, sid)
             if out:
                 return emit(out)
-        if reqs:
-            return  # 제어 명령이지만 동의가 필요 없다
+        # **제어 명령이라고 뒤 검사를 건너뛰지 않는다.** 건너뛰었더니 명령 어딘가에
+        # `harness` 라는 낱말과 위치 인자 하나만 있으면 쓰기 규칙과 opaque 검사가
+        # 통째로 꺼졌다 — `echo "harness 관련" > docs/x.md` 가 그대로 통과했다.
 
         # Bash 쓰기도 **같은 규칙 엔진**을 지난다. 예전에는 `docs_readonly` 규칙 하나만
         # 여기 손으로 베껴져 있었고, 나머지 여섯 규칙은 Bash 에 없었다 — `stage_write`
@@ -2680,8 +2724,7 @@ def hook_pre_tool_use(inp, ctx):
             return emit(pre_decision("ask", t(
                 "이 명령이 무엇을 바꿀지 하네스가 알 수 없다 — %s. 단계별 쓰기 규칙을 "
                 "적용할 대상을 정할 수 없으므로 사람이 봐야 한다. 대상이 분명한 형태로 "
-                "바꿔 쓰면(예: 경로를 직접 적으면) 규칙이 대신 판정한다. 이 물음이 "
-                "잦으면 `stages.json` 의 `bash.opaque_ask` 를 false 로 둘 수 있다.")
+                "바꿔 쓰면(예: 경로를 직접 적으면) 규칙이 대신 판정한다.")
                 % why))
         return
 
@@ -3373,7 +3416,8 @@ def wrapper_intact(root):
     # **엔진 경로만 다르면 변조가 아니라 낡은 것이다.** 플러그인을 업데이트하면 캐시
     # 디렉터리 이름이 바뀌어 그 줄이 달라진다 — 아무도 손대지 않았는데 보안 경고가
     # 뜨고 `wrapper_tampered` 가 통계를 오염시켰다. 조용히 맞춰 놓는다.
-    stale = have is not None and wrapper_shape(have) == wrapper_shape(want)
+    # 파일이 아예 없는 것은 변조가 아니다 — 새 클론·워크트리에는 원래 없다(gitignore).
+    stale = have is None or wrapper_shape(have) == wrapper_shape(want)
     ok = refresh_wrapper(root) is not None
     if not ok:
         return None                              # 복구도 못 했다
@@ -3528,7 +3572,19 @@ NOT_VERIFICATION = ("ls", "echo hi", "true", "cat README.md", "git status", "pwd
                     'echo "npm test"', 'git commit -m "ran npm test"',
                     "cat tsc.log", "grep -rn pytest src/", "ls | grep vitest")
 # 이 도구를 썼다는 사실만으로 검증이 됐다고 볼 수 없다. 읽기·탐색은 검증이 아니다.
-INNOCUOUS_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "TodoWrite")
+# MCP 이름도 넣는다 — 브라우저 목록 조회가 검증으로 세어졌는데 탐침이 그 자리를 못 봤다.
+INNOCUOUS_TOOLS = ("Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "TodoWrite",
+                   "mcp__claude-in-chrome__list_connected_browsers",
+                   "mcp__claude-in-chrome__tabs_close_mcp")
+# **인정되어야 하는** 검증 명령. 과다만 재고 과소를 안 재면, 정직하게 테스트를 돌린
+# 프로젝트일수록 게이트가 안 열리고 사용자는 스킵으로 빠진다 — 그것이 게이트를 끄는 길이다.
+MUST_VERIFY = ("npm test", "pnpm -r test", "yarn workspace app test", "bun test",
+               "python -m pytest", "uv run pytest", "poetry run pytest", "tox",
+               "npx playwright test", "npx vitest run", "pytest -q", "vitest",
+               "go test ./...", "cargo test", "cargo nextest run",
+               "mvn -q test", "gradle check", "./gradlew test", "dotnet test",
+               "deno test", "swift test", "ctest", "rspec", "bin/rails test",
+               "make check", "make test", "npx tsc --noEmit", "ruff check .", "mypy .")
 
 
 def selftest_criteria(cfg):
@@ -3537,6 +3593,10 @@ def selftest_criteria(cfg):
     for name, spec in sorted((cfg.obj("criteria") or {}).items()):
         if not isinstance(spec, dict):
             continue
+        if spec.get("human") and spec.get("satisfied_by") != "cli":
+            out.append((t("%s 는 사람만 채울 수 있는 방식인가") % name, False,
+                        t("human: true 인데 satisfied_by=%s 다 — 파일을 쓰거나 도구를 "
+                          "쓰는 것만으로 사람의 승인이 된다") % spec.get("satisfied_by")))
         if spec.get("satisfied_by") == "file":
             pats = cfg.seq("criteria.%s.write_glob" % name)
             hits = [p for p in UNRELATED
@@ -3569,6 +3629,13 @@ def selftest_criteria(cfg):
             # 엔진이 실제로 쓰는 판정(`verification_hit`)과 다른 것을 검사했다.
             hits = [c for c in NOT_VERIFICATION
                     if vre is not None and verification_hit(cfg, c)]
+            missed = [c for c in MUST_VERIFY if not verification_hit(cfg, c)]
+            out.append((t("%s 가 실제 검증 명령을 받아들인다") % name, not missed,
+                        t("이것들을 거부한다: %s") % ", ".join(missed[:4]) if missed
+                        else t("%d종을 전부 받아들인다") % len(MUST_VERIFY)))
+            if vre is None:
+                out.append((t("%s 에 판정 기준이 있다") % name, False,
+                            t("bash_pattern 이 없어 아무 명령도 검증이 되지 못한다")))
             out.append((t("%s 는 검증 명령만 인정한다") % name, not hits,
                         t("검증이 아닌 명령도 인정: %s") % ", ".join(hits) if hits
                         else t("검증 명령만 인정한다")))
@@ -3631,7 +3698,7 @@ def selftest(ctx):
                 # 그래서 `sh -c '... harness auto-skip on'` 으로 동의 게이트 여섯 개가
                 # 통째로 사라진 것을 22/22 라는 숫자가 가려 줬다. 탐침 목록이 게이트
                 # 목록보다 좁으면, 그 숫자는 강제가 온전하다고 거짓말을 한다.
-                subs = [sub for sub, _ in ctrl_requests(tgt)]
+                subs = [c[0] for c in ctrl_requests(tgt)]
                 need = consent_map(cfg)
                 blocked = any(sub in need for sub in subs)
                 why = ",".join(subs) or t("제어 명령으로 안 보임")
@@ -4159,8 +4226,13 @@ def cli_verify(ctx, argv):
         return 2
     # 관측 경로와 **같은 판정**을 쓴다. 두 곳이 갈리면 `verify` 로는 되는데 그냥
     # 돌리면 안 되는(또는 그 반대) 일이 생긴다.
-    if cfg.at("criteria.verification_evidence.bash_pattern") \
-            and not verification_hit(cfg, cmd):
+    # 패턴이 없으면 검사를 건너뛰었다 — 그 순간 이 명령은 게이트를 지나는 **셸**이
+    # 된다. 없으면 거부한다. 무엇이 검증인지 모르면 아무것도 돌리지 않는 것이 맞다.
+    if not cfg.at("criteria.verification_evidence.bash_pattern"):
+        print(t("`criteria.verification_evidence.bash_pattern` 이 없다 — 무엇이 검증인지 "
+                "정해지지 않았으므로 아무것도 실행하지 않는다."))
+        return 2
+    if not verification_hit(cfg, cmd):
         print(t("검증 명령으로 보이지 않는다: %s") % cmd)
         print(t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."))
         return 2
@@ -4224,6 +4296,13 @@ def cli_approve_plan(ctx, argv):
         print(t("계획 파일이 아니다: %s") % rel)
         print(t("이 회차의 계획은 %s 아래에 `%s` 로 시작하는 이름이어야 한다.")
               % (", ".join(want), pre))
+        return 2
+    if evidence_digest(root, rel) is None:
+        # 지문을 못 구하면 그 승인은 **만료될 수 없다.** `chmod 000` 한 번으로 승인 후
+        # 계획을 통째로 갈아치울 수 있었다. 읽을 수 없으면 승인하지 않는다.
+        print(t("계획 파일을 읽을 수 없어 승인할 수 없다: %s") % rel)
+        print(t("읽을 수 있게 한 뒤 다시 시도하라 — 승인은 그 시점의 내용에 대한 것이라 "
+                "내용을 확인할 수 없으면 기록이 거짓이 된다."))
         return 2
     with con:
         record_evidence(con, lid, sid, "plan_file", rel, root)
@@ -5296,7 +5375,9 @@ def install_db(root, cfg):
 def install_gitignore(root):
     """런타임 상태를 커밋 대상에서 뺀다."""
     gi = os.path.join(root, ".gitignore")
+    # 격리한 손상 DB 사본도 런타임 상태다 — 커밋 대상이 아니다.
     want = [".claude/harness/harness.db", ".claude/harness/harness.db-wal",
+            ".claude/harness/harness.db.corrupt-*",
             ".claude/harness/harness.db-shm", ".claude/harness/bin/"]
     have = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
     # 행 단위로 본다. substring 으로 보면 주석에 경로가 언급된 것만으로
@@ -5375,8 +5456,16 @@ def install_anchors(root):
            if a not in lines]
     if not add:
         return []
-    with open(cm, "a", encoding="utf-8") as fh:
-        if body and not body.endswith("\n"):
+    # 읽고-쓰는 사이에 다른 `init` 이 넣을 수 있다. 동시 넷이 앵커를 세 번 겹쳐
+    # 넣었다 — 이 파일은 세션마다 로드되므로 중복은 그대로 컨텍스트 낭비다.
+    with open(cm, "a+", encoding="utf-8") as fh:
+        fh.seek(0)
+        now_lines = {ln.strip() for ln in fh.read().splitlines()}
+        add = [a for a in add if a not in now_lines]
+        if not add:
+            return []
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() and not body.endswith("\n"):
             fh.write("\n")
         fh.write("\n" + "\n".join(add) + "\n")
     return [t("CLAUDE.md (앵커 %d줄)") % len(add)]

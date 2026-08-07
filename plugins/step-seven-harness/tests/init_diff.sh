@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # init 이 **무엇을 잃지 않았는지** 차등 실행으로 확인한다.
 #   usage: sh init_diff.sh [repo-root]
 # 스모크 스위트에 넣지 않는다 — git 히스토리를 필요로 하고 8개 픽스처에
@@ -10,8 +10,10 @@
 #
 # 그래서 불변식을 한 방향으로 바꿨다: **옛 엔진이 만든 것을 새 엔진이 잃지 않는다.**
 #   - 파일 트리: 옛 것 ⊆ 새 것 (추가는 허용하고 보고만 한다)
-#   - 사용자 파일 내용(CLAUDE.md/.gitignore/settings.json): 완전히 같아야 한다
-#     — 남의 글을 덮는 것이 이 검사가 잡아야 할 진짜 사고다
+#   - 사용자 파일 내용(CLAUDE.md/.gitignore/settings.json): 옛 줄이 **하나도 사라지지
+#     않아야** 한다 — 남의 글을 덮는 것이 이 검사가 잡아야 할 진짜 사고다.
+#     (완전 일치를 요구했더니 `.gitignore` 에 항목 하나를 **더한** 것이 손실로 잡혔다.
+#      머리말은 "잃지 않는다" 인데 구현만 "동일" 이었다. 구현을 말에 맞춘다.)
 #   - 종료 코드: 같아야 한다
 # 출력 문구 차이는 보고하되 실패로 세지 않는다.
 REPO=${1:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -72,16 +74,18 @@ for c in empty claude_md gitignore settings_dict settings_empty all anchor_in_pr
   # 옛 엔진이 만들었는데 새 엔진이 만들지 않은 파일. 이것만 실패다.
   LOST=$(comm -23 "$T/ta" "$T/tb")
   GAIN=$(comm -13 "$T/ta" "$T/tb")
-  if [ -z "$LOST" ] && [ "$(bodies "$A")" = "$(bodies "$B")" ] && [ "$RA" = "$RB" ]; then
+  bodies "$A" > "$T/ba"; bodies "$B" > "$T/bb"
+  BLOST=$(comm -23 <(sort -u "$T/ba") <(sort -u "$T/bb"))
+  if [ -z "$LOST" ] && [ -z "$BLOST" ] && [ "$RA" = "$RB" ]; then
     echo "  보존   $c$([ -n "$GAIN" ] && printf ' (추가: %s)' "$(echo $GAIN)")"
     SAME=$((SAME+1))
     rm -rf "$T"
   else
     echo "  퇴행   $c   (exit $RA vs $RB)"
     DIFF=$((DIFF+1))
-    [ -n "$LOST" ] && printf '         잃음 %s\n' "$(echo $LOST)"
+    [ -n "$LOST" ] && printf '         파일 잃음 %s\n' "$(echo $LOST)"
+    [ -n "$BLOST" ] && printf '         줄 잃음 %s\n' "$(echo $BLOST)"
     printf '%s\n' "$OA" > "$T/oa"; printf '%s\n' "$OB" > "$T/ob"
-    bodies "$A" > "$T/ba"; bodies "$B" > "$T/bb"
     diff "$T/oa" "$T/ob" | head -8 | sed 's/^/         출력 /'
     diff "$T/ba" "$T/bb" | head -10 | sed 's/^/         파일 /'
     diff "$T/ta" "$T/tb" | head -6 | sed 's/^/         트리 /'
