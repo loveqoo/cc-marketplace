@@ -59,10 +59,13 @@ for c in $CHECKERS; do
   run "$c" python3 "$HERE/$c.py" "$REPO"
 done
 run init_diff  bash "$HERE/init_diff.sh" "$REPO"
+# **출시 인수 시나리오도 여기 들어온다.** 밖에 두면 "커밋 전 검사"와 "출시 전 검사"
+# 두 입구가 생기고, 입구가 여럿이면 하나는 빠뜨린다 — 이 파일이 존재하는 이유다.
+run release    sh "$HERE/release.sh" "$REPO"
 
 # ② 개수 바닥. 검사기가 조용히 빠지면 여기서 걸린다.
-if [ "$RAN" -lt 8 ]; then
-  echo "검사를 $RAN 개밖에 돌리지 않았다 (최소 8) — 목록이 깨졌다" >&2
+if [ "$RAN" -lt 9 ]; then
+  echo "검사를 $RAN 개밖에 돌리지 않았다 (최소 9) — 목록이 깨졌다" >&2
   exit 1
 fi
 

@@ -466,7 +466,7 @@
   "정리 후보 (Scaffolding 단계의 일이다. 삭제·병합 여부는 자율)": "정리 후보 (Scaffolding 단계의 일이다. 삭제·병합 여부는 자율)",
   "정리 후보: %s — `harness tidy` 로 목록을 본다": "정리 후보: %s — `harness tidy` 로 목록을 본다",
   "제어: `.claude/harness/bin/harness` {status | advance | skip <대상> --reason \"...\"} · 나머지 명령은 `harness help`": "제어: `.claude/harness/bin/harness` {status | advance | skip <대상> --reason \"...\"} · 나머지 명령은 `harness help`",
-  "조회 명령은 동의를 묻지 않는다": "조회 명령은 동의를 묻지 않는다",
+  "조회 명령은 동의를 묻지 않는다 (%s)": "조회 명령은 동의를 묻지 않는다 (%s)",
   "종료 조건": "종료 조건",
   "주의: .claude/settings.json 을 다른 쪽이 동시에 쓰고 있어 권한 허용을 건너뛰었다. 남의 변경을 덮지 않으려고 포기한 것이다 — `harness init` 을 다시 실행하면 된다.": "주의: .claude/settings.json 을 다른 쪽이 동시에 쓰고 있어 권한 허용을 건너뛰었다. 남의 변경을 덮지 않으려고 포기한 것이다 — `harness init` 을 다시 실행하면 된다.",
   "주의: .claude/settings.json 을 읽을 수 없어 권한 허용을 건너뛰었다.": "주의: .claude/settings.json 을 읽을 수 없어 권한 허용을 건너뛰었다.",

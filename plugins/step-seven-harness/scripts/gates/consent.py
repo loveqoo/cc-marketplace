@@ -69,8 +69,16 @@ def register(h):
             out.append((h.t("모르는 하위 명령은 묻는다"),
                         h._bind(ask, "%s bogus-subcommand" % h.WRAPPER_CMD), True))
             # 통과하는 쪽이 없으면 이 게이트는 구분력이 없다 — 조회 명령은 묻지 않는다.
-            out.append((h.t("조회 명령은 동의를 묻지 않는다"),
-                        h._bind(ask, "%s status" % h.WRAPPER_CMD), False))
+            #
+            # **껍데기마다 본다.** 무거운 명령은 껍데기를 돌려 쓰는데(i % 4) 통과하는
+            # 쪽은 '그대로' 하나뿐이었다. 그동안 `sh -c '<래퍼> status'` 는 "하네스
+            # 자신은 Bash 로도 변경할 수 없다" 로 **거절**되고 있었고, 자기검사는
+            # 39/39 였다 — 조회를 변경으로 오판한 것을 아무도 묻지 않았기 때문이다
+            # (출시 시나리오 ③ 실측). 과잉 차단은 통과하는 쪽에서만 보인다.
+            for i, wrap in enumerate(self.WRAPS):
+                shape = (h.t("그대로"), h.t("따옴표"), h.t("sh -c"), h.t("중첩 셸"))[i]
+                out.append((h.t("조회 명령은 동의를 묻지 않는다 (%s)") % shape,
+                            h._bind(ask, wrap % ("%s status" % h.WRAPPER_CMD)), False))
             return out
 
         def problems(self, cfg):

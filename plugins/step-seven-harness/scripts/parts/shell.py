@@ -206,8 +206,15 @@ def floor_verdict(cfg, root, cmd):
 EXPAND_RE = re.compile(r"\$\(|`|\$\{|\$[A-Za-z_]|\$'")
 
 
-# 인터프리터에 코드를 인라인으로 넘기는 형태. 그 안은 셸 토큰이 아니다.
-INLINE_CODE_RE = re.compile(r"(?:^|\s)-(?:c|e|-eval)(?:\s|=|$)|<<\s*\w")
+# 인터프리터에 코드를 인라인으로 넘기는 플래그. **묶음 단축옵션까지 본다** —
+# `bash -lc "…"` 는 `-c` 와 같은 일을 하는데 `-c` 만 찾으면 안 보인다. 안 보이면
+# 그 안은 평평한 경로 목록으로 읽히고, 실행 대상이 변경 대상이 됐다(실측:
+# `bash -lc "<래퍼> auto-skip on"` → "하네스 자신은 변경할 수 없다" 로 거절).
+INLINE_FLAG_RE = re.compile(r"^-(?:[A-Za-z]*c|e|-eval)$")
+
+
+# 그 형태가 명령 안에 있나. 그 안은 셸 토큰이 아니다.
+INLINE_CODE_RE = re.compile(r"(?:^|\s)-(?:[A-Za-z]*c|e|-eval)(?:\s|=|$)|<<\s*\w")
 
 
 def bash_unresolved(cfg, cmd):
@@ -253,9 +260,17 @@ def bash_unresolved(cfg, cmd):
     return None
 
 
-def ctrl_exec_seg(toks):
-    """이 세그먼트가 **하네스를 실행**하나. 그러면 인라인 코드가 아니다."""
-    return any(os.path.basename(x.strip("\"'")) in CTRL_NAMES for x in toks[:2])
+def ctrl_exec_seg(toks, depth=0):
+    """이 세그먼트가 **하네스를 실행**하나. 그러면 인라인 코드가 아니다.
+
+    `sh -c '<래퍼> status'` 의 하네스 이름은 `toks[:2]` 밖 — 인라인 코드 **안**에
+    있다. 밖만 보면 조회 명령 하나가 "읽지 못하는 코드" 로 되물어진다. 껍데기를
+    벗기고 같은 질문을 다시 한다.
+    """
+    if any(os.path.basename(x.strip("\"'")) in CTRL_NAMES for x in toks[:2]):
+        return True
+    code = _inline_code(toks) if depth < INLINE_DEPTH else None
+    return bool(code) and ctrl_exec_seg(sh_tokens(code), depth + 1)
 
 
 def bash_opaque(cmd):
@@ -266,7 +281,7 @@ def bash_opaque(cmd):
     return None
 
 
-def bash_protected_hit(cfg, root, cmd):
+def bash_protected_hit(cfg, root, cmd, depth=0):
     """Bash 명령이 보호 경로를 **대상으로** 삼는지. 실행하는 것은 대상이 아니다.
 
     check_write 는 Write/Edit 만 본다. Bash 는 `rm`, `sed -i`, 리다이렉트,
@@ -348,12 +363,47 @@ def bash_protected_hit(cfg, root, cmd):
             continue
         # 인터프리터도 같은 검사를 받는다. `interpreters: ["rm"]` 로 다음 인자를
         # '실행 대상'으로 건너뛰게 만들면 설정만으로 잠금이 풀렸다 — 5차 리뷰.
-        skip = 2 if benign_head(cfg, "interpreters", head,
-                                BASH_INTERPRETERS_DEFAULT) and len(toks) > 1 else 1
-        for tok in toks[skip:]:
+        interp = benign_head(cfg, "interpreters", head,
+                             BASH_INTERPRETERS_DEFAULT) and len(toks) > 1
+        # **인라인 코드는 경로 목록이 아니라 또 하나의 명령이다.** 평평한 토큰으로
+        # 훑으면 그 안의 **실행 대상**이 변경 대상으로 읽힌다 — `sh -c '<래퍼>
+        # status'` 가 "하네스 자신은 Bash 로도 변경할 수 없다" 로 거절됐다(출시
+        # 시나리오 ③ 실측). 조회 명령인데 변경으로 판정한 것이다.
+        #
+        # `floor_named` 는 이미 "실행은 언급이 아니다" 를 알고 `_invocation` 으로
+        # 가른다. 여기만 그것을 몰랐다. 안쪽에 같은 질문을 다시 던지면 답이 하나가
+        # 된다 — 실행이면 지나가고, `sh -c 'rm <DB>'` 는 그대로 거절된다.
+        code = _inline_code(sh_tokens(seg)) if interp else None
+        if code is not None:
+            if depth < INLINE_DEPTH:
+                hit = bash_protected_hit(cfg, root, code, depth + 1)
+                if hit:
+                    return hit
+            continue
+        for tok in toks[2 if interp else 1:]:
             hit = protected(tok)
             if hit:
                 return hit
+    return None
+
+
+# 인라인 코드 안의 인라인 코드까지는 본다. 그보다 깊으면 원문 감시(`floor_named`)와
+# `bash_unresolved` 가 받는다 — 둘 다 '모르면 묻는다' 로 끝나므로 통과가 아니다.
+INLINE_DEPTH = 3
+
+
+def _inline_code(toks):
+    """인터프리터에 **코드로** 넘긴 문자열. 없으면 None.
+
+    `INLINE_CODE_RE` 는 그것이 **있는지**를 보고, 여기서는 **무엇인지**를 꺼낸다.
+    같은 어휘를 둘로 적지 않도록 플래그 모양은 `INLINE_FLAG_RE` 하나로 둔다.
+    """
+    for i, tok in enumerate(toks[1:], 1):
+        if INLINE_FLAG_RE.match(tok):
+            return toks[i + 1] if i + 1 < len(toks) else ""
+        head, sep, rest = tok.partition("=")
+        if sep and INLINE_FLAG_RE.match(head):
+            return rest
     return None
 
 
