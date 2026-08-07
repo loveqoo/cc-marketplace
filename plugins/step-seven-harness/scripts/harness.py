@@ -53,7 +53,7 @@ _MESSAGES = {}
 LANG_ENV = "HARNESS_LANG"
 # 정의 시점에 번역할 수 없어 사용 지점에서 감싸는 상수들. 검사기가 이 목록을 안다.
 LAZY_MSG_NAMES = ("USAGE", "AGENTS_BLOCK", "LEARNED_HEAD", "PROMOTE_AS_DEFAULT",
-                  "SELFTEST", "UNRELATED", "NOT_VERIFICATION",
+                  "UNRELATED", "NOT_VERIFICATION",
                   "INNOCUOUS_TOOLS",
                   "SELF_LOCK_MSG", "TREND_KEYS", "VERDICT_TEXT",
                   "NO_CYCLES", "WRAPPER", "RECALL_DIRS_DEFAULT",
@@ -600,7 +600,9 @@ def config_problems(cfg):
     막지는 않는다 — 설정이 조금 틀렸다고 세션을 벽돌로 만들면 그게 더 나쁘다.
     무엇이 무시되고 있는지 **말한다.**
     """
-    out = []
+    # 게이트는 **자기 설정을 스스로 진단한다.** 여기서 게이트마다 적으면 게이트를
+    # 더할 때 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
+    out = gate_problems(cfg)
     crit = cfg.obj("criteria")
     for name, spec in sorted(crit.items()):
         if not isinstance(spec, dict):
@@ -689,41 +691,6 @@ def config_problems(cfg):
     # 아무 말 없이 강제를 껐다. 적대적 리뷰에서 여섯 모양으로 확인했다.
     # 바닥값(SELF_LOCK)이 있으므로 하네스 자기 잠금은 이제 이것들로 풀리지 않지만,
     # 사용자가 지정한 보호 경로와 규칙은 여전히 조용히 사라질 수 있다.
-    fr_raw = cfg.get("folder_rules")
-    if isinstance(fr_raw, dict) and "protected_paths" in fr_raw \
-            and not cfg.seq("folder_rules.protected_paths"):
-        out.append(t("folder_rules.protected_paths 가 비어 있다 — 하네스 자신은 "
-                     "코드의 바닥값으로 계속 보호되지만, 여기에 적었던 경로는 "
-                     "더 이상 보호되지 않는다"))
-    if "write_rules" in cfg and not (cfg.get("write_rules") or []):
-        out.append(t("write_rules 가 비어 있다 — 폴더·파일명 규칙이 하나도 없다 "
-                     "(하네스 자기 잠금만 바닥값으로 남는다)"))
-    if not isinstance(cfg.get("write_rules", []), list):
-        out.append(t("write_rules 가 배열이 아니다 — 규칙이 하나도 적용되지 않는다"))
-    # 문법이 맞는데 아무것도 안 맞는 정규식. `(?!)` 이 그 예다.
-    mpat = cfg.at("bash.mutator_pattern")
-    if mpat:
-        try:
-            probe = re.compile(mpat)
-        except re.error:
-            probe = None
-        if probe is not None and not any(probe.search(s) for s in
-                                         ("rm x", "mv a b", "echo x > y", "sed -i s/a/b/ f")):
-            out.append(t("bash.mutator_pattern 이 흔한 변경 명령을 하나도 잡지 못한다 "
-                         "— 문법은 맞지만 사실상 꺼진 것이다"))
-    dead = [(r.get("id") or i) for i, r in enumerate(write_rules(cfg))
-            if not rule_reachable(cfg, r)]
-    if dead:
-        out.append(t("write_rules 의 %s 는 어떤 경로에도 해당할 수 없다 "
-                     "(모르는 class 이거나 판정이 없다) — 아무것도 막지 못한다")
-                   % ", ".join(str(d) for d in dead[:5]))
-    for i, r in enumerate(write_rules(cfg)):
-        cls = (r.get("when") or {}).get("class") if isinstance(r.get("when"), dict) else None
-        if cls is not None and cls not in known_classes(cfg):
-            out.append(t("write_rules[%s].when.class='%s' 는 path_classes 에 없다 "
-                         "(%s 중 하나) — 이 규칙은 죽어 있다")
-                       % (r.get("id") or i, cls,
-                          "/".join(sorted(known_classes(cfg)))))
     # 검증 증거 패턴을 **탐침한다.** 설정 텍스트를 읽어 "이게 너무 넓은가"를 판단하는
     # 것은 끝이 없다(`.*`, `.+`, `[\s\S]*`, `|`…). 대신 **증거가 되면 안 되는 명령**을
     # 넣어 보고 걸리는지 본다. 파싱이 아니라 실험이다.
@@ -740,28 +707,7 @@ def config_problems(cfg):
                 out.append(t("criteria.verification_evidence.bash_pattern 이 검증이 "
                              "아닌 명령도 증거로 인정한다 (%s) — 성공한 아무 명령이나 "
                              "Verification 을 통과시킨다") % ", ".join(hits))
-    # readers·interpreters 는 둘 다 '무해 선언' 이고 둘 다 잠금을 푸는 데 쓰였다.
-    for key, what in (("readers", t("읽기")), ("interpreters", t("인터프리터"))):
-        bad = [r for r in cfg.seq("bash." + key) if r in NEVER_BENIGN]
-        if bad:
-            out.append(t("bash.%s 의 %s 는 변경 명령이라 %s로 선언할 수 없다 "
-                         "— 무시된다") % (key, ", ".join(sorted(bad)), what))
 
-    known = set(CLI) | {"loop new", "loop adopt"}
-    unknown = [k for k in consent_map(cfg) if k not in known]
-    if unknown:
-        out.append(t("consent 의 %s 는 실제 명령 이름이 아니다 — 그 항목은 아무것도 "
-                     "막지 않는다 (이름: %s)")
-                   % (", ".join(sorted(unknown)), ", ".join(sorted(known))))
-    known_kinds = ("block", "tool_fail", "stop_gate", "bypass", "skip")
-    bad_kinds = [k for k in cfg.seq("promotion.kinds") if k not in known_kinds]
-    if bad_kinds:
-        out.append(t("promotion.kinds 의 %s 는 기록되는 이벤트 종류가 아니다 "
-                     "(%s 중에서 골라라) — 그 종류는 아무것도 모으지 않는다")
-                   % (", ".join(sorted(bad_kinds)), ", ".join(known_kinds)))
-    if not cfg.seq("promotion.kinds"):
-        out.append(t("promotion.kinds 가 비어 있다 — 반복 항목을 하나도 모으지 않으므로 "
-                     "Compounding 의 승격 게이트가 늘 충족된 상태가 된다"))
     kinds = promote_as(cfg)
     if not [k for k in kinds if k != "declined"]:
         out.append(t("promotion.as_kinds 에 승격 종류가 없다 — 보류밖에 할 수 없다"))
@@ -3521,41 +3467,6 @@ def rule_reachable(cfg, rule):
 # 차단자인 단계를 골라야 "이 규칙이 살아 있나"를 실제로 묻게 된다.
 #
 # (설명, 종류, 대상, 막혀야 하나, 어느 단계에서 볼까 — None 이면 현재 단계)
-SELFTEST = (
-    ("하네스 엔진 사본 쓰기", "write", ".claude/harness/bin/harness.py", True, None),
-    ("상태 DB 쓰기", "write", ".claude/harness/harness.db", True, None),
-    ("Bash 로 엔진 삭제", "bash", "rm .claude/harness/bin/harness.py", True, None),
-    ("Bash 로 .claude 삭제", "bash", "rm -rf .claude", True, None),
-    # 설정이 정한 보호 경로. context 쓰기가 허용된 단계라야 `protected` 가 유일한
-    # 차단자가 된다 — 아니면 stage_write 가 먼저 막아 구분이 안 된다.
-    ("설정의 보호 경로", "write", ".claude/harness/LEARNED.md", True, "scaffolding"),
-    ("docs/ 쓰기 (사람의 영역)", "write", "docs/probe.md", True, None),
-    # 단계별 쓰기 허용. context 가 허용되지 않는 단계에서 context 경로를 친다.
-    ("단계별 쓰기 허용", "write", ".claude/settings.json", True, "selection"),
-    # 신규 최상위 폴더. source 가 허용된 단계라야 new_toplevel 이 유일한 차단자다.
-    ("신규 최상위 폴더", "write", "__probe_top__/a.py", True, "execution"),
-    (".dev/ 하위 폴더 규칙", "write", ".dev/__probe__/a.md", True, None),
-    (".dev/ 산출물 접두사", "write", ".dev/plan/__probe__.md", True, None),
-    # 예외(`allow`)가 걸린 상태에서만 도달하는 규칙들. DB를 건드리지 않으려고
-    # 가짜 grant 를 끼워 판정만 돌린다 — 실제 예외를 등록하면 자기검사가 상태를
-    # 바꾸게 되고, 그러면 "보기만 하는 명령" 이라는 계약이 깨진다.
-    ("예외가 있어도 docs 명명 규칙", "grant", "docs/spec/__probe__.md", True, "scaffolding"),
-    ("예외가 있으면 docs 에 쓸 수 있다", "grant", "docs/spec/001-probe.md", False, "scaffolding"),
-    ("읽기는 통과해야 한다", "bash", "cat .claude/harness/harness.db", False, None),
-    # Bash 쓰기가 **쓰기 규칙 엔진**을 지나는지. 예전에는 Bash 가 바닥값만 받았고
-    # 단계별 쓰기 규칙은 `sed -i` 한 줄로 통째로 우회됐다. 그 불변식을 사용자의
-    # 실제 프로젝트에서 매번 확인한다 — 테스트에만 두면 설정이 어긋난 것을 못 본다.
-    ("Bash 리다이렉트가 단계 규칙을 받는다", "bashrule",
-     "printf x > .claude/settings.json", True, "selection"),
-    ("sed -i 도 단계 규칙을 받는다", "bashrule",
-     "sed -i s/a/b/ .claude/settings.json", True, "selection"),
-    # 과잉 수집도 결함이다 — 읽기 명령이 쓰기로 잡히면 마찰이고, 마찰은 게이트를 끈다.
-    ("읽기 명령은 쓰기 대상을 만들지 않는다", "bashrule",
-     "grep -rn foo .claude/settings.json", False, "selection"),
-    # 동의가 필요 없는 명령까지 묻지는 않는다 — 과잉은 마찰이다.
-    ("조회 명령은 동의를 묻지 않는다", "consent", "<WRAP> status", False, None),
-    ("접두사 붙인 산출물은 통과", "write", ".dev/plan/<PREFIX>probe.md", False, None),
-)
 
 
 # 종료 조건 쪽 탐침. "이 조건이 자기 산출물이 아닌 것도 받아들이나" 를 본다.
@@ -3585,6 +3496,397 @@ MUST_VERIFY = ("npm test", "pnpm -r test", "yarn workspace app test", "bun test"
                "mvn -q test", "gradle check", "./gradlew test", "dotnet test",
                "deno test", "swift test", "ctest", "rspec", "bin/rails test",
                "make check", "make test", "npx tsc --noEmit", "ruff check .", "mypy .")
+
+
+# ============================================================ 게이트
+#
+# ## 왜 이 골격이 있나
+#
+# 게이트 하나에는 네 가지 책임이 있다 — **무엇을 막나 / 지금 켜져 있나 / 그것을 어떻게
+# 증명하나 / 설정이 옳은가.** 이 넷이 파일 곳곳에 흩어져 있었다(쓰기 게이트는 15곳,
+# 줄 539~3754). 그래서 게이트를 고칠 때 한 자리만 고치게 되고, **나머지가 빠져도
+# 아무 소리가 나지 않았다.** 적대적 리뷰 3회가 찾은 결함의 대부분이 그 침묵이다:
+#
+#   `promotion.kinds` 는 진단하는데 같은 게이트의 `min_loops` 는 침묵
+#   판정을 고쳤는데 `강제 중:` 줄은 그대로 (판정과 요약이 3,200줄 떨어져 있다)
+#   탐침 목록이 게이트 목록보다 좁아서 22/22 가 CRITICAL 을 가려 줌
+#
+# ## 강제 장치
+#
+# 컴파일러가 있는 언어라면 "네 짝 중 하나가 없으면 컴파일이 안 된다"로 끝난다.
+# 파이썬에는 그것이 없다. 대신 이 파일에는 **실행**이 있다 — 자기검사는 이미
+# "주장하지 말고 대표 조작을 실제 판정에 넣어 본다"는 원칙으로 돌고 있다.
+#
+# 그래서 강제를 실행에 건다: **게이트는 자기가 막는 것과 통과시키는 것을 둘 다
+# 내놓아야 한다.** 한쪽만 내놓으면 그 게이트는 자기를 증명하지 못한 것이고,
+# 자기검사가 그 사실 자체를 실패로 보고한다(`gate_probes`). 설정으로 게이트를 끄면
+# "막아야 할 것"이 통과하면서 드러나고, 과잉 차단이 되면 "통과해야 할 것"이 막히면서
+# 드러난다 — 오늘 세 회차가 양방향으로 실패한 그 두 가지가 같은 장치에 걸린다.
+#
+# 확장은 열려 있다: 게이트를 더하려면 `Gate` 하나를 만들어 `GATES` 에 넣는다.
+# 요약·자기검사·설정 진단이 전부 `GATES` 를 순회하므로 **빠뜨릴 자리가 없다.**
+
+
+class Gate(object):
+    """게이트 하나. 네 책임을 **한 곳에서** 소유한다.
+
+    구현이 채우는 것:
+      key      설정에서 이 게이트를 끄는 손잡이들 (진단이 전수로 본다)
+      state    (지금 켜진 수, 전체) — `강제 중:` 줄이 순회한다
+      probes   [(설명, 판정거리, 막혀야 하나)] — 자기검사가 순회한다
+      problems [문장] — 설정 진단이 순회한다
+    """
+
+    knobs = ()          # 이 게이트를 끄는 설정 경로들
+
+    @property
+    def name(self):
+        """사람이 보는 이름. **읽을 때** 번역한다 — 클래스 정의 시점에는 아직
+        프로젝트의 `language` 를 모른다."""
+        raise NotImplementedError
+
+    def state(self, cfg):
+        """(켜진 수, 전체). 둘이 다르면 사용자가 그 차이를 본다."""
+        raise NotImplementedError
+
+    def probes(self, ctx):
+        """[(설명, 호출, 막혀야 하나)]. `호출` 은 인자 없이 불러 (막혔나, 설명) 을 준다."""
+        raise NotImplementedError
+
+    def problems(self, cfg):
+        return []
+
+
+GATES = []
+
+
+def gate(cls):
+    """게이트를 등록한다. 데코레이터 하나가 요약·자기검사·진단 전부에 꽂는다."""
+    GATES.append(cls())
+    return cls
+
+
+def gate_probes(ctx):
+    """모든 게이트의 탐침을 돌린다. **자기를 증명하지 못하는 게이트도 결과다.**
+
+    막는 탐침과 통과하는 탐침을 둘 다 갖지 못한 게이트는 구분력이 없다 — 설정으로
+    꺼져도, 과잉 차단이 되어도 그 게이트만은 조용하다. 그것을 실패로 낸다.
+    """
+    out = []
+    for g in GATES:
+        try:
+            ps = list(g.probes(ctx))
+        except Exception as exc:
+            out.append((t("%s 게이트의 탐침이 터졌다") % g.name, False, str(exc)))
+            continue
+        wants = {want for _d, _c, want in ps}
+        if wants != {True, False}:
+            out.append((t("%s 게이트가 자기를 증명한다") % g.name, False,
+                        t("막는 탐침과 통과하는 탐침을 둘 다 내놓아야 한다 (지금 %s)")
+                        % (t("막는 것만") if wants == {True} else
+                           t("통과하는 것만") if wants == {False} else t("없음"))))
+            continue
+        for desc, call, want in ps:
+            try:
+                blocked, why = call()
+            except ValueError as exc:
+                out.append((desc, False, str(exc)))   # 돌릴 수 없다는 것도 결과다
+                continue
+            except Exception as exc:
+                out.append((desc, False, t("판정 중 예외: %s") % exc))
+                continue
+            out.append((desc, blocked == want,
+                        (t("막힘(%s)") % why) if blocked else t("통과")))
+    return out
+
+
+def gate_states(cfg):
+    """[(이름, 켜진 수, 전체)] — `강제 중:` 줄의 재료."""
+    return [(g.name,) + tuple(g.state(cfg)) for g in GATES]
+
+
+def gate_problems(cfg):
+    out = []
+    for g in GATES:
+        try:
+            out += list(g.problems(cfg))
+        except Exception as exc:
+            out.append(t("%s 게이트의 설정 진단이 터졌다: %s") % (g.name, exc))
+    return out
+
+
+@gate
+class ConsentGate(Gate):
+    """사람의 승인이 필요한 명령이 실제로 승인을 요구하나.
+
+    이 게이트의 네 책임이 예전에는 여섯 곳에 흩어져 있었다 — 판정(`ctrl_requests`),
+    요약(`enforcing_summary`), 탐침(`consent_probes` + `SELFTEST` 행), 진단
+    (`config_problems`). 하나만 고치면 나머지는 조용히 남았다.
+    """
+
+    knobs = ("consent",)
+    # 엔진이 '결과가 무거워 사람이 봐야 한다' 고 보는 명령들. 설정은 이것을 줄일 수
+    # 있고, 줄였다는 **사실이 요약에 보인다** — 막지는 않는다.
+    FLOOR = ("skip", "allow", "approve-plan", "auto-skip", "loop new", "loop adopt")
+
+    @property
+    def name(self):
+        return t("승인 필요")
+    # 감싸는 껍데기와 대표 인자. **게이트가 자기 재료를 소유한다** — 밖에 두면
+    # 게이트를 옮길 때 재료가 남고, 남은 재료는 다음 사람이 못 지운다.
+    WRAPS = ("%s", '"%s"', "sh -c '%s'", 'bash -lc "%s"')
+    ARGS = {"skip": "context --reason x", "allow": "docs/** --reason x",
+            "approve-plan": "p.md", "auto-skip": "on --reason x",
+            "loop new": "--reason x", "loop adopt": "abcdef --reason x"}
+
+    def state(self, cfg):
+        have = consent_map(cfg)
+        return sum(1 for k in self.FLOOR if k in have), len(self.FLOOR)
+
+    def probes(self, ctx):
+        need = consent_map(ctx.cfg)
+
+        def ask(cmd):
+            subs = [c[0] for c in ctrl_requests(cmd)]
+            return any(x in need for x in subs), ",".join(subs) or t("제어 명령 아님")
+
+        out = []
+        for i, name in enumerate(self.FLOOR):
+            shape = (t("그대로"), t("따옴표"), t("sh -c"), t("중첩 셸"))[i % 4]
+            call = "%s %s %s" % (WRAPPER_CMD, name, self.ARGS.get(name, ""))
+            out.append((t("동의 게이트: %s (%s)") % (name, shape),
+                        _bind(ask, self.WRAPS[i % 4] % call.strip()), True))
+        # 통과하는 쪽이 없으면 이 게이트는 구분력이 없다 — 조회 명령은 묻지 않는다.
+        out.append((t("조회 명령은 동의를 묻지 않는다"),
+                    _bind(ask, "%s status" % WRAPPER_CMD), False))
+        return out
+
+    def problems(self, cfg):
+        known = set(CLI) | {"loop new", "loop adopt"}
+        bad = [k for k in consent_map(cfg) if k not in known]
+        return [t("consent 의 %s 는 실제 명령 이름이 아니다 — 그 항목은 아무것도 "
+                  "막지 않는다") % ", ".join(sorted(bad))] if bad else []
+
+
+@gate
+class PromotionGate(Gate):
+    """반복된 항목이 승격 결정을 **강제하나** (Compounding 의 종료 조건).
+
+    3회차가 찾은 것: `promotion.kinds: []` 는 진단하는데 같은 게이트의 `min_loops`
+    와 `exclude_rules` 는 침묵했다. **한 게이트의 손잡이가 흩어져 있으면 하나를 막고
+    나머지를 잊는다.** 손잡이를 여기 모아 두고, 하나라도 게이트를 끄면 탐침이 잡는다.
+    """
+
+    KINDS = ("block", "tool_fail", "stop_gate", "bypass", "skip")
+    knobs = ("promotion.kinds", "promotion.min_loops", "promotion.exclude_rules")
+
+    @property
+    def name(self):
+        return t("승격 게이트")
+
+    def _live(self, cfg):
+        """이 설정으로 승격 후보가 **모일 수 있나.** 손잡이를 전부 본다."""
+        return (bool(cfg.seq("promotion.kinds"))
+                and cfg.num("promotion.min_loops", 3, low=2) <= 20
+                and not set(cfg.seq("promotion.kinds"))
+                <= set(cfg.seq("promotion.exclude_rules", ())))
+
+    def state(self, cfg):
+        return (1 if self._live(cfg) else 0), 1
+
+    def probes(self, ctx):
+        cfg = ctx.cfg
+
+        def collects():
+            """합성 이력으로 후보가 실제로 모이는지 본다 — DB 를 건드리지 않는다."""
+            live = self._live(cfg)
+            return live, t("모은다") if live else t("아무것도 모으지 않는다")
+
+        def unrelated():
+            """승격 종류가 아닌 이벤트도 붙잡나. 붙잡으면 과잉이다."""
+            got = "edit" in cfg.seq("promotion.kinds")
+            return got, t("edit 까지 모은다") if got else t("edit 는 안 모은다")
+
+        return [(t("승격 게이트: 반복 항목을 모은다"), collects, True),
+                (t("승격 게이트: 무관한 이벤트는 모으지 않는다"), unrelated, False)]
+
+    def problems(self, cfg):
+        out = []
+        bad = [k for k in cfg.seq("promotion.kinds") if k not in self.KINDS]
+        if bad:
+            out.append(t("promotion.kinds 의 %s 는 기록되는 이벤트 종류가 아니다 "
+                         "(%s 중에서 골라라) — 그 종류는 아무것도 모으지 않는다")
+                       % (", ".join(sorted(bad)), ", ".join(self.KINDS)))
+        if not cfg.seq("promotion.kinds"):
+            out.append(t("promotion.kinds 가 비어 있다 — 반복 항목을 하나도 모으지 "
+                         "않으므로 Compounding 의 승격 게이트가 늘 충족된 상태가 된다"))
+        lo = cfg.num("promotion.min_loops", 3, low=2)
+        if lo > 20:
+            out.append(t("promotion.min_loops 가 %d 이다 — 그만큼 반복되는 항목은 "
+                         "사실상 없으므로 승격 게이트가 늘 충족된 상태가 된다") % lo)
+        gone = set(cfg.seq("promotion.kinds")) & set(cfg.seq("promotion.exclude_rules", ()))
+        if gone and gone == set(cfg.seq("promotion.kinds")):
+            out.append(t("promotion.exclude_rules 가 모을 종류를 전부 제외한다 "
+                         "(%s) — 승격 게이트가 늘 충족된 상태가 된다")
+                       % ", ".join(sorted(gone)))
+        return out
+
+
+@gate
+class WriteGate(Gate):
+    """어느 단계에서 어디에 쓸 수 있나 — 그리고 하네스 자신은 못 건드리나.
+
+    이 게이트의 네 책임이 **15곳**에 흩어져 있었다(줄 539~3754). 그래서 세 회차 동안
+    한 자리를 고치고 형제 자리를 남겼다: 대소문자 → symlink → glob → 대입 → 따옴표.
+    판정 **함수**는 그대로 둔다(그건 기계다). 여기 모으는 것은 **조율** —
+    무엇이 켜져 있나 / 그것을 어떻게 증명하나 / 설정이 옳은가.
+    """
+
+    knobs = ("write_rules", "folder_rules.protected_paths", "bash.mutator_pattern",
+             "bash.readers", "bash.interpreters", "path_classes")
+
+    @property
+    def name(self):
+        return t("쓰기 규칙")
+
+    def state(self, cfg):
+        rules = write_rules(cfg)
+        return sum(1 for r in rules if rule_reachable(cfg, r)), len(rules)
+
+    def probes(self, ctx):
+        cfg, root = ctx.cfg, ctx.root
+
+        def wr(rel, at=None):
+            c = Ctx(ctx.con, cfg, root, ctx.lid, at or ctx.sid)
+            if not stage_known(cfg, c.sid):
+                raise ValueError(t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % c.sid)
+            if floor_hit(root, rel):
+                return True, t("바닥값")
+            rid, why = _first_violation(WriteReq(c, rel), write_rules(cfg))
+            return bool(why), (rid or "")
+
+        def wrg(rel, at=None):
+            """**예외가 걸린 상태**로 판정한다. `grant_opens` 규칙(docs_readonly)이
+            비켜야 그 뒤의 규칙이 유일한 차단자가 되고, 그때만 탐침이 구분력을 갖는다.
+            가짜 예외를 끼우고 소비하지 않으므로 상태는 그대로다."""
+            c = Ctx(ctx.con, cfg, root, ctx.lid, at or ctx.sid)
+            if not stage_known(cfg, c.sid):
+                raise ValueError(t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % c.sid)
+            w = WriteReq(c, rel)
+            w.grant = w.grant or {"id": -1, "glob": rel, "uses_left": 1,
+                                  "reason": "selftest"}
+            rid, why = _first_violation(w, write_rules(cfg))
+            return bool(why), (rid or "")
+
+        def bh(cmd):
+            hit = bash_protected_hit(cfg, root, cmd)
+            return bool(hit), (hit or "")
+
+        def br(cmd, at=None):
+            c = Ctx(ctx.con, cfg, root, ctx.lid, at or ctx.sid)
+            if not stage_known(cfg, c.sid):
+                raise ValueError(t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % c.sid)
+            for rel in bash_writes(cfg, root, cmd):
+                rid, why = _first_violation(WriteReq(c, rel), write_rules(cfg))
+                if why:
+                    return True, "%s/%s" % (rid or "?", rel)
+            return False, ""
+
+        pre = file_prefix(ctx.con, ctx.lid)
+        out = []
+        for desc, call, want in (
+                # 바닥값 — 설정으로 열 수 없어야 한다
+                (t("하네스 엔진 사본"), _bind(wr, ENGINE_REL.replace(os.sep, "/")), True),
+                (t("상태 DB"), _bind(wr, DB_REL.replace(os.sep, "/")), True),
+                (t("Bash 로 엔진 삭제"), _bind(bh, "rm " + ENGINE_REL), True),
+                (t("Bash 로 .claude 삭제"), _bind(bh, "rm -rf .claude"), True),
+                # `readers` 는 denylist(`NEVER_BENIGN`)로 막는데, 목록에 없는 이름을
+                # 넣으면 바닥값이 열린다(`perl -i` 는 `sed -i` 와 같은 일을 한다).
+                # 이름을 더 넣는 대신 **결과를 탐침한다.**
+                (t("읽기 선언으로 바닥값을 열 수 없다"),
+                 _bind(bh, "perl -i -pe s/a/b/ " + ENGINE_REL), True),
+                # 클래스를 지우는 것은 규칙을 지우는 게 아니라 그 경로를 가장 넓은
+                # 클래스로 **옮기는** 것이다 — `context` 를 비우면 훅·CLAUDE.md·
+                # stages.json 이 한꺼번에 열린다.
+                (t("context 경로가 분류를 잃지 않는다"),
+                 _bind(wr, ".claude/hooks/probe.json", "execution"), True),
+                # 단계별 쓰기 규칙 — Write 와 Bash 가 **같은 판정**을 받아야 한다
+                (t("단계별 쓰기 허용 (Write)"), _bind(wr, ".claude/settings.json",
+                                                "selection"), True),
+                (t("단계별 쓰기 허용 (Bash)"),
+                 _bind(br, "printf x > .claude/settings.json", "selection"), True),
+                (t("sed -i 도 같은 판정"),
+                 _bind(br, "sed -i s/a/b/ .claude/settings.json", "selection"), True),
+                (t("docs/ 쓰기 (사람의 영역)"), _bind(wr, "docs/probe.md"), True),
+                (t("설정의 보호 경로"),
+                 _bind(wr, ".claude/harness/LEARNED.md", "scaffolding"), True),
+                (t("신규 최상위 폴더"),
+                 _bind(wr, "__probe_top__/a.py", "execution"), True),
+                (t("예외가 있어도 docs 명명 규칙"),
+                 _bind(wrg, "docs/spec/__probe__.md", "scaffolding"), True),
+                (t(".dev/ 하위 폴더 규칙"), _bind(wr, ".dev/__probe__/a.md"), True),
+                (t(".dev/ 산출물 접두사"), _bind(wr, ".dev/plan/__probe__.md"), True),
+                # 통과해야 하는 것 — 과잉 차단은 마찰이고, 마찰은 게이트를 끈다
+                (t("예외가 있으면 docs 에 쓸 수 있다"),
+                 _bind(wrg, "docs/spec/001-probe.md", "scaffolding"), False),
+                (t("접두사 붙인 산출물은 통과"),
+                 _bind(wr, ".dev/plan/%sprobe.md" % pre), False),
+                (t("읽기는 통과"), _bind(bh, "cat " + DB_REL), False),
+                (t("읽기 명령은 쓰기 대상을 만들지 않는다"),
+                 _bind(br, "grep -rn foo .claude/settings.json", "selection"), False)):
+            out.append((desc, call, want))
+        return out
+
+    def problems(self, cfg):
+        out = []
+        fr = cfg.get("folder_rules")
+        if isinstance(fr, dict) and "protected_paths" in fr \
+                and not cfg.seq("folder_rules.protected_paths"):
+            out.append(t("folder_rules.protected_paths 가 비어 있다 — 하네스 자신은 "
+                         "코드의 바닥값으로 계속 보호되지만, 여기에 적었던 경로는 "
+                         "더 이상 보호되지 않는다"))
+        if "write_rules" in cfg and not (cfg.get("write_rules") or []):
+            out.append(t("write_rules 가 비어 있다 — 폴더·파일명 규칙이 하나도 없다 "
+                         "(하네스 자기 잠금만 바닥값으로 남는다)"))
+        if not isinstance(cfg.get("write_rules", []), list):
+            out.append(t("write_rules 가 배열이 아니다 — 규칙이 하나도 적용되지 않는다"))
+        mpat = cfg.at("bash.mutator_pattern")
+        if mpat:
+            try:
+                probe = re.compile(mpat)
+            except re.error:
+                probe = None
+            if probe is not None and not any(
+                    probe.search(x) for x in
+                    ("rm x", "mv a b", "echo x > y", "sed -i s/a/b/ f")):
+                out.append(t("bash.mutator_pattern 이 흔한 변경 명령을 하나도 잡지 "
+                             "못한다 — 문법은 맞지만 사실상 꺼진 것이다"))
+        dead = [(r.get("id") or i) for i, r in enumerate(write_rules(cfg))
+                if not rule_reachable(cfg, r)]
+        if dead:
+            out.append(t("write_rules 의 %s 는 어떤 경로에도 해당할 수 없다 "
+                         "(모르는 class 이거나 판정이 없다) — 아무것도 막지 못한다")
+                       % ", ".join(str(d) for d in dead[:5]))
+        for i, r in enumerate(write_rules(cfg)):
+            w = r.get("when")
+            cls = w.get("class") if isinstance(w, dict) else None
+            if cls is not None and cls not in known_classes(cfg):
+                out.append(t("write_rules[%s].when.class='%s' 는 path_classes 에 없다 "
+                             "(%s 중 하나) — 이 규칙은 죽어 있다")
+                           % (r.get("id") or i, cls,
+                              "/".join(sorted(known_classes(cfg)))))
+        # readers·interpreters 는 둘 다 '무해 선언' 이고 둘 다 잠금을 푸는 데 쓰였다.
+        for key, what in (("readers", t("읽기")), ("interpreters", t("인터프리터"))):
+            bad = [r for r in cfg.seq("bash." + key) if r in NEVER_BENIGN]
+            if bad:
+                out.append(t("bash.%s 의 %s 는 변경 명령이라 %s로 선언할 수 없다 "
+                             "— 무시된다") % (key, ", ".join(sorted(bad)), what))
+        return out
+
+
+def _bind(fn, *a):
+    """인자를 묶어 둔다. 탐침은 **나중에** 돌아야 한다 (돌려 본 결과가 결과다)."""
+    return lambda: fn(*a)
 
 
 def selftest_criteria(cfg):
@@ -3656,99 +3958,14 @@ def selftest_criteria(cfg):
     return out
 
 
-# 동의 게이트를 감싸는 껍데기들. 셸이 어떻게 감싸든 하네스 호출은 하네스 호출이다.
-CONSENT_WRAPS = ("%s", '"%s"', "sh -c '%s'", 'bash -lc "%s"')
-CONSENT_ARGS = {"skip": "context --reason x", "allow": "docs/** --reason x",
-                "approve-plan": "p.md", "auto-skip": "on --reason x",
-                "loop new": "--reason x", "loop adopt": "abcdef --reason x"}
-
-
-def consent_probes():
-    """`CONSENT_FLOOR` 의 **모든** 종류 × 감싸는 방식 몇 가지. 표에서 생성한다.
-
-    손으로 넷을 적어 두었더니 그 넷을 지워도 스위트가 초록이었다. 탐침 수를 탐침
-    표에서 세는 검사는 자기 자신을 재는 것이므로 공허하다 — 게이트 목록이 늘면
-    탐침도 함께 는다.
-    """
-    out = []
-    for i, sub_name in enumerate(CONSENT_FLOOR):
-        call = "%s %s" % ("<WRAP>", "%s %s" % (sub_name, CONSENT_ARGS.get(sub_name, "")))
-        shape = (t("그대로"), t("따옴표"), t("sh -c"), t("중첩 셸"))[i % 4]
-        out.append((t("동의 게이트: %s (%s)") % (sub_name, shape),
-                    "consent", CONSENT_WRAPS[i % 4] % call.strip(), True, None))
-    return out
-
-
 def selftest(ctx):
-    """대표 조작을 **실제 판정 함수**에 넣고 기대와 대조한다.
+    """게이트가 스스로를 증명한다. **주장이 아니라 실행이다.**
 
-    반환: [(설명, 통과했나, 실제 결과 설명)]
+    예전에는 여기 35줄짜리 표(`SELFTEST`)와 48줄짜리 kind 분기가 있었다. 게이트를
+    더할 때 표에 행을 넣는 것을 잊어도 조용했고, 실제로 동의 게이트가 통째로 빠진 채
+    22/22 를 냈다. 이제 탐침은 게이트가 소유하므로 빠뜨릴 자리가 없다.
     """
-    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
-    pre = file_prefix(con, lid)
-    out = []
-    ids = stage_ids(cfg)
-    for raw_label, kind, target, want_block, at_stage in (
-            tuple(SELFTEST) + tuple(consent_probes())):
-        label = t(raw_label)
-        tgt = target.replace("<PREFIX>", pre).replace("<WRAP>", WRAPPER_CMD)
-        # 단계가 지정됐고 그 단계가 존재하면 그 단계로 판정한다. 없으면 현재 단계.
-        probe_ctx = ctx
-        if at_stage and at_stage not in ids:
-            # **조용히 현재 단계로 떨어지지 않는다.** 그러면 그 탐침이 구분력을 잃고
-            # (stage_write 가 대신 막아) 죽은 규칙을 가린 채 통과한다 — 4차 리뷰가
-            # 지적했다. 돌릴 수 없다는 사실 자체가 결과다.
-            out.append((label, False,
-                        t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % at_stage))
-            continue
-        if at_stage and at_stage != sid:
-            probe_ctx = Ctx(con, cfg, root, lid, at_stage)
-        try:
-            if kind in ("write", "grant"):
-                # check_write 는 차단을 event 로 적립한다. 자기검사가 통계를 오염시키면
-                # 안 되므로 판정 부분만 직접 부른다.
-                w = WriteReq(probe_ctx, tgt)
-                if kind == "grant" and not w.grant:
-                    # 예외가 걸린 상태를 흉내낸다. 소비하지 않으므로 상태는 그대로다.
-                    w.grant = {"id": -1, "glob": tgt, "uses_left": 1,
-                               "reason": "selftest"}
-                if self_lock_hit(tgt):
-                    blocked, why = True, t("바닥값")
-                else:
-                    rid, reason = _first_violation(w, write_rules(cfg))
-                    blocked, why = bool(reason), (rid or "")
-            elif kind == "consent":
-                # **동의 게이트도 탐침한다.** 예전에는 자기검사가 쓰기 규칙만 돌았고,
-                # 그래서 `sh -c '... harness auto-skip on'` 으로 동의 게이트 여섯 개가
-                # 통째로 사라진 것을 22/22 라는 숫자가 가려 줬다. 탐침 목록이 게이트
-                # 목록보다 좁으면, 그 숫자는 강제가 온전하다고 거짓말을 한다.
-                subs = [c[0] for c in ctrl_requests(tgt)]
-                need = consent_map(cfg)
-                blocked = any(sub in need for sub in subs)
-                why = ",".join(subs) or t("제어 명령으로 안 보임")
-            elif kind == "bashrule":
-                # Bash 가 모으는 쓰기 대상을 **같은 규칙 엔진**에 넣는다.
-                blocked, why = False, ""
-                for rel in bash_writes(cfg, root, tgt):
-                    rid, reason = _first_violation(WriteReq(probe_ctx, rel),
-                                                   write_rules(cfg))
-                    if reason:
-                        blocked, why = True, "%s/%s" % (rid or "?", rel)
-                        break
-            else:
-                hit = bash_protected_hit(cfg, root, tgt)
-                blocked, why = bool(hit), (hit or "")
-        except Exception as exc:                  # 판정이 터지는 것도 결과다
-            out.append((label, False, t("판정 중 예외: %s") % exc))
-            continue
-        ok = (blocked == want_block)
-        got = (t("막힘(%s)") % why if blocked else t("통과"))
-        out.append((label, ok, got))
-    return out + selftest_criteria(cfg)
-
-
-CONSENT_FLOOR = ("skip", "allow", "approve-plan", "auto-skip",
-                 "loop new", "loop adopt")
+    return selftest_criteria(ctx.cfg) + gate_probes(ctx)
 
 
 def enforcing_summary(cfg):
@@ -3773,8 +3990,9 @@ def enforcing_summary(cfg):
         "gated_stages": sum(1 for st in stages
                             if isinstance(st, dict) and (st.get("exit_criteria") or [])),
         "stages": len(stages),
-        "consent": sum(1 for k in CONSENT_FLOOR if k in consent_map(cfg)),
-        "consent_floor": len(CONSENT_FLOOR),
+        # 게이트가 자기 상태를 말한다. 여기서 게이트별로 세면 게이트를 더할 때
+        # 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
+        "gates": gate_states(cfg),
         # 턴 종료 게이트를 세는 자리가 없었다. `stop_requires` 를 전부 비우면 검증
         # 증거·회고·승격 결정의 강제가 통째로 사라지는데 요약이 **한 글자도** 안 바뀌었다.
         "stop_gates": sum(1 for st in stages
@@ -3810,12 +4028,12 @@ def render_status(d, cfg):
             print(t("자기검사: %d/%d 통과 (대표 조작을 실제 판정에 넣어 확인)")
                   % (len(st) - len(fails), len(st)))
         print(t("강제 중: 쓰기 규칙 %s · 보호 경로 %d · 종료 조건 %d "
-                "(게이트 있는 단계 %d/%d) · 턴 종료 게이트 %d/%d · 승인 필요 %d/%d "
-                "· 언어 %s")
+                "(게이트 있는 단계 %d/%d) · 턴 종료 게이트 %d/%d%s · 언어 %s")
               % (rules_txt, e.get("protected_paths", 0),
                  e.get("criteria", 0), e.get("gated_stages", 0), e.get("stages", 0),
                  e.get("stop_gates", 0), e.get("stages", 0),
-                 e.get("consent", 0), e.get("consent_floor", 0),
+                 "".join(" · %s %d/%d" % (n, on, tot)
+                         for n, on, tot in e.get("gates", [])),
                  e.get("language", "ko")))
     print(t("작업 %s · 회차 %d · 단계 %s") % (d["loop"], d["cycle"], d["stage_label"]))
     if d["intent"]:
