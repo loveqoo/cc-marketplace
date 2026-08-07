@@ -21,6 +21,11 @@ def register(h):
 
         key = "promotion"
 
+        # Compounding 의 종료 조건은 `pending_promotions` 가 비었나로 판정된다.
+        # 예전 탐침은 자기 `_live(cfg)` 를 불렀다 — `state()` 와 **같은 식**이라
+        # 요약과 탐침이 함께 틀렸고, 둘이 서로를 확인해 줄 수 없었다(4회차).
+        entry = ("pending_promotions",)
+
         @property
         def name(self):
             return h.t("승격 게이트")
@@ -35,18 +40,40 @@ def register(h):
         def state(self, cfg):
             return (1 if self._live(cfg) else 0), 1
 
-        def probes(self, ctx):
-            cfg = ctx.cfg
+        # 탐침이 심는 합성 이력의 크기. **이것이 "게이트가 산다"의 정의다** —
+        # 서로 다른 작업 셋에서 같은 마찰이 반복되면 결정을 요구해야 한다.
+        # `min_loops` 를 그보다 크게 두면 이 탐침이 실패한다. 그래야 옳다:
+        # 20개 작업을 기다리는 게이트는 사실상 꺼진 것이다(4회차 B#7·D-H4).
+        SEED_LOOPS = 3
+        PROBE_RULE = "__probe_rule__"
 
+        def _seed(self, con, ctx, kind):
+            """서로 다른 작업 여러 개에 같은 마찰을 심는다. 사본이라 새지 않는다."""
+            for i in range(self.SEED_LOOPS):
+                con.execute(
+                    "INSERT INTO event(at,loop_id,stage,kind,rule,target) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (h.now(), "__probe%d__" % i, ctx.sid, kind,
+                     self.PROBE_RULE, self.PROBE_RULE))
+
+        def probes(self, ctx):
             def collects():
-                """합성 이력으로 후보가 실제로 모이는지 본다 — DB 를 건드리지 않는다."""
-                live = self._live(cfg)
-                return live, h.t("모은다") if live else h.t("아무것도 모으지 않는다")
+                """**훅과 같은 길.** 합성 이력을 심고 `pending_promotions` 에 묻는다."""
+                with h.probe_loop(ctx.con) as (con, _lid):
+                    self._seed(con, ctx, "block")
+                    got = any(it["key"] == "block:%s" % self.PROBE_RULE
+                              for it in h.pending_promotions(con, ctx.cfg))
+                return got, (h.t("결정을 요구한다") if got else
+                             h.t("작업 %d개에서 반복돼도 결정을 요구하지 않는다")
+                             % self.SEED_LOOPS)
 
             def unrelated():
-                """승격 종류가 아닌 이벤트도 붙잡나. 붙잡으면 과잉이다."""
-                got = "edit" in cfg.seq("promotion.kinds")
-                return got, h.t("edit 까지 모은다") if got else h.t("edit 는 안 모은다")
+                """승격 종류가 아닌 이벤트까지 붙잡으면 과잉이다."""
+                with h.probe_loop(ctx.con) as (con, _lid):
+                    self._seed(con, ctx, "edit")
+                    got = any(it["key"] == "edit:%s" % self.PROBE_RULE
+                              for it in h.pending_promotions(con, ctx.cfg))
+                return got, h.t("edit 까지 모은다")
 
             return [(h.t("승격 게이트: 반복 항목을 모은다"), collects, True),
                     (h.t("승격 게이트: 무관한 이벤트는 모으지 않는다"), unrelated, False)]

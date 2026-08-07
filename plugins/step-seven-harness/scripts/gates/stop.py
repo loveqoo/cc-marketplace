@@ -21,6 +21,13 @@ def register(h):
 
         key = "stop"
 
+        # 훅은 `hook_stop` 으로 판정한다. 예전 탐침은 설정을 세고 자기
+        # `_limits_live` 를 부를 뿐 이 함수를 한 번도 지나지 않았다 — 그래서
+        # `hook_stop` 본문을 통째로 비워도 `턴 종료 게이트 2/7` 이 그대로였고
+        # `stop_continue.enabled: false` 도, 항목별 `stop_block_limits: 0` 도
+        # 조용했다(4회차 B#3·D-H3).
+        entry = ("hook_stop",)
+
         @property
         def name(self):
             return h.t("턴 종료 게이트")
@@ -37,22 +44,52 @@ def register(h):
                        if isinstance(st, dict) and (st.get("stop_requires") or []))
             return (live if self._limits_live(cfg) else 0), len(stages)
 
+        def _pair(self, ctx):
+            """**증거로 뒤집을 수 있는** (단계, 조건) 하나를 찾는다.
+
+            양방향 탐침의 재료다 — 같은 단계를 증거 없이/있이 두 번 돌려
+            `hook_stop` 이 실제로 막고 실제로 놓아주는지 본다. 고정 목록을
+            적지 않는다: 설정이 바뀌면 재료도 따라 바뀌어야 한다.
+            """
+            for st in ctx.cfg.get("stages") or []:
+                if not isinstance(st, dict):
+                    continue
+                for key in st.get("stop_requires") or []:
+                    with h.probe_loop(ctx.con) as (con, lid):
+                        if h.criterion_met(con, ctx.cfg, ctx.root, lid, key):
+                            continue          # 증거 없이도 충족 — 뒤집을 수 없다
+                        h.record_evidence(con, lid, st["id"], key, "probe")
+                        if h.criterion_met(con, ctx.cfg, ctx.root, lid, key):
+                            return st, key
+            return None, None
+
         def probes(self, ctx):
-            cfg = ctx.cfg
+            st, key = self._pair(ctx)
+            if st is None:
+                # 뒤집을 수 있는 조건이 하나도 없으면 이 게이트는 아무것도 막지
+                # 못한다. 그 사실 자체가 결과다 — `hook_stop` 을 지나지 않았으므로
+                # 진입점 검사가 이것을 실패로 낸다.
+                return []
 
-            def requires():
-                """요구하는 단계가 하나라도 있나."""
-                n = sum(1 for st in (cfg.get("stages") or [])
-                        if isinstance(st, dict) and (st.get("stop_requires") or []))
-                return n > 0, h.t("%d개 단계가 요구한다") % n
+            def run(seed):
+                """훅과 **같은 길**로 Stop 을 돌리고, 그 조건으로 막았는지 본다."""
+                with h.probe_loop(ctx.con) as (con, lid):
+                    if seed:
+                        for k in st.get("stop_requires") or []:
+                            h.record_evidence(con, lid, st["id"], k, "probe")
+                    h.hook_stop({"prompt_id": "__probe__",
+                                 "last_assistant_message": ""},
+                                h.Ctx(con, ctx.cfg, ctx.root, lid, st["id"]))
+                    why = h.criterion_why(con, ctx.cfg, ctx.root, lid, key)
+                hit = any(why and why in str(o.get("reason", ""))
+                          for o in h.PROBE_EMITS
+                          if isinstance(o, dict) and o.get("decision") == "block")
+                return hit, why
 
-            def budget():
-                """차단 예산이 0 이면 첫 시도부터 소진으로 떨어져 한 번도 못 막는다."""
-                ok = self._limits_live(cfg)
-                return (not ok), h.t("stop_block_limits 가 전부 0 이다")
-
-            return [(h.t("턴 종료를 요구하는 단계가 있다"), requires, True),
-                    (h.t("차단 예산이 0 이 아니다"), budget, False)]
+            return [(h.t("증거 없는 '%s' 는 턴 종료를 막는다") % key,
+                     h._bind(run, False), True),
+                    (h.t("증거 있는 '%s' 로는 막지 않는다") % key,
+                     h._bind(run, True), False)]
 
         def problems(self, cfg):
             out = []

@@ -23,6 +23,11 @@ def register(h):
 
         key = "consent"
 
+        # 훅은 `ctrl_decision` 으로 판정한다. 예전 탐침은 `ctrl_requests` 로 이름을
+        # 뽑아 `consent_map` 멤버십만 봤다 — 한 층 아래다. 그래서 `ctrl_decision`
+        # 본문을 통째로 비워도 `승인 필요 6/6` 이 그대로였다(4회차).
+        entry = ("ctrl_decision",)
+
         @property
         def name(self):
             return h.t("승인 필요")
@@ -38,11 +43,21 @@ def register(h):
             return sum(1 for k in self.FLOOR if k in have), len(self.FLOOR)
 
         def probes(self, ctx):
-            need = h.consent_map(ctx.cfg)
-
             def ask(cmd):
-                subs = [c[0] for c in h.ctrl_requests(cmd)]
-                return any(x in need for x in subs), ",".join(subs) or h.t("제어 명령 아님")
+                """**훅과 같은 길로 판정한다.** `ctrl_requests` 로 호출을 뽑고
+                하나하나 `ctrl_decision` 에 넣는다 — 훅이 하는 그대로다.
+
+                판정이 나오면(ask/deny) 막힌 것이다. `permissionDecision` 을
+                직접 읽지 않고 '판정이 있었나' 만 본다 — 승인 방식이 바뀌어도
+                탐침은 계속 옳다.
+                """
+                for sub, pos, direct, seg in h.ctrl_requests(cmd):
+                    with h.probe_loop(ctx.con) as (con, lid):
+                        out = h.ctrl_decision(con, ctx.cfg, ctx.root, sub, pos,
+                                              direct, seg, None, lid, ctx.sid)
+                    if out:
+                        return True, sub
+                return False, h.t("판정 없음")
 
             out = []
             for i, name in enumerate(self.FLOOR):

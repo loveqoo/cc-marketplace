@@ -3548,6 +3548,19 @@ class Gate(abc.ABC):
 
     knobs = ()          # 이 게이트를 끄는 설정 경로들
 
+    # **훅이 실제로 부르는 함수 이름들.** 탐침은 반드시 여기를 지나야 한다.
+    #
+    # 4회차 리뷰가 이 규칙 없이는 자기증명이 공허하다는 것을 증명했다:
+    # `check_write`·`ctrl_decision`·`hook_stop`·`pending_promotions` 네 함수의
+    # 본문을 첫 줄에서 잘라내도 **자기검사 42/42 통과**, 요약 줄 바이트 동일,
+    # 훅은 아무것도 막지 않았다. 탐침들이 진입점보다 한 층 아래를 부르거나
+    # 자기 자신의 헬퍼를 부르고 있었기 때문이다.
+    #
+    # 예전 규칙은 "막는 기대와 통과하는 기대를 둘 다 **선언**했는가"만 물었다.
+    # 선언은 증명이 아니다. `gate_probes` 가 이 이름들을 계수기로 감싸고,
+    # **한 번도 지나지 않은 탐침을 실패로 낸다.**
+    entry = ()
+
     @property
     @abc.abstractmethod
     def key(self):
@@ -3593,6 +3606,86 @@ def missing_gates():
     return [k for k in REQUIRED_GATES if k not in {g.key for g in GATES}]
 
 
+# 탐침이 도는 동안 훅이 낸 것. `probe_run` 이 채우고 탐침이 읽는다 —
+# 훅의 **출력**을 보지 않으면 "막았다" 를 게이트 밖에서 확인할 방법이 없다.
+PROBE_EMITS = []
+
+
+class probe_loop(object):
+    """탐침 전용 작업 id. 안에서 쓴 것은 **전부 되돌린다.**
+
+    예전에는 살아 있는 작업(`ctx.lid`)에 대고 물었다. 그래서 사용자가
+    `harness loop intent "..."` 를 기록하는 순간 — **하네스가 시키는 첫 행동이다** —
+    탐침이 뒤집혀 매 세션 거짓 경보가 상주했다(4회차). 더 나쁜 것은 그 경보의
+    문자열이 `criterion_met` 이 통째로 죽었을 때와 **정확히 같았다**는 점이다.
+    신호와 소음이 구분되지 않으면 사람은 둘 다 무시한다.
+
+    탐침은 고정된 입력에 대고 물어야 한다. 그래서 격리한다.
+
+    **사본에 대고 묻는다.** 처음에는 savepoint 로 되돌리려 했는데 진입점 안에
+    `with con:` 이 있고 그것이 커밋하면서 savepoint 를 없앴다 (`no such
+    savepoint: probe`). 진짜 진입점을 부르는 이상 그 안에서 무엇이 커밋될지
+    탐침은 알 수 없다 — 알려고 하면 그게 또 하나의 모형이다. 사본에 물으면
+    그 질문 자체가 사라진다.
+    """
+
+    LID = "__probe__"
+
+    def __init__(self, con):
+        self.src, self.mem = con, None
+
+    def __enter__(self):
+        self.mem = sqlite3.connect(":memory:")
+        self.mem.row_factory = self.src.row_factory
+        self.src.backup(self.mem)
+        return self.mem, self.LID
+
+    def __exit__(self, *exc):
+        self.mem.close()
+        return False
+
+
+class probe_run(object):
+    """탐침 한 번을 **격리해서** 돌리고, 진입점을 지났는지 센다.
+
+    두 가지를 동시에 한다.
+
+    ① **계수** — `entry` 로 선언된 함수를 감싸 호출 수를 센다. 0 이면 그 탐침은
+       훅이 지나는 문을 지나지 않은 것이고, 무엇도 증명하지 못한다.
+
+    ② **출력 가로채기** — `hook_stop` 은 stdout 으로 JSON 을 낸다. 자기검사가
+       그것을 그대로 흘리면 훅 채널이 깨진다. `emit` 을 여기서 잡아 `PROBE_EMITS`
+       에 모으고, 탐침이 그것을 읽어 "무엇으로 막았나" 를 확인한다.
+       DB 오염은 `probe_loop` 의 메모리 사본이 막는다 — 장치는 하나면 된다.
+
+    되돌리는 것까지 한 덩어리다. 예외가 나도 `__exit__` 이 원래 함수를 되돌린다.
+    """
+
+    def __init__(self, mod, names):
+        self.mod, self.names, self.hits = mod, names, 0
+        self._orig = {}
+
+    def _count(self, fn):
+        def go(*a, **kw):
+            self.hits += 1
+            return fn(*a, **kw)
+        return go
+
+    def __enter__(self):
+        for nm in self.names:
+            self._orig[nm] = getattr(self.mod, nm)
+            setattr(self.mod, nm, self._count(self._orig[nm]))
+        del PROBE_EMITS[:]
+        self._orig["emit"] = self.mod.emit
+        self.mod.emit = PROBE_EMITS.append
+        return self
+
+    def __exit__(self, *exc):
+        for nm, fn in self._orig.items():
+            setattr(self.mod, nm, fn)
+        return False
+
+
 def gate_probes(ctx):
     """모든 게이트의 탐침을 돌린다. 실리지 않은 게이트가 있으면 그것이 첫 결과다. **자기를 증명하지 못하는 게이트도 결과다.**
 
@@ -3615,14 +3708,27 @@ def gate_probes(ctx):
                         % (t("막는 것만") if wants == {True} else
                            t("통과하는 것만") if wants == {False} else t("없음"))))
             continue
+        if not g.entry:
+            out.append((t("%s 게이트가 진입점을 밝힌다") % g.name, False,
+                        t("`entry` 가 비어 있다 — 탐침이 무엇을 지나는지 잴 수 없다")))
+            continue
+        mod = sys.modules[__name__]
         for desc, call, want in ps:
             try:
-                blocked, why = call()
+                with probe_run(mod, g.entry) as run:
+                    blocked, why = call()
             except ValueError as exc:
                 out.append((desc, False, str(exc)))   # 돌릴 수 없다는 것도 결과다
                 continue
             except Exception as exc:
                 out.append((desc, False, t("판정 중 예외: %s") % exc))
+                continue
+            # **지나지 않았으면 증명이 아니다.** 이 검사가 없을 때 네 게이트의
+            # 진입점을 통째로 비워도 42/42 가 나왔다.
+            if not run.hits:
+                out.append((desc, False,
+                            t("진입점(%s)을 지나지 않았다 — 자기 자신을 재고 있다")
+                            % ", ".join(g.entry)))
                 continue
             out.append((desc, blocked == want,
                         (t("막힘(%s)") % why) if blocked else t("통과")))

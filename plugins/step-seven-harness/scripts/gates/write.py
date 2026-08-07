@@ -24,6 +24,11 @@ def register(h):
 
         key = "write"
 
+        # 훅이 지나는 문 셋. 예전 탐침은 `floor_hit` + `_first_violation` 을
+        # 직접 불렀다 — `check_write` 보다 한 층 아래다. 그래서 `check_write`
+        # 본문을 통째로 비워도 `쓰기 규칙 7/7` 이 그대로였다(4회차 D-C1).
+        entry = ("check_write", "bash_protected_hit", "bash_writes")
+
         @property
         def name(self):
             return h.t("쓰기 규칙")
@@ -35,43 +40,53 @@ def register(h):
         def probes(self, ctx):
             cfg, root = ctx.cfg, ctx.root
 
+            def _ctx(con, lid, at):
+                if not h.stage_known(cfg, at):
+                    raise ValueError(h.t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % at)
+                return h.Ctx(con, cfg, root, lid, at)
+
             def wr(rel, at=None):
-                c = h.Ctx(ctx.con, cfg, root, ctx.lid, at or ctx.sid)
-                if not h.stage_known(cfg, c.sid):
-                    raise ValueError(h.t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % c.sid)
-                if h.floor_hit(root, rel):
-                    return True, h.t("바닥값")
-                rid, why = h._first_violation(h.WriteReq(c, rel), h.write_rules(cfg))
-                return bool(why), (rid or "")
+                """**훅과 같은 문.** `check_write` 가 판정한다."""
+                with h.probe_loop(ctx.con) as (con, lid):
+                    decision, why = h.check_write(_ctx(con, lid, at or ctx.sid), rel)
+                return bool(decision), (why or "")
 
             def wrg(rel, at=None):
                 """**예외가 걸린 상태**로 판정한다. `grant_opens` 규칙(docs_readonly)이
                 비켜야 그 뒤의 규칙이 유일한 차단자가 되고, 그때만 탐침이 구분력을 갖는다.
-                가짜 예외를 끼우고 소비하지 않으므로 상태는 그대로다."""
-                c = h.Ctx(ctx.con, cfg, root, ctx.lid, at or ctx.sid)
-                if not h.stage_known(cfg, c.sid):
-                    raise ValueError(h.t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % c.sid)
-                w = h.WriteReq(c, rel)
-                w.grant = w.grant or {"id": -1, "glob": rel, "uses_left": 1,
-                                      "reason": "selftest"}
-                rid, why = h._first_violation(w, h.write_rules(cfg))
-                return bool(why), (rid or "")
+
+                예전에는 `WriteReq.grant` 에 가짜 dict 를 꽂았다 — 그건 `check_write`
+                가 하는 소진 처리를 건너뛰는 모형이었다. 사본에 **진짜 예외 행**을
+                넣는다. 사본이라 소진돼도 남지 않는다.
+                """
+                with h.probe_loop(ctx.con) as (con, lid):
+                    con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
+                                "VALUES(?,?,?,?,?)", (lid, rel, "selftest", 1, h.now()))
+                    decision, why = h.check_write(_ctx(con, lid, at or ctx.sid), rel)
+                return bool(decision), (why or "")
 
             def bh(cmd):
                 hit = h.bash_protected_hit(cfg, root, cmd)
                 return bool(hit), (hit or "")
 
             def br(cmd, at=None):
-                c = h.Ctx(ctx.con, cfg, root, ctx.lid, at or ctx.sid)
-                if not h.stage_known(cfg, c.sid):
-                    raise ValueError(h.t("탐침을 돌릴 수 없다 — 단계 '%s' 가 없다") % c.sid)
-                for rel in h.bash_writes(cfg, root, cmd):
-                    rid, why = h._first_violation(h.WriteReq(c, rel), h.write_rules(cfg))
-                    if why:
-                        return True, "%s/%s" % (rid or "?", rel)
+                """Bash 경로도 훅과 같다 — `bash_writes` 로 대상을 뽑아 `check_write`."""
+                with h.probe_loop(ctx.con) as (con, lid):
+                    c = _ctx(con, lid, at or ctx.sid)
+                    for rel in h.bash_writes(cfg, root, cmd):
+                        decision, why = h.check_write(c, rel)
+                        if decision:
+                            return True, "%s/%s" % (rel, why or "")
                 return False, ""
 
-            pre = h.file_prefix(ctx.con, ctx.lid)
+            def wr_prefixed():
+                """접두사는 **탐침이 도는 작업**의 것이어야 한다. 실제 작업의
+                접두사를 격리된 작업에 대고 물으면 늘 어긋난다."""
+                with h.probe_loop(ctx.con) as (con, lid):
+                    rel = ".dev/plan/%sprobe.md" % h.file_prefix(con, lid)
+                    decision, why = h.check_write(_ctx(con, lid, ctx.sid), rel)
+                return bool(decision), (why or "")
+
             out = []
             for desc, call, want in (
                     # 바닥값 — 설정으로 열 수 없어야 한다
@@ -108,8 +123,7 @@ def register(h):
                     # 통과해야 하는 것 — 과잉 차단은 마찰이고, 마찰은 게이트를 끈다
                     (h.t("예외가 있으면 docs 에 쓸 수 있다"),
                      h._bind(wrg, "docs/spec/001-probe.md", "scaffolding"), False),
-                    (h.t("접두사 붙인 산출물은 통과"),
-                     h._bind(wr, ".dev/plan/%sprobe.md" % pre), False),
+                    (h.t("접두사 붙인 산출물은 통과"), wr_prefixed, False),
                     (h.t("읽기는 통과"), h._bind(bh, "cat " + h.DB_REL), False),
                     (h.t("읽기 명령은 쓰기 대상을 만들지 않는다"),
                      h._bind(br, "grep -rn foo .claude/settings.json", "selection"), False)):

@@ -3068,7 +3068,10 @@ exec(sys.argv[2])
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$S4B/.claude/harness/stages.json" "$1"; }
 s4bed 'cfg["criteria"]["verification_evidence"]["tools"] = ["Read"]'
-check "무해한 도구를 증거로 세면 잡는다" '무해한 도구도 증거: Read' "$(s4b status 2>&1)"
+# 이 종류는 **진단**이다 — 판정(`criterion_met`)을 지나지 않으므로 탐침이 아니다.
+# 탐침 자리에 있던 시절 `자기검사 42/42` 의 대부분이 "설정이 앞뒤가 맞다" 는
+# 뜻이었고, 게이트가 실제로 막는지와 무관한 수였다 (4회차).
+check "무해한 도구를 증거로 세면 잡는다" '무해한 도구를 증거로 센다: Read' "$(s4b status 2>&1)"
 s4bed 'cfg["criteria"]["verification_evidence"]["tools"] = ["Agent", "Task"]
 cfg["criteria"]["verification_evidence"]["tool_pattern"] = ".*"'
 check "도구 패턴이 너무 넓으면 잡는다" '무해한 도구에도 걸린다' "$(s4b status 2>&1)"

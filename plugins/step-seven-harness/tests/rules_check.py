@@ -428,6 +428,69 @@ finally:
     os.chmod(wp, 0o755)
 ck("쓸 수 있게 되면 복구한다", h.wrapper_intact(root) is False)
 
+# --- 자기증명 규칙 자체 ---------------------------------------------------
+# 4회차: 이 강제 장치에 테스트가 없어서, `wants != {True, False}` 를 `if False:`
+# 로 바꿔도 41종 검사가 전부 초록이었다. 그리고 그 규칙은 애초에 공허했다 —
+# 진입점을 통째로 비운 네 게이트가 42/42 를 유지했다. 둘 다 여기서 못 박는다.
+print("== 자기증명 규칙이 자기를 증명한다")
+ck("게이트가 전부 진입점을 밝힌다",
+   all(g.entry for g in h.GATES),
+   str([g.key for g in h.GATES if not g.entry]))
+ck("진입점 이름이 실재하는 함수다",
+   all(callable(getattr(h, nm, None)) for g in h.GATES for nm in g.entry),
+   str([nm for g in h.GATES for nm in g.entry if not callable(getattr(h, nm, None))]))
+
+
+class _Hollow(h.Gate):
+    """엔진을 한 번도 부르지 않는 게이트. **탐지되어야 한다.**"""
+    key = "__hollow__"
+    entry = ("check_write",)
+
+    @property
+    def name(self):
+        return "공허"
+
+    def state(self, cfg):
+        return 1, 1
+
+    def probes(self, ctx):
+        return [("공허: 막는다", lambda: (True, "막았다"), True),
+                ("공허: 통과시킨다", lambda: (False, ""), False)]
+
+
+h.GATES.append(_Hollow())
+try:
+    rows = h.gate_probes(h.Ctx(con, cfg, root, h.head_loop(con),
+                               h.active_stage(con, h.head_loop(con))))
+    bad = [r for r in rows if r[0].startswith("공허")]
+    ck("진입점을 지나지 않는 탐침은 실패한다",
+       bad and all(not ok for _d, ok, _w in bad), str(bad))
+    ck("  왜 실패했는지 말한다",
+       bad and all("진입점" in w for _d, _ok, w in bad), str(bad))
+finally:
+    h.GATES[:] = [g for g in h.GATES if g.key != "__hollow__"]
+
+# 탐침은 부수 효과를 남기지 않는다 — 사본에 대고 묻기 때문이다.
+_before = con.execute("SELECT COUNT(*) c FROM event").fetchone()["c"]
+h.gate_probes(h.Ctx(con, cfg, root, h.head_loop(con),
+                    h.active_stage(con, h.head_loop(con))))
+ck("탐침이 이벤트를 남기지 않는다",
+   con.execute("SELECT COUNT(*) c FROM event").fetchone()["c"] == _before)
+# 훅 채널은 JSON 이다. 탐침이 `emit` 을 가로챘다가 **되돌려 놓지 않으면**
+# 그 뒤의 진짜 판정이 사라진다 — fail-open 이라 조용히.
+_emit_before = h.emit
+h.gate_probes(h.Ctx(con, cfg, root, h.head_loop(con),
+                    h.active_stage(con, h.head_loop(con))))
+ck("탐침이 emit 을 되돌려 놓는다", h.emit is _emit_before)
+
+
+try:
+    with h.probe_run(sys.modules[h.__name__], ("check_write",)):
+        raise RuntimeError("중단")
+except RuntimeError:
+    pass
+ck("탐침이 터져도 emit 이 되돌아온다", h.emit is _emit_before)
+
 # --- 서브명령 표 ---------------------------------------------------------
 # 표로 옮기기 전에는 `harness loop inetnt "작업 내용"` 이 rc=0 으로 조용히
 # `show` 를 했다 — 사용자는 기록됐다고 믿는다. 표가 모르는 이름을 알아본다.
@@ -439,7 +502,7 @@ for name, table in (("loop", h.LOOP_SUBS), ("auto-skip", h.AUTO_SKIP_SUBS)):
         ck("%s 는 모르는 서브명령을 거절한다" % name, False, "거절하지 않았다")
     except h.Refuse as exc:
         ck("%s 는 모르는 서브명령을 거절한다" % name, exc.code == 2)
-        ck("  가능한 이름을 알려준다" % (),
+        ck("  가능한 이름을 알려준다",
            all(k in " ".join(exc.lines) for k in table))
 
 # `CTRL_SUB2` 는 **동의가 필요한** loop 서브명령이다. 이름이 표와 어긋나면
