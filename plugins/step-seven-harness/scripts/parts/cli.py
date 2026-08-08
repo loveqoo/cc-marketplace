@@ -199,7 +199,11 @@ def cli_skip(ctx, argv):
                            "`harness status` 로 현재 단계를 확인하라.")
                          % stage_obj(cfg, sid)["label"], code=1)
         for x in route[1:]:
-            ensure_stage_row(con, lid, x)
+            # 회차 한정 노드만 지연 생성한다 — 설정 단계는 이미 행이 있고, 없으면
+            # 그건 상태·설정 드리프트이므로 skip 이 유령 행을 만들면 안 된다(_enter 와
+            # 같은 이유).
+            if stage_obj(cfg, x).get("__dyn__"):
+                ensure_stage_row(con, lid, x)
             stage_set(con, "skip_ahead", (now(), reason, by, lid, x))
             skipped.append(x)
         for s in skipped:
@@ -870,7 +874,10 @@ def _path_show(ctx, argv, pos):
         row = rows.get(s["id"])
         mark = marks.get(row["status"], "·") if row else "·"
         bits = ""
-        nxt = valid_next(cfg, s["id"])
+        # **successors 를 쓴다** — `valid_next` 는 dyn 노드에 늘 [] 라, 회차 한정
+        # 노드 사슬 끝에서 유예된 분기가 안 보였다(위상 리뷰가 지적). successors 는
+        # 사슬의 주인(앵커)까지 거슬러 분기를 복원한다.
+        nxt = successors(cfg, s["id"])
         if len(nxt) > 1:
             bits += t("  분기 → %s") % " | ".join(nxt)
         elif nxt:
@@ -888,7 +895,7 @@ def _path_add(ctx, argv, pos):
     """앞쪽에 노드를 더한다 — **회차 한정.** 추가는 동의를 묻지 않는다: 일이 늘
     뿐 어떤 게이트도 사라지지 않는다. 사유는 그래도 기록한다 — 계획 승인이 곧
     그래프 승인이 되려면 왜 자랐는지가 남아야 한다."""
-    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     node = pos[1] if len(pos) > 1 else None
     reason = argv_value(argv, "reason")
     if not node or not reason:
@@ -899,9 +906,6 @@ def _path_add(ctx, argv, pos):
     cur = stage_index(cfg, sid)
     after = argv_value(argv, "after") \
         or (sid if 1 <= cur < len(ids) - 1 else ids[1])
-    why = path_add_block_reason(con, cfg, lid, node, after)
-    if why:
-        raise Refuse(why, code=1)
     write = [w.strip() for w in (argv_value(argv, "write") or "dev").split(",")
              if w.strip()]
     bad = [w for w in write if w not in known_classes(cfg)]
@@ -909,7 +913,23 @@ def _path_add(ctx, argv, pos):
         raise Refuse(t("모르는 경로 클래스: %s (가능: %s)")
                      % (", ".join(bad), ", ".join(sorted(known_classes(cfg)))), code=2)
     cyc = cycle_of(con, lid)
+    # **판정과 삽입을 한 트랜잭션 안에서** 한다. 판정을 밖에서 하면 그 사이 병렬
+    # `advance` 가 앵커를 지나쳐, 이미 지난 자리에 미방문 노드가 꽂힌다(Codex 재현).
+    # 앵커의 쓰기 허용도 트랜잭션 안에서 확정한다.
     with con:
+        why = path_add_block_reason(con, cfg, root, lid, node, after)
+        if why:
+            raise Refuse(why, code=1)
+        # **자가부여 차단.** dyn 노드의 쓰기는 앵커 단계의 허용을 넘을 수 없다 —
+        # `--write context` 로 CLAUDE.md·stages.json 쓰기를 스스로 여는 것을 막는다
+        # (게이트 리뷰가 재현). 추가는 '일을 늘리는' 것이지 권한을 넓히는 게 아니다.
+        allowed = set(stage_obj(cfg, after).get("write") or [])
+        over = [w for w in write if w not in allowed]
+        if over:
+            raise Refuse(t("회차 한정 노드의 쓰기는 앵커(%s)의 허용 %s 을 넘을 수 없다: %s "
+                           "— 추가는 일을 늘리는 것이지 쓰기 권한을 넓히는 것이 아니다.")
+                         % (after, ", ".join(sorted(allowed)) or t("(없음)"),
+                            ", ".join(over)), code=1)
         if not add_path_row(con, lid, cyc, node,
                             argv_value(argv, "label") or node,
                             argv_value(argv, "summary") or t("회차 한정 노드"),
@@ -928,20 +948,25 @@ def _path_add(ctx, argv, pos):
 def _path_remove(ctx, argv, pos):
     """미방문 회차 한정 노드를 뺀다. **미방문 노드 삭제는 스킵의 위장**이므로
     PreToolUse 가 스킵과 같은 동의를 받은 뒤에만 여기까지 온다."""
-    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
+    con, cfg, root, lid, sid = ctx.con, ctx.cfg, ctx.root, ctx.lid, ctx.sid
     node = pos[1] if len(pos) > 1 else None
     reason = argv_value(argv, "reason")
     if not node or not reason:
         raise Refuse(t("사용법: harness path remove <node> --reason \"...\""), code=2)
-    why = path_remove_block_reason(con, cfg, lid, node)
-    if why:
-        raise Refuse(why, code=1)
     by = "auto" if auto_skip_on(con) else "user"
     left = None
+    # **정책 검사가 먼저, 원자적 관문이 그다음** — 한 트랜잭션 안에서.
+    # path_remove_block_reason 은 정책(회차 한정 노드인가·계획 승인 뒤인가)을,
+    # remove_path_row 의 조건부 DELETE 는 방문 상태(pending·dyn) 경쟁을 막는다.
+    # 정책을 관문 뒤에 두면 계획 승인 뒤에도 삭제가 통과했다(이번 회차 실측) —
+    # 관문은 방문 여부만 보지 승인 여부를 모른다.
     with con:
+        why = path_remove_block_reason(con, cfg, root, lid, node)
+        if why:
+            raise Refuse(why, code=1)
         if not remove_path_row(con, lid, cycle_of(con, lid), node):
-            raise Refuse(t("'%s' 는 이번 회차에 없다 — 다른 호출이 먼저 지웠을 수 "
-                           "있다. `harness path` 로 확인하라.") % node, code=1)
+            raise Refuse(t("'%s' 를 지우지 못했다 — 그 사이 방문됐거나 다른 호출이 "
+                           "먼저 처리했다. `harness path` 로 확인하라.") % node, code=1)
         record_event(con, lid, sid, "path_remove", node, by, reason)
         if by == "auto":
             _, left = consume_auto_skip(con)

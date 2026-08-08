@@ -476,6 +476,12 @@ PY
   h2() { (cd "$P2" && "$P2/.claude/harness/bin/harness" "$@"); }
   st2() { h2 status --json 2>/dev/null | jget "$1"; }
 
+  # **그래프를 정한 뒤 새 작업으로 시작한다.** init 이 만든 첫 작업의 단계 행은
+  # 옛 그래프(context 포함)에 맞춰져 있다 — 실사용은 그래프를 먼저 정하고 그 위에서
+  # 일하므로, 여기서도 `loop new` 로 새 그래프에 맞는 단계 행을 만든다. init 후
+  # stages.json 을 바꾼 채 그대로 진행하는 것은 상태·설정 드리프트이고, 그건 advance
+  # 가 정당하게 거부한다(위상 리뷰가 지적해 이번 회차에 방어선을 복원했다).
+  h2 loop new --reason "가감한 그래프로 새 작업" >/dev/null 2>&1
   eq "가감한 그래프에서 시작한다" selection "$(st2 stage)"
   h2 loop intent "중간 그래프 한 바퀴" >/dev/null 2>&1
   h2 loop done-when "여덟 번째 시나리오가 통과한다" >/dev/null 2>&1

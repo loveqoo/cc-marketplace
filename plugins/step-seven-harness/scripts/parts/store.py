@@ -541,13 +541,23 @@ def add_path_row(con, lid, cycle, node, label, summary, write, after, reason):
 
 
 def remove_path_row(con, lid, cycle, node):
-    """노드 하나를 이번 회차에서 뺀다. 단계 행도 함께 — 미방문 행만 지운다
-    (방문한 행은 기록이라 `path_remove_block_reason` 이 먼저 거절한다)."""
-    won = claim(con, "DELETE FROM path_node WHERE loop_id=? AND cycle=? AND node=?",
+    """미방문 회차 한정 노드만 **원자적으로** 뺀다. 이겼으면 True.
+
+    **stage DELETE 가 관문이다.** pending 이면서 이번 회차 path_node 인 노드만
+    지워지므로, active/done/skipped(방문 흔적)나 설정 단계(비-dyn)는 rowcount 0 으로
+    걸러진다. 판정을 DELETE 의 WHERE 안에 넣는 것이 요점이다 — read-then-check 였을
+    때 `path_remove_block_reason` 통과와 실제 삭제 사이에 병렬 `advance` 가 노드를
+    active 로 만들어, path_node 는 지워지고 stage(active) 만 남아 다음 훅이
+    `stage_known` 실패로 fail-open 했다(Codex 가 CRITICAL 로 재현). 이제 그 창이 없다.
+    """
+    if not claim(con, "DELETE FROM stage WHERE loop_id=? AND stage=? "
+                      "AND status='pending' AND stage IN "
+                      "(SELECT node FROM path_node WHERE loop_id=? AND cycle=?)",
+                 (lid, node, lid, cycle)):
+        return False
+    con.execute("DELETE FROM path_node WHERE loop_id=? AND cycle=? AND node=?",
                 (lid, cycle, node))
-    con.execute("DELETE FROM stage WHERE loop_id=? AND stage=? AND status='pending'",
-                (lid, node))
-    return won
+    return True
 
 
 def ensure_stage_row(con, lid, sid):

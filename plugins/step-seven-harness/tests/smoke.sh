@@ -3511,6 +3511,79 @@ check "선언을 지우면 깨끗하다 (기존 설정 무변경 호환)" '^0$' 
   "$(gw status 2>&1 | grep -c '무시되는 설정')"
 rm -rf "$GW"
 
+echo "== 중간 그래프: 적대적 리뷰가 찾은 우회들 (1회차 수정 회귀)"
+# 세 리뷰어(교차 모델·위상·게이트 우회)가 찾은 것들을 테스트로 못 박는다.
+RG="$(mktemp -d)"
+(cd "$RG" && git init -q . && python3 "$ENGINE" init >/dev/null)
+rg() { (cd "$RG" && python3 "$ENGINE" "$@"); }
+rgst() { rg status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+
+# --- 위상: 게이트를 분기로 우회하는 그래프는 진단이 잡는다 (Q1 위상 검증)
+python3 - "$RG/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p))
+for s in c["stages"]:
+    if s["id"] == "execution":
+        s["next"] = ["verification", "compounding"]   # verification 우회 가능
+json.dump(c, open(p, "w"), ensure_ascii=False)
+PY
+check "게이트를 안 지나는 종료 경로를 진단한다" '분기로 우회할 수 있다' "$(rg status 2>&1)"
+python3 - "$RG/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p))
+for s in c["stages"]:
+    s.pop("next", None)
+json.dump(c, open(p, "w"), ensure_ascii=False)
+PY
+
+rg loop intent "우회 회귀" >/dev/null
+rg loop done-when "끝" >/dev/null
+rg advance >/dev/null                                   # Scaffolding
+
+# --- Q2: path add --write 로 앵커 권한을 넘는 쓰기 자가부여는 거부
+check "회차 한정 노드가 앵커 권한을 넘는 쓰기를 못 한다" '넘을 수 없다' \
+  "$(rg path add ctxnode --after execution --write context --reason x 2>&1)"
+check "앵커 권한 안의 쓰기는 허용된다" '노드 추가' \
+  "$(rg path add build --after execution --write source --reason x 2>&1)"
+
+# --- W1: 분기 노드를 지나는 skip 은 거부 (분기는 advance --to 의 일)
+python3 - "$RG/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p))
+for s in c["stages"]:
+    if s["id"] == "context":
+        s["next"] = ["planning", "execution"]
+json.dump(c, open(p, "w"), ensure_ascii=False)
+PY
+rg advance >/dev/null                                   # Context (분기)
+check "분기 노드를 지나는 skip 은 거부한다" '분기 노드다' \
+  "$(rg skip until:execution --reason x 2>&1)"
+check "분기는 advance --to 로 고른다" 'Planning' \
+  "$(rg advance --to planning --reason '코드 전 계획' 2>&1)"
+
+# --- Q1: 계획 승인 뒤에는 그래프를 못 바꾼다 (계획 승인 = 그래프 승인)
+RGPFX="$(rgst prefix)"
+mkdir -p "$RG/.dev/plan"; printf '# 계획\n' > "$RG/.dev/plan/${RGPFX}p.md"
+rg approve-plan ".dev/plan/${RGPFX}p.md" >/dev/null
+check "계획 승인 뒤 path add 는 거부된다" '계획 승인이 곧 그래프 승인' \
+  "$(rg path add late --after execution --reason x 2>&1)"
+check "계획 승인 뒤 path remove 도 거부된다" '계획 승인이 곧 그래프 승인' \
+  "$(rg path remove build --reason x 2>&1)"
+
+# --- C1: remove_path_row 는 설정 단계·방문 노드를 원자적으로 거른다
+# (관문이 조건부 DELETE 라, path_remove_block_reason 통과와 삭제 사이에 advance 가
+#  끼어드는 경쟁에서도 active 노드를 지우지 않는다 — Codex CRITICAL)
+check "설정 단계는 remove 관문을 통과 못한다 (원자적 거름)" '^False$' \
+  "$(python3 -c "
+import sys
+sys.path.insert(0, sys.argv[2])
+import harness as h
+con = h.connect(sys.argv[1])
+lid = h.head_loop(con)
+print(h.remove_path_row(con, lid, h.cycle_of(con, lid), 'execution'))
+" "$RG" "$(dirname "$ENGINE")")"
+rm -rf "$RG"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

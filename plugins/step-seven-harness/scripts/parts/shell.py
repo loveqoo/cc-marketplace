@@ -727,7 +727,7 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
         # CLI 가 거부하고, 모델은 안내받은 명령을 다시 시도해 다이얼로그가 반복된다.
         tgt = pos[2] if len(pos) > 2 else None
         if tgt:
-            why = path_remove_block_reason(con, cfg, lid, tgt)
+            why = path_remove_block_reason(con, cfg, root, lid, tgt)
             if why:
                 record_event(con, lid, sid, "block", "path_remove_impossible",
                              tgt, why)

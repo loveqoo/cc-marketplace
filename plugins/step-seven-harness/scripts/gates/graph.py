@@ -23,8 +23,11 @@ def register(h):
 
         # 위상 진단은 `graph_problems` 를 지나고 (hook_session_start →
         # config_problems → gate_problems 가 부른다), 방향 비대칭·후진 스킵은
-        # `hook_pre_tool_use` 를 지난다. 탐침도 같은 문으로 들어간다.
-        entry = ("hook_pre_tool_use", "graph_problems")
+        # `hook_pre_tool_use` 를, 실행 그래프 결합은 `graph_splice` 를 지난다.
+        # graph_splice 를 넣지 않았을 때, 그 함수가 고장나(빈 결과) 동적 노드가
+        # 실행 그래프에서 통째로 사라져도 이 게이트는 초록이었다 — Codex 가 지적한
+        # 자기증명 구멍이다. splice 를 진입점에 넣고 아래 splices() 탐침이 지난다.
+        entry = ("hook_pre_tool_use", "graph_problems", "graph_splice")
 
         @property
         def name(self):
@@ -93,6 +96,28 @@ def register(h):
                 return ask("%s path add probe-add --reason x" % h.WRAPPER_CMD,
                            ctx.cfg)
 
+            def splices():
+                """**실제 DB→graph_splice 경로를 증명한다.** path_node 를 심고
+                결합 결과에 그 노드가 앵커 뒤로 나오나. splice 가 고장나(빈 결과)
+                동적 노드를 잃으면 이 탐침이 실패한다 — 다른 탐침은 합성 cfg 를
+                쓰므로 이 경로를 지나지 않았다(Codex 지적)."""
+                ids = h.stage_ids(ctx.cfg)
+                if len(ids) < 3:
+                    return False, h.t("틀이 셋 미만이라 중간이 없다")
+                anchor = ids[1]
+                with h.probe_loop(ctx.con) as (con, lid):
+                    h.add_path_row(con, lid, h.cycle_of(con, lid),
+                                   "__probe_splice__", "P", "p", ["dev"],
+                                   anchor, "probe")
+                    c2 = h.Cfg({"stages": [s for s in ctx.cfg["stages"]
+                                           if not s.get("__dyn__")]})
+                    h.graph_splice(con, c2, lid)
+                    seq = [s["id"] for s in c2["stages"]]
+                got = ("__probe_splice__" in seq
+                       and seq.index("__probe_splice__") == seq.index(anchor) + 1)
+                return (not got), (h.t("앵커 뒤에 결합됨") if got
+                                   else h.t("결합되지 않았다 — splice 가 노드를 잃었다"))
+
             out = [
                 (h.t("뒤로 가는 엣지는 진단에 잡힌다"),
                  h._bind(diag, lambda sts: sts[3].update(next=["m1"]),
@@ -108,6 +133,8 @@ def register(h):
                  remove_asks, True),
                 (h.t("노드 추가는 동의를 묻지 않는다 (일이 늘 뿐이다)"),
                  add_free, False),
+                (h.t("path_node 가 실행 그래프로 결합된다 (DB→splice)"),
+                 splices, False),
             ]
             if len(h.stage_ids(ctx.cfg)) >= 3:
                 out.append((h.t("뒤로 가는 스킵은 묻지 않고 거부한다"),
