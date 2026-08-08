@@ -3387,6 +3387,130 @@ ad loop adopt "$ADL" --reason '부활' >/dev/null
 check "재연결은 다시 열린 작업으로 만든다" 'closed=False' "$(adinfo "$ADL")"
 rm -rf "$AD"
 
+echo "== 중간 그래프: 회차 한정 노드 (path add → 통과 → 회차가 닫히면 사라진다)"
+# 설계 합의(.dev/plan/dynamic-middle-graph.md): 동적 그래프 = 앞쪽에 노드가 자라는
+# 것. stages.json 은 안정된 틀로 남고, 추가는 CLI 로 DB 에 이번 회차에만 붙는다.
+GW="$(mktemp -d)"
+(cd "$GW" && git init -q . && python3 "$ENGINE" init >/dev/null)
+gw() { (cd "$GW" && python3 "$ENGINE" "$@"); }
+gst() { gw status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+gw loop intent "중간 그래프" >/dev/null
+gw loop done-when "끝" >/dev/null
+gw advance >/dev/null                                  # Scaffolding
+check "추가에도 사유는 필수다 (기록이다)" '사용법' "$(gw path add research 2>&1)"
+check "노드가 이번 회차에 더해진다" 'research — context 뒤' \
+  "$(gw path add research --after context --reason '조사 먼저')"
+check "그래프에 회차 한정으로 보인다" '회차 한정' "$(gw path)"
+check "틀은 고정이다 — 첫 틀 뒤에는 못 끼운다" '첫 틀' \
+  "$(gw path add x1 --after selection --reason x 2>&1)"
+check "마지막 틀 뒤에도 못 끼운다" '마지막 틀' \
+  "$(gw path add x2 --after compounding --reason x 2>&1)"
+check "이미 있는 단계 이름은 못 쓴다" '이미 있는 단계' \
+  "$(gw path add planning --reason x 2>&1)"
+gw advance >/dev/null                                  # Context
+check "지난 자리에는 못 붙인다 — 그래프는 앞쪽으로만 자란다" '이미 지난 자리' \
+  "$(gw path add x3 --after scaffolding --reason x 2>&1)"
+gw advance >/dev/null                                  # research (지연 생성된 행)
+check "회차 한정 노드에 들어선다" '^research$' "$(gst stage)"
+check "N/M 이 이번 회차의 그래프 크기를 센다" '4/8' "$(gst stage_label)"
+gw advance >/dev/null                                  # Planning
+gw path add extra --after execution --reason '실험' >/dev/null
+check "미방문 노드는 지울 수 있다 (동의 뒤의 자리)" '노드 삭제' \
+  "$(gw path remove extra --reason '불필요')"
+check "방문한 노드는 기록이라 못 지운다" '지울 수 없다' \
+  "$(gw path remove research --reason x 2>&1)"
+check "설정의 단계는 CLI 로 못 지운다" '회차 한정 노드가 아니다' \
+  "$(gw path remove execution --reason x 2>&1)"
+GPFX="$(gst prefix)"
+mkdir -p "$GW/.dev/plan" "$GW/.dev/retrospect"
+printf '# 계획\n' > "$GW/.dev/plan/${GPFX}p.md"
+gw skip until:compounding --reason '그래프 검사 중단' >/dev/null
+printf '# 회고\n' > "$GW/.dev/retrospect/${GPFX}r.md"
+gw advance --cycle >/dev/null
+check "회차가 닫히면 노드가 사라진다" '^0$' "$(gw path | grep -c '회차 한정')"
+check "이력은 이벤트로 남는다" 'research' "$(python3 -c "
+import sqlite3,sys
+rows=sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='path_add' ORDER BY id\").fetchall()
+print(','.join(r[0] for r in rows))" "$GW/.claude/harness/harness.db")"
+
+echo "== 중간 그래프: next 분기와 advance --to"
+# 분기 노드에서는 대상과 사유를 요구한다 — 어느 길로 갔는지도 기록이다.
+python3 - "$GW/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+for st in cfg["stages"]:
+    if st["id"] == "planning":
+        st["next"] = ["verification", "execution"]     # 기본 경로는 verification
+json.dump(cfg, open(p, "w"), ensure_ascii=False)
+PY
+gw advance >/dev/null; gw advance >/dev/null           # 2회차 → Planning
+G2PFX="$(gst prefix)"
+printf '# 계획\n' > "$GW/.dev/plan/${G2PFX}p.md"
+gw approve-plan ".dev/plan/${G2PFX}p.md" >/dev/null
+check "분기 노드는 대상 없이 못 간다" '분기 노드다' "$(gw advance 2>&1)"
+check "갈 수 없는 대상은 거부한다" '갈 수 있는 다음이 아니다' \
+  "$(gw advance --to compounding --reason x 2>&1)"
+check "사유 없는 분기는 거부한다" '사유가 필요하다' "$(gw advance --to execution 2>&1)"
+# 스킵은 **기본 경로**를 잰다 — 경로 밖 노드는 스킵이 아니라 분기 선택의 문제다.
+check "기본 경로 밖의 노드는 스킵 대상이 아니다" '기본 경로에 없다' \
+  "$(gw skip execution --reason x 2>&1)"
+check "분기를 고르면 간다" 'Execution' "$(gw advance --to execution --reason '코드가 있다')"
+check "분기 선택이 기록된다" '^execution$' "$(python3 -c "
+import sqlite3,sys
+r=sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT target FROM event WHERE kind='branch' ORDER BY id DESC LIMIT 1\").fetchone()
+print(r[0] if r else '')" "$GW/.claude/harness/harness.db")"
+check "지나지 않은 갈래는 pending 으로 남는다 (스킵이 아니다)" '^pending$' \
+  "$(gw status --json | python3 -c 'import json, sys
+print([s["status"] for s in json.load(sys.stdin)["stages"]
+       if s["id"] == "verification"][0])')"
+
+echo "== 중간 그래프: 위상 진단 (틀 고정·전방 전용·도달성)"
+python3 - "$GW/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+for st in cfg["stages"]:
+    st.pop("next", None)
+    if st["id"] == "execution":
+        st["next"] = ["context"]                       # 백엣지
+    if st["id"] == "selection":
+        st["next"] = ["planning"]                      # 틀 노드 선언
+    if st["id"] == "planning":
+        st["next"] = ["nowhere"]                       # 없는 대상
+    if st["id"] == "context":
+        st["next"] = ["planning"]                      # verification 도달 불가...
+json.dump(cfg, open(p, "w"), ensure_ascii=False)
+PY
+GDIAG="$(gw status 2>&1)"
+check "틀 노드의 next 선언을 말한다" '틀 노드라 next 를 선언할 수 없다' "$GDIAG"
+check "백엣지를 말한다" '뒤로 가는 엣지' "$GDIAG"
+check "없는 대상을 말한다" '없는 단계다' "$GDIAG"
+python3 - "$GW/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+for st in cfg["stages"]:
+    st.pop("next", None)
+    if st["id"] == "context":
+        st["next"] = ["execution"]                     # planning 으로 가는 길이 없다
+json.dump(cfg, open(p, "w"), ensure_ascii=False)
+PY
+check "도달하지 않는 노드를 말한다" '결코 방문되지 않는다' "$(gw status 2>&1)"
+python3 - "$GW/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+for st in cfg["stages"]:
+    st.pop("next", None)
+json.dump(cfg, open(p, "w"), ensure_ascii=False)
+PY
+check "선언을 지우면 깨끗하다 (기존 설정 무변경 호환)" '^0$' \
+  "$(gw status 2>&1 | grep -c '무시되는 설정')"
+rm -rf "$GW"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

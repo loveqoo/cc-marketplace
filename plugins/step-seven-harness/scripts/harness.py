@@ -154,6 +154,14 @@ CREATE INDEX IF NOT EXISTS event_target_idx ON event(target);
 CREATE TABLE IF NOT EXISTS promotion (
   key TEXT PRIMARY KEY, kind TEXT, decision TEXT, maturity TEXT,
   note TEXT, loop_id TEXT, at TEXT, recheck_at TEXT);
+-- 회차 한정 경로 노드. stages.json 은 안정된 틀로 남고, 진행 중 더한 노드는
+-- 여기 담겨 **이번 회차에만** 산다 — 회차가 닫히면 스코프 밖으로 나가고,
+-- 이력은 event(path_add/path_remove) 로 남는다.
+CREATE TABLE IF NOT EXISTS path_node (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loop_id TEXT, cycle INTEGER, node TEXT, label TEXT, summary TEXT,
+  write TEXT, after_node TEXT, reason TEXT, at TEXT,
+  UNIQUE(loop_id, cycle, node));
 """
 
 EVENT_KINDS = {
@@ -173,6 +181,9 @@ EVENT_KINDS = {
     "plan_mode_exit": "plan mode 종료 관측",
     "stop_continue": "턴 이어붙임",
     "stop_stalled": "진전 없어 이어붙임 중단",
+    "path_add": "경로 노드 추가 (회차 한정)",
+    "path_remove": "경로 노드 삭제",
+    "branch": "분기 선택",
 }
 
 # 승격 결정의 종류. 'declined' 는 "안 한다 + 사유" — 결정이지 회피가 아니다.
@@ -363,6 +374,7 @@ def sub_table():
 
 LOOP_SUBS, loop_sub = sub_table()
 AUTO_SKIP_SUBS, auto_skip_sub = sub_table()
+PATH_SUBS, path_sub = sub_table()
 
 
 def dispatch(table, cmd, sub):
@@ -1355,6 +1367,12 @@ def run_hook():
             return inactive(t("`%s` 의 stages 가 비어 있다 — 단계가 없으면 단계 게이트도, "
                               "종료 조건도, 단계별 쓰기 규칙도 없다") % CONFIG_REL, fix)
         lid = head_loop(con)
+        if lid:
+            # 이번 회차의 실행 그래프 = 설정 단계 + 회차 한정 노드. 활성 단계가
+            # 회차 한정 노드일 수 있으므로 `stage_known` **앞**에서 결합해야 한다 —
+            # 뒤에 두면 그 노드에 서 있는 것만으로 게이트가 꺼진다.
+            with swallow(t("경로 노드 결합")):
+                graph_splice(con, cfg, lid)
         sid = active_stage(con, lid) if lid else None
         if lid and sid and not stage_known(cfg, sid):
             # DB 의 활성 단계가 `stages.json` 에 없다. 예전에는 `stage_index` 가 0 을
@@ -1617,7 +1635,7 @@ class Gate(abc.ABC):
 # **여기 있어야 하는 게이트.** 구현이 파일로 갈라지면 파일 하나가 안 실려도 조용히
 # 사라질 수 있다 — 그때 `강제 중:` 줄에서 그 게이트만 빠지고 아무도 모른다.
 # 그래서 레지스트리가 아니라 **엔진이** 목록을 선언하고, 없으면 소리를 낸다.
-REQUIRED_GATES = ("write", "consent", "criteria", "stop", "promotion")
+REQUIRED_GATES = ("write", "consent", "criteria", "stop", "promotion", "graph")
 GATES = []
 
 
@@ -2031,6 +2049,9 @@ def run_cli(argv):
                 with con:
                     lid = create_loop(con, cfg, root, only_if_none=True)
                 sid = active_stage(con, lid) or cfg["stages"][0]["id"]
+            # 훅과 같은 이유·같은 자리 — `stage_known` 앞에서 결합한다.
+            with swallow(t("경로 노드 결합")):
+                graph_splice(con, cfg, lid)
         except sqlite3.OperationalError as exc:
             # 0바이트·타 SQLite 파일은 `connect` 는 통과하고 **첫 질의**에서
             # 죽는다. 훅이 안내하는 `status` 가 여기서 traceback 이면 복구
@@ -2121,6 +2142,8 @@ USAGE = """step-seven-harness — 작업 하네스
 
 단계 진행
   advance                      다음 단계로. 종료 조건이 남으면 거부하고 무엇이 남았는지 알려준다
+  advance --to <stage-id> --reason "..."
+                               분기 노드(next 가 여럿)에서는 대상과 사유를 골라야 한다
   advance --done               (Compounding 에서만) 작업 종료 → Selection 으로
   advance --cycle              (Compounding 에서만) 다음 회차 → Scaffolding 으로, 같은 작업 유지
   skip <대상> --reason "..."    단계 건너뛰기 ✋
@@ -2128,6 +2151,17 @@ USAGE = """step-seven-harness — 작업 하네스
   approve-plan <file>          계획에 대한 사람의 승인 기록 ✋
   verify -- <검증 명령>        하네스가 직접 돌려 종료 코드로 판정한다. 통과해야
                                증거가 된다. 훅이 없는 도구에서도 이 길은 열려 있다
+
+중간 그래프 (틀 셋 — 처음 둘과 마지막 — 사이는 회차마다 다를 수 있다)
+  path                         이번 회차의 실행 그래프 — 방문 상태·분기·회차 한정 노드
+  path add <id> --reason "..." [--label "..."] [--summary "..."]
+           [--after <node>] [--write dev,tests]
+                               앞쪽에 노드를 더한다 (회차 한정 — 회차가 닫히면 사라지고
+                               이력은 event 로 남는다). 추가는 자유다 — 일이 늘 뿐
+                               어떤 게이트도 사라지지 않는다
+  path remove <node> --reason "..."
+                               미방문 회차 한정 노드를 뺀다 ✋ — 미방문 노드 삭제는
+                               스킵의 위장이므로 스킵과 같은 동의를 받는다
 
 예외
   allow <glob> --reason "..." [--uses N]

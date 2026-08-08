@@ -36,6 +36,24 @@ def cli_advance(ctx, argv):
                          t("  harness advance --cycle   후속 회차가 남았다 → %s (같은 작업 유지)")
                          % stage_obj(cfg, cfg["stages"][1]["id"])["label"], code=1)
 
+    # 분기 노드에서는 대상과 사유를 요구한다 — 어느 길로 갔는지도 기록이다.
+    to = argv_value(argv, "to")
+    succ = successors(cfg, sid) if sid != last else []
+    if sid != last:
+        if to and to not in succ:
+            raise Refuse(t("--to %s 는 여기서 갈 수 있는 다음이 아니다 (가능: %s). "
+                           "그래프는 `harness path` 로 본다.")
+                         % (to, ", ".join(succ)), code=2)
+        if len(succ) > 1:
+            if not to:
+                raise Refuse(t("%s 는 분기 노드다 — 다음을 골라야 한다: %s")
+                             % (stage_obj(cfg, sid)["label"], ", ".join(succ)),
+                             t("  harness advance --to <단계> --reason \"왜 그 길인가\""),
+                             code=2)
+            if not argv_value(argv, "reason"):
+                raise Refuse(t("분기에는 사유가 필요하다: --reason \"왜 그 길인가\" "
+                               "— 어느 길을 왜 골랐는지가 기록으로 남는다."), code=2)
+
     missing = exit_blockers(con, cfg, root, lid, sid)
     if missing:
         print(t("advance 거부 — %s 단계의 종료 조건이 남았다:") % stage_obj(cfg, sid)["label"])
@@ -92,7 +110,11 @@ def cli_advance(ctx, argv):
         elif sid == last:
             nlid, nsid, done_task = lid, next_cycle(ctx), False
         else:
-            nlid, nsid, _ = _enter(ctx, stage_index(cfg, sid) + 1)
+            nsid0 = to if (to and to in succ) else succ[0]
+            if len(succ) > 1:
+                record_event(con, lid, sid, "branch", sid, nsid0,
+                             argv_value(argv, "reason"))
+            nlid, nsid, _ = _enter(ctx, stage_index(cfg, nsid0))
             done_task = False
             if nsid is None:
                 raise Refuse(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"), code=2)
@@ -138,20 +160,18 @@ def cli_skip(ctx, argv):
     why = skip_block_reason(cfg, sid, target, con, root, lid)
     if why:
         raise Refuse(why, code=1)
-    ids = stage_ids(cfg)
-    cur = stage_index(cfg, sid)
-    if target.startswith("+"):
-        dest = min(cur + int(target[1:]) - 1, len(ids) - 1)
-    elif target.startswith("until:"):
-        dest = ids.index(target.split(":", 1)[1]) - 1
-    else:
-        dest = ids.index(target)
+    # 대상 해석은 **경로 기준**이다 — `+N`/`until:` 은 배열이 아니라 기본 경로를
+    # 잰다. skip_block_reason 이 이미 같은 해석으로 걸렀으므로 err 는 방어선이다.
+    err, route = skip_route(cfg, sid, target)
+    if err:
+        raise Refuse(err, code=1)
+    dest = route[-1]
 
     # 스킵은 **승인**을 면제하지만 **기록**을 면제하지 않는다.
     # 무인 실행으로 Planning 을 건너뛰어도 계획 파일은 남아야 한다 — 회차 10번을 돌았을 때
     # 계획 10개가 남는 것과 스킵 기록 10개가 남는 것은 복리의 재료로서 다르다.
-    for i in range(cur, dest + 1):
-        st = cfg["stages"][i]
+    for x in route:
+        st = stage_obj(cfg, x)
         for key in st.get("skip_requires", []):
             # advance 와 **같은 판정**을 써야 한다. has_evidence 만 보면 계획 파일이
             # 디스크에 있는데도 "계획 파일을 남겨야 한다"고 거부한다 — 이미 한 일을
@@ -169,7 +189,7 @@ def cli_skip(ctx, argv):
         # 현재 단계를 벗어나는 것은 **한 번뿐이다.** 이 claim 이 병렬 스킵의 단일
         # 소비점이다 — 자동 승인 `--uses 1` 을 둘이 동시에 써도 하나만 통과한다.
         # 종료 조건을 충족했다면 done, 아니면 skipped 로 정직하게 기록한다.
-        if dest == cur or exit_blockers(con, cfg, root, lid, sid):
+        if len(route) == 1 or exit_blockers(con, cfg, root, lid, sid):
             won = stage_set(con, "skipped", (now(), reason, by, lid, sid))
             skipped.append(sid)
         else:
@@ -178,14 +198,19 @@ def cli_skip(ctx, argv):
             raise Refuse(t("이미 %s 단계를 벗어났다 — 다른 호출이 먼저 진행했다. "
                            "`harness status` 로 현재 단계를 확인하라.")
                          % stage_obj(cfg, sid)["label"], code=1)
-        for i in range(cur + 1, dest + 1):
-            stage_set(con, "skip_ahead", (now(), reason, by, lid, ids[i]))
-            skipped.append(ids[i])
+        for x in route[1:]:
+            ensure_stage_row(con, lid, x)
+            stage_set(con, "skip_ahead", (now(), reason, by, lid, x))
+            skipped.append(x)
         for s in skipped:
             record_event(con, lid, s, "skip", s, by, reason)
         if by == "auto":
             _, left = consume_auto_skip(con)
-        nlid, nsid, cycled = _enter(ctx, dest + 1)
+        # 도착지는 경로에서 대상 **다음** 노드다. 분기를 지나는 스킵은 없다 —
+        # skip_route 가 기본 경로 밖 대상을 이미 거절했다.
+        nxt = successors(cfg, dest)
+        nlid, nsid, cycled = _enter(
+            ctx, stage_index(cfg, nxt[0]) if nxt else len(cfg["stages"]))
         if nsid is None:
             raise RuntimeError(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"))
     print(t("스킵(%s): %s") % (t("자동 승인") if by == "auto" else t("사용자 승인"),
@@ -834,6 +859,108 @@ def cli_loop(ctx, argv):
     return dispatch(LOOP_SUBS, "loop", pos[0] if pos else "show")(ctx, argv, pos)
 
 
+@path_sub("show")
+def _path_show(ctx, argv, pos):
+    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
+    rows = stage_rows(con, lid)
+    print(t("작업 %s · 회차 %d 의 실행 그래프 (%d 노드)")
+          % (lid, cycle_of(con, lid), len(cfg["stages"])))
+    marks = {"active": "●", "done": "✓", "skipped": "~"}
+    for s in cfg["stages"]:
+        row = rows.get(s["id"])
+        mark = marks.get(row["status"], "·") if row else "·"
+        bits = ""
+        nxt = valid_next(cfg, s["id"])
+        if len(nxt) > 1:
+            bits += t("  분기 → %s") % " | ".join(nxt)
+        elif nxt:
+            bits += "  → %s" % nxt[0]
+        if s.get("__dyn__"):
+            bits += t("  (회차 한정)")
+        print("  %s %-16s %s%s" % (mark, s["id"], s["label"], bits))
+    print(t("노드 추가는 자유다: `harness path add <id> --reason \"...\"`. "
+          "미방문 노드 삭제는 스킵과 같은 동의를 받는다: `harness path remove <id>`"))
+    return 0
+
+
+@path_sub("add")
+def _path_add(ctx, argv, pos):
+    """앞쪽에 노드를 더한다 — **회차 한정.** 추가는 동의를 묻지 않는다: 일이 늘
+    뿐 어떤 게이트도 사라지지 않는다. 사유는 그래도 기록한다 — 계획 승인이 곧
+    그래프 승인이 되려면 왜 자랐는지가 남아야 한다."""
+    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
+    node = pos[1] if len(pos) > 1 else None
+    reason = argv_value(argv, "reason")
+    if not node or not reason:
+        raise Refuse(t("사용법: harness path add <id> --reason \"...\" "
+                       "[--label \"...\"] [--summary \"...\"] [--after <node>] "
+                       "[--write dev,tests]"), code=2)
+    ids = stage_ids(cfg)
+    cur = stage_index(cfg, sid)
+    after = argv_value(argv, "after") \
+        or (sid if 1 <= cur < len(ids) - 1 else ids[1])
+    why = path_add_block_reason(con, cfg, lid, node, after)
+    if why:
+        raise Refuse(why, code=1)
+    write = [w.strip() for w in (argv_value(argv, "write") or "dev").split(",")
+             if w.strip()]
+    bad = [w for w in write if w not in known_classes(cfg)]
+    if bad:
+        raise Refuse(t("모르는 경로 클래스: %s (가능: %s)")
+                     % (", ".join(bad), ", ".join(sorted(known_classes(cfg)))), code=2)
+    cyc = cycle_of(con, lid)
+    with con:
+        if not add_path_row(con, lid, cyc, node,
+                            argv_value(argv, "label") or node,
+                            argv_value(argv, "summary") or t("회차 한정 노드"),
+                            write, after, reason):
+            raise Refuse(t("'%s' 는 이번 회차에 이미 있다") % node, code=1)
+        ensure_stage_row(con, lid, node)
+        record_event(con, lid, sid, "path_add", node, after, reason)
+    graph_splice(con, cfg, lid)
+    print(t("노드 추가 (회차 %d 한정): %s — %s 뒤. 회차가 닫히면 사라지고 "
+          "이력은 기록으로 남는다.") % (cyc, node, after))
+    print(t("  쓰기 허용: %s · 그래프 확인: `harness path`") % ", ".join(write))
+    return 0
+
+
+@path_sub("remove")
+def _path_remove(ctx, argv, pos):
+    """미방문 회차 한정 노드를 뺀다. **미방문 노드 삭제는 스킵의 위장**이므로
+    PreToolUse 가 스킵과 같은 동의를 받은 뒤에만 여기까지 온다."""
+    con, cfg, lid, sid = ctx.con, ctx.cfg, ctx.lid, ctx.sid
+    node = pos[1] if len(pos) > 1 else None
+    reason = argv_value(argv, "reason")
+    if not node or not reason:
+        raise Refuse(t("사용법: harness path remove <node> --reason \"...\""), code=2)
+    why = path_remove_block_reason(con, cfg, lid, node)
+    if why:
+        raise Refuse(why, code=1)
+    by = "auto" if auto_skip_on(con) else "user"
+    left = None
+    with con:
+        if not remove_path_row(con, lid, cycle_of(con, lid), node):
+            raise Refuse(t("'%s' 는 이번 회차에 없다 — 다른 호출이 먼저 지웠을 수 "
+                           "있다. `harness path` 로 확인하라.") % node, code=1)
+        record_event(con, lid, sid, "path_remove", node, by, reason)
+        if by == "auto":
+            _, left = consume_auto_skip(con)
+    graph_splice(con, cfg, lid)
+    print(t("노드 삭제(%s): %s") % (t("자동 승인") if by == "auto" else t("사용자 승인"),
+                                node))
+    print(t("사유: %s") % reason)
+    if by == "auto" and left is not None:
+        print(t("자동 승인 남은 횟수: %d%s") % (left, t(" — 소진되어 OFF 로 돌아갔다") if left == 0 else ""))
+    return 0
+
+
+def cli_path(ctx, argv):
+    """중간 그래프 조작. add 는 자유(추가는 게이트를 없애지 않는다), remove 는
+    PreToolUse 가 스킵과 같은 동의를 받은 뒤에만 도달한다."""
+    pos = argv_positional(argv)
+    return dispatch(PATH_SUBS, "path", pos[0] if pos else "show")(ctx, argv, pos)
+
+
 CLI = {
     "status": cli_status,
     "advance": cli_advance,
@@ -842,6 +969,7 @@ CLI = {
     "allow": cli_allow,
     "approve-plan": cli_approve_plan,
     "loop": cli_loop,
+    "path": cli_path,
     "auto-skip": cli_auto_skip,
     "recall": cli_recall,
     "stats": cli_stats,

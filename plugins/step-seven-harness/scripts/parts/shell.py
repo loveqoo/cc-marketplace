@@ -15,7 +15,7 @@ BASH_MUTATORS = re.compile(
 # 두 번째 토큰까지 잡는다. `loop new` 는 루프를 닫고 새로 만들므로 모든 단계
 # 게이트를 우회하는데, 첫 토큰만 보면 subcommand 가 'loop' 로 잡혀 동의 판정이
 # 아예 일어나지 않았다 — 승격 게이트가 그 구멍으로 그대로 새어나갔다.
-CTRL_SUB2 = {"loop": ("new", "adopt")}
+CTRL_SUB2 = {"loop": ("new", "adopt"), "path": ("remove",)}
 
 
 CTRL_NAMES = ("harness", "harness.py")
@@ -688,6 +688,14 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
         # CLI 에서는 on 인데 이 정규식에서는 아니어서 게이트가 통째로 사라졌다.
         if "on" not in pos[1:]:
             return
+    elif sub == "path remove":
+        # **미방문 노드 삭제는 스킵의 위장** — 기존 스킵 동의 게이트를 그대로 쓴다.
+        # 새 동의 항목을 만들지 않는 이유 둘: 기존 설치의 consent 영역에는 새
+        # 항목이 병합되지 않고(최상위 영역만 채운다), 방향 비대칭 게이트의 합의가
+        # "새 규칙을 발명하지 않는다" 였다. 사용자가 skip 동의를 덜어냈다면 삭제
+        # 동의도 같이 꺼진다 — 같은 게이트니까 그게 맞다.
+        if "skip" not in consent_map(cfg):
+            return
     elif sub not in consent_map(cfg):
         return
 
@@ -714,6 +722,17 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
                 record_event(con, lid, sid, "block", "skip_impossible", tgt, why)
                 return pre_decision("deny", why)
 
+    if sub == "path remove":
+        # 불가능한 삭제도 스킵과 같다 — **묻지 않고** 거부한다. 승인을 받아봐야
+        # CLI 가 거부하고, 모델은 안내받은 명령을 다시 시도해 다이얼로그가 반복된다.
+        tgt = pos[2] if len(pos) > 2 else None
+        if tgt:
+            why = path_remove_block_reason(con, cfg, lid, tgt)
+            if why:
+                record_event(con, lid, sid, "block", "path_remove_impossible",
+                             tgt, why)
+                return pre_decision("deny", why)
+
     reason = raw_flag(cmd, "reason")
     if sub != "approve-plan" and not reason:
         record_event(con, lid, sid, "block", "no_reason", sub, cmd[:200])
@@ -727,8 +746,19 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
                                 "끄려면 `harness auto-skip off`.")
                                 % (reason, auto_skip_scope_note(con)))
         return out
+    if sub == "path remove" and auto_skip_on(con):
+        # 같은 게이트이므로 자동 승인도 같이 적용된다 — 사실은 노출한다.
+        out = pre_decision("defer", None)
+        out["systemMessage"] = (t("harness: 회차 노드 삭제를 스킵 자동 승인으로 "
+                                "통과시켰다 (사유: %s · %s). 끄려면 "
+                                "`harness auto-skip off`.")
+                                % (reason, auto_skip_scope_note(con)))
+        return out
 
-    detail = "%s: `%s`" % (consent_map(cfg).get(sub, sub + t(" 요청")), cmd.strip())
+    what = consent_map(cfg).get(sub, sub + t(" 요청"))
+    if sub == "path remove":
+        what = t("미방문 회차 노드 삭제 요청 — 스킵의 위장이므로 스킵과 같은 동의를 받는다")
+    detail = "%s: `%s`" % (what, cmd.strip())
     if reason:
         detail += t("\n사유: %s") % reason
     if sub == "approve-plan":

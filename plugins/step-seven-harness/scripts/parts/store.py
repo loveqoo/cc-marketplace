@@ -10,7 +10,14 @@ ADDED_COLUMNS = (("evidence", "digest", "TEXT"),
 
 
 def migrate(con):
-    """빠진 열을 채운다. 이미 있으면 아무것도 하지 않는다."""
+    """빠진 열과 표를 채운다. 이미 있으면 아무것도 하지 않는다.
+
+    표는 스키마 전체를 다시 적용한다 — 전부 `IF NOT EXISTS` 라 멱등이다.
+    열과 달리 표를 목록으로 따로 적으면 스키마와 목록이 어긋날 자리가 생긴다.
+    새 표(path_node)를 훅이 매 호출 읽으므로, `init` 을 기다리지 않고 연결
+    시점에 채워야 낡은 DB 에서 훅이 죽지 않는다.
+    """
+    con.executescript(SCHEMA)
     for table, col, typ in ADDED_COLUMNS:
         cols = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
         if cols and col not in cols:
@@ -87,15 +94,22 @@ def create_loop(con, cfg, root, intent=None, loop_id=None, only_if_none=False):
             row = con.execute("SELECT id FROM loop WHERE closed_at IS NULL "
                               "ORDER BY created_at DESC, id DESC LIMIT 1").fetchone()
             if row:
+                graph_splice(con, cfg, row["id"])
                 return row["id"]
     else:
         con.execute(sql, args)
-    for i, st in enumerate(cfg["stages"]):
+    # 회차 한정 노드(`__dyn__`)는 **이 작업의 것이 아니다.** cfg 가 이전 작업의
+    # 그래프로 결합돼 있어도, 새 작업은 설정의 틀에서 시작한다.
+    for i, st in enumerate([s for s in cfg["stages"] if not s.get("__dyn__")]):
         con.execute("INSERT OR IGNORE INTO stage(loop_id,stage,status,entered_at) "
                     "VALUES(?,?,?,?)",
                     (lid, st["id"], "active" if i == 0 else "pending",
                      now() if i == 0 else None))
     set_meta(con, "head", lid)
+    # cfg 를 **이 작업**의 그래프로 다시 결합한다. 이전 작업의 회차 한정 노드가
+    # 결합된 채 남으면, 같은 프로세스에서 이어지는 출력("→ 단계 1/8")이 새 작업에
+    # 대해 거짓말을 한다.
+    graph_splice(con, cfg, lid)
     return lid
 
 
@@ -498,3 +512,49 @@ def grant_write(con, lid, glob, reason, uses):
     자리다 — 파일이 갈라지니 그 중복이 비로소 보였다."""
     con.execute("INSERT INTO wgrant(loop_id,glob,reason,uses_left,at) "
                 "VALUES(?,?,?,?,?)", (lid, glob, reason, uses, now()))
+
+
+# ------------------------------------------------------------------ path node
+#
+# 회차 한정 경로 노드. stages.json 은 안정된 틀로 남고, 진행 중 더한 노드는
+# (loop, cycle) 로 스코프된다 — 회차가 닫히면 조회에서 빠져 저절로 사라진다.
+# 행을 지우지 않는 이유는 없다: 이력은 event 가 갖고, 행은 스코프가 가른다.
+
+def path_rows(con, lid, cycle):
+    """이번 회차의 경로 노드들. **표가 없는 낡은 DB 는 빈 목록이다** — 판정을
+    막지 않는다. 표는 다음 `connect`/`init` 이 채운다 (migrate)."""
+    try:
+        return con.execute(
+            "SELECT * FROM path_node WHERE loop_id=? AND cycle=? ORDER BY id",
+            (lid, cycle)).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def add_path_row(con, lid, cycle, node, label, summary, write, after, reason):
+    """노드 하나를 이번 회차에 더한다. 같은 이름은 한 번만 — 이겼으면 True."""
+    return claim(con, "INSERT OR IGNORE INTO path_node"
+                      "(loop_id,cycle,node,label,summary,write,after_node,reason,at) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)",
+                 (lid, cycle, node, label, summary,
+                  json.dumps(write, ensure_ascii=False), after, reason, now()))
+
+
+def remove_path_row(con, lid, cycle, node):
+    """노드 하나를 이번 회차에서 뺀다. 단계 행도 함께 — 미방문 행만 지운다
+    (방문한 행은 기록이라 `path_remove_block_reason` 이 먼저 거절한다)."""
+    won = claim(con, "DELETE FROM path_node WHERE loop_id=? AND cycle=? AND node=?",
+                (lid, cycle, node))
+    con.execute("DELETE FROM stage WHERE loop_id=? AND stage=? AND status='pending'",
+                (lid, node))
+    return won
+
+
+def ensure_stage_row(con, lid, sid):
+    """단계 행을 **지연 생성**한다. 있으면 아무것도 하지 않는다.
+
+    작업을 만들 때 일괄 생성만 있으면, 회차 중에 더해진 경로 노드는 행이 없어
+    `advance` 가 "다음 단계 행이 없다" 로 거절한다 — 설계 문서가 미리 짚은 자리다.
+    """
+    con.execute("INSERT OR IGNORE INTO stage(loop_id,stage,status,entered_at) "
+                "VALUES(?,?,'pending',NULL)", (lid, sid))

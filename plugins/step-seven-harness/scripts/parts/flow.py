@@ -41,6 +41,211 @@ def label_of(cfg, sid):
                          stage_obj(cfg, sid)["label"])
 
 
+# -------------------------------------------------------------------- 중간 그래프
+#
+# 샌드위치 구조: 처음 둘(Selection·Scaffolding)과 마지막(Compounding)은 **틀**이라
+# 코드가 고정한다 — `next` 선언 불가, 위치 고정. 그 사이(중간)만 그래프다:
+# `next` 선언으로 분기하되 **앞으로만** 간다(백엣지 금지). 선언이 없으면 다음
+# 항목이다 — 기존 설정은 무변경으로 동작한다.
+#
+# 뒤로는 가지 않는다(POLICY 4). 되돌아갈 일은 회차를 빠르게 닫는 것으로 해결하므로
+# 재진입 의미론은 설계하지 않는다 — 이 결정이 이 그래프를 DAG 로 유지한다.
+
+def frame_idx(cfg):
+    """틀 노드의 자리 — 처음 둘과 마지막. id 가 아니라 **자리**다: 엔진의 나머지
+    (create_loop 의 0, next_cycle 의 1, advance 의 -1)가 이미 자리로 말한다."""
+    n = len(cfg.get("stages") or [])
+    return {0, 1, n - 1} if n >= 3 else set(range(n))
+
+
+def declared_next(st):
+    """선언된 next. 문자열 하나도 받는다 — 목록 강제는 마찰만 늘린다."""
+    v = st.get("next")
+    if isinstance(v, str):
+        v = [v]
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def valid_next(cfg, sid):
+    """이 노드의 선언 중 **실제로 쓰는** 엣지. 틀 노드의 선언, 모르는 대상,
+    뒤로 가는 엣지는 버린다 — 버린 사실은 `graph_problems` 가 말한다."""
+    ids = stage_ids(cfg)
+    i = ids.index(sid)
+    st = cfg["stages"][i]
+    if i in frame_idx(cfg) or st.get("__dyn__"):
+        return []
+    return [x for x in declared_next(st) if x in ids and ids.index(x) > i]
+
+
+def successors(cfg, sid):
+    """이 노드에서 갈 수 있는 다음 노드들 (이번 회차의 실행 그래프 기준).
+
+    회차 한정 노드는 앵커 **바로 뒤에** 끼워지므로: 앵커의 다음은 그 노드이고,
+    사슬의 끝은 앵커가 원래 가던 곳(선언 또는 다음 항목)으로 간다 — 앵커가
+    분기 노드면 분기 결정이 사슬 뒤로 미뤄진다.
+    """
+    sts, ids = cfg["stages"], stage_ids(cfg)
+    if sid not in ids:
+        return []
+    i = ids.index(sid)
+    if i >= len(sts) - 1:
+        return []
+    if sts[i + 1].get("__dyn__"):
+        return [ids[i + 1]]
+    j = i
+    while j >= 0 and sts[j].get("__dyn__"):    # 사슬의 주인(앵커)을 찾는다
+        j -= 1
+    return valid_next(cfg, ids[j]) or [ids[i + 1]]
+
+
+def default_path(cfg, sid):
+    """sid 에서 끝까지의 **기본 경로** — 분기에서는 첫 선언을 따른다.
+
+    스킵의 `+N`/`until:` 이 이 경로를 기준으로 잰다. 엣지가 전부 앞으로만 가므로
+    (valid_next 가 보장) 이 걸음은 반드시 끝난다.
+    """
+    path, node = [sid], sid
+    while True:
+        nxt = successors(cfg, node)
+        if not nxt:
+            return path
+        node = nxt[0]
+        path.append(node)
+
+
+def graph_splice(con, cfg, lid):
+    """cfg 의 stages 를 **이번 회차의 실행 그래프**로 바꾼다 (그 자리에서).
+
+    설정 단계 + 회차 한정 노드(path_node, 앵커 바로 뒤). 멱등이다 — 결합된
+    상태에서 다시 불러도 같은 답이 나온다. 계획 승인 = 그래프 승인이라는 결정의
+    구현 절반이 여기다: Planning 에서 더한 노드가 그대로 실행 그래프가 된다.
+    """
+    base = [s for s in (cfg.get("stages") or [])
+            if not (isinstance(s, dict) and s.get("__dyn__"))]
+    chains = {}
+    for r in path_rows(con, lid, cycle_of(con, lid)):
+        try:
+            write = json.loads(r["write"]) if r["write"] else ["dev"]
+        except ValueError:
+            write = ["dev"]
+        chains.setdefault(r["after_node"], []).append({
+            "id": r["node"], "label": r["label"] or r["node"],
+            "summary": r["summary"] or t("회차 한정 노드"),
+            "write": write if isinstance(write, list) else ["dev"],
+            "exit_criteria": [], "stop_requires": [], "__dyn__": True,
+        })
+    out = []
+
+    def emit(node):
+        out.append(node)
+        for d in chains.pop(node["id"], []):    # 사슬 뒤에 또 사슬이 붙을 수 있다
+            emit(d)
+
+    for s in base:
+        emit(s)
+    orphan = [d for lst in chains.values() for d in lst]
+    if orphan and out:
+        # 앵커가 사라진 노드(설정이 바뀐 경우). 버리면 조용한 소실이므로 마지막
+        # 틀 앞에 두어 눈에 보이게 한다 — 지우는 것은 사람의 결정이다.
+        out[-1:-1] = orphan
+    cfg["stages"] = out
+    return cfg
+
+
+def graph_problems(cfg):
+    """중간 그래프의 위상 진단. 막지 않는다 — 무엇이 무시되는지 **말한다**.
+
+    잡는 것 셋, 전부 조용히 어긋나는 부류다: ① 틀 노드의 `next` 선언(무시된다)
+    ② 모르는·뒤로 가는 엣지(무시된다 — 뒤로 가는 그래프는 이 하네스가 설계로
+    거부한 것이다) ③ 어떤 경로로도 도달하지 않는 중간 노드(결코 방문되지 않는다).
+    """
+    out = []
+    sts = [s for s in (cfg.get("stages") or [])
+           if isinstance(s, dict) and not s.get("__dyn__")]
+    ids = [s.get("id") for s in sts]
+    n = len(sts)
+    frame = {0, 1, n - 1} if n >= 3 else set(range(n))
+    for i, st in enumerate(sts):
+        dec = declared_next(st)
+        if not dec:
+            continue
+        if i in frame:
+            out.append(t("stages[%s] 는 틀 노드라 next 를 선언할 수 없다 — 선언이 "
+                         "무시된다. 틀 사이(중간)에서만 그래프를 그려라") % st.get("id"))
+            continue
+        for x in dec:
+            if x not in ids:
+                out.append(t("stages[%s].next 의 '%s' 는 없는 단계다 — 그 엣지는 "
+                             "무시된다") % (st.get("id"), x))
+            elif ids.index(x) <= i:
+                out.append(t("stages[%s].next 의 '%s' 는 뒤로 가는 엣지다 — 중간 "
+                             "그래프는 앞으로만 간다. 그 엣지는 무시된다. 되돌아갈 "
+                             "일은 회차를 닫고 다음 회차로 해결하라")
+                           % (st.get("id"), x))
+    if n < 3:
+        return out
+    # 도달성: 두 번째 틀(Scaffolding 자리)에서 걸어 본다. 엣지가 전부 앞으로만
+    # 가므로 도달한 노드는 마지막 틀에도 반드시 닿는다 — 남는 질문은 이것 하나다.
+    plain = {"stages": sts}
+    seen, frontier = {ids[1]}, [ids[1]]
+    while frontier:
+        node = frontier.pop()
+        for x in successors(plain, node):
+            if x not in seen:
+                seen.add(x)
+                frontier.append(x)
+    for i in range(2, n - 1):
+        if ids[i] not in seen:
+            out.append(t("stages[%s] 는 어떤 경로로도 도달하지 않는다 — 이 단계는 "
+                         "결코 방문되지 않는다. 앞 노드의 next 에 넣거나 단계를 "
+                         "빼라") % ids[i])
+    return out
+
+
+def path_add_block_reason(con, cfg, lid, node, after):
+    """`path add` 가 불가능한 이유. 가능하면 None. 훅과 CLI 가 같은 함수를 쓴다.
+
+    추가는 동의가 필요 없지만 **아무 데나** 자랄 수는 없다: 그래프는 앞쪽으로만
+    자라고(지난 자리 뒤에는 못 붙인다), 틀은 고정이다(첫 틀 뒤·마지막 틀 뒤는
+    끼울 자리가 아니다).
+    """
+    ids = stage_ids(cfg)
+    if not node or not re.match(r"^[a-z][a-z0-9_-]{0,31}$", node):
+        return t("노드 이름은 소문자·숫자·'-'·'_' 32자 이내여야 한다: %s") % (node or "")
+    if node in ids:
+        return t("'%s' 는 이미 있는 단계다 — 다른 이름을 써라") % node
+    if after not in ids:
+        return t("앵커 '%s' 가 이번 회차의 그래프에 없다. `path` 로 그래프를 "
+                 "확인하라") % after
+    ai, cur = ids.index(after), stage_index(cfg, active_stage(con, lid) or ids[0])
+    if ai == 0:
+        return t("첫 틀(%s) 뒤에는 끼울 수 없다 — 틀 셋은 고정이고, 중간은 %s 뒤부터다") \
+            % (ids[0], ids[1])
+    if ai >= len(ids) - 1:
+        return t("마지막 틀(%s) 뒤에는 끼울 수 없다 — 더 할 일이 남았으면 "
+                 "`advance --cycle` 로 다음 회차를 열어라") % ids[-1]
+    if ai < cur:
+        return t("'%s' 는 이미 지난 자리다 — 그래프는 앞쪽으로만 자란다. 지금(%s) "
+                 "이후의 노드를 앵커로 잡아라") % (after, active_stage(con, lid))
+    return None
+
+
+def path_remove_block_reason(con, cfg, lid, node):
+    """`path remove` 가 불가능한 이유. 가능하면 None. 훅과 CLI 가 같은 함수를
+    쓴다 — 다르면 사용자가 승인한 **뒤에** CLI 가 거부하고 다이얼로그가 반복된다."""
+    st = next((s for s in cfg["stages"] if s.get("id") == node), None)
+    if st is None or not st.get("__dyn__"):
+        return t("'%s' 는 회차 한정 노드가 아니다 — stages.json 의 단계는 CLI 로 "
+                 "지울 수 없다. 설정을 바꾸려면 그 파일을 고쳐라 (진단이 따라온다)") \
+            % node
+    row = con.execute("SELECT status FROM stage WHERE loop_id=? AND stage=?",
+                      (lid, node)).fetchone()
+    if row and row["status"] in ("active", "done", "skipped"):
+        return t("'%s' 는 이미 방문했거나 방문 중이다 — 지나간 노드는 기록이라 "
+                 "지울 수 없다") % node
+    return None
+
+
 def file_prefix(con, lid):
     """`.dev/` 산출물 파일명 접두사. 앞단 해시로 grep 하면 한 작업이 모인다."""
     return "%s-%d-" % (lid, cycle_of(con, lid))
@@ -294,6 +499,50 @@ def auto_skip_scope_note(con):
     return ", ".join(bits) or t("무제한")
 
 
+def skip_route(cfg, sid, target):
+    """`(불가 사유 | None, 스킵할 노드들[현재..대상])` — **기본 경로** 기준.
+
+    스킵의 `+N`/`until:` 은 배열이 아니라 경로를 잰다. 분기가 있으면 첫 선언을
+    따른다 — 경로 밖의 노드로 가는 것은 스킵이 아니라 **분기 선택**이고, 그건
+    `advance --to` 의 일이다. 두 어휘를 섞으면 스킵이 분기 결정을 삼킨다.
+    """
+    ids = stage_ids(cfg)
+    cur = stage_index(cfg, sid)
+    path = default_path(cfg, sid)
+    back = (t("뒤로 갈 수는 없다 — 이미 %s 단계이거나 그보다 뒤다. "
+              "단계는 항상 앞으로만 간다.") % label_of(cfg, sid))
+
+    def off_path(want):
+        return (t("'%s' 는 여기서의 기본 경로에 없다 — 분기 대상은 건너뛰는 것이 "
+                  "아니라 `advance --to <단계> --reason \"...\"` 로 고르는 것이다. "
+                  "그래프는 `path` 로 본다.") % want)
+
+    if target.startswith("+"):
+        try:
+            n = int(target[1:])
+        except ValueError:
+            return t("잘못된 형식: %s") % target, None
+        if n < 1:
+            return back, None
+        return None, path[:min(n, len(path))]
+    if target.startswith("until:"):
+        want = target.split(":", 1)[1]
+        if want not in ids:
+            return t("알 수 없는 단계: %s") % want, None
+        if ids.index(want) <= cur:
+            return back, None
+        if want not in path:
+            return off_path(want), None
+        return None, path[:path.index(want)]
+    if target not in ids:
+        return t("알 수 없는 대상: %s") % target, None
+    if ids.index(target) < cur:
+        return back, None
+    if target not in path:
+        return off_path(target), None
+    return None, path[:path.index(target) + 1]
+
+
 def skip_block_reason(cfg, sid, target, con=None, root=None, lid=None):
     """skip 이 **불가능한** 이유. 가능하면 None.
 
@@ -304,40 +553,24 @@ def skip_block_reason(cfg, sid, target, con=None, root=None, lid=None):
     ids = stage_ids(cfg)
     cur = stage_index(cfg, sid)
     last = cfg["stages"][-1]["id"]
-    if target.startswith("+"):
-        try:
-            dest = min(cur + int(target[1:]) - 1, len(ids) - 1)
-        except ValueError:
-            return t("잘못된 형식: %s") % target
-    elif target.startswith("until:"):
-        want = target.split(":", 1)[1]
-        if want not in ids:
-            return t("알 수 없는 단계: %s") % want
-        dest = ids.index(want) - 1
-    elif target in ids:
-        dest = ids.index(target)
-    else:
-        return t("알 수 없는 대상: %s") % target
+    err, route = skip_route(cfg, sid, target)
+    if err:
+        return err
 
-    if dest < cur:
-        return (t("뒤로 갈 수는 없다 — 이미 %s 단계이거나 그보다 뒤다. "
-                "단계는 항상 앞으로만 간다.") % label_of(cfg, sid))
-
-    locked = [ids[i] for i in range(cur, dest + 1)
-              if cfg["stages"][i].get("skippable") is False]
+    locked = [x for x in route if stage_obj(cfg, x).get("skippable") is False]
     if not locked:
         # 여기까지 왔으면 이동 자체는 가능하다. 남은 것은 **CLI 가 실제로 요구하는
         # 기록**이다. 훅이 이것을 모르면 사용자가 승인한 **뒤에** CLI 가 거부하고,
         # 모델은 안내받은 명령을 다시 시도해 다이얼로그가 무한 반복된다 — 이 함수가
         # 존재하는 이유가 바로 그것인데 정작 이 축을 안 보고 있었다.
         if con is not None:
-            for i in range(cur, dest + 1):
-                for key in cfg["stages"][i].get("skip_requires") or []:
+            for x in route:
+                for key in stage_obj(cfg, x).get("skip_requires") or []:
                     if not criterion_met(con, cfg, root, lid, key):
                         return (t("%s 를 건너뛰더라도 기록은 남겨야 한다: %s "
                                   "먼저 그 기록을 남긴 뒤 다시 시도하라 — 승인만 "
                                   "면제된다.")
-                                % (cfg["stages"][i]["label"],
+                                % (stage_obj(cfg, x)["label"],
                                    criterion_why(con, cfg, root, lid, key)))
         return None
 
@@ -613,6 +846,11 @@ def _enter(ctx, dest_idx):
         close_loop(con, cfg, lid, "cycle_close")
         return create_loop(con, cfg, root), cfg["stages"][0]["id"], True
     sid = cfg["stages"][dest_idx]["id"]
+    # 행은 **지연 생성**한다. 작업 생성 때는 없던 노드(회차 중 `path add`)가
+    # 여기서 처음 실체를 얻는다 — 없으면 아래 claim 이 0행 갱신으로 지고
+    # "다음 단계 행이 없다" 가 된다. id 는 cfg 의 그래프에서 왔으므로 임의
+    # 문자열이 행이 되는 일은 없다.
+    ensure_stage_row(con, lid, sid)
     # **들어가는 쪽도 차지해야 한다.** 떠나는 쪽에만 claim 을 붙였더니, 대상 단계 행이
     # 없을 때(설정에서 id 가 바뀐 경우) 0행 갱신인데도 "→ 단계 N" 이라고 말하고
     # 활성 단계가 0개인 루프가 남았다. 다음 명령이 그 작업을 말없이 버렸다.
@@ -630,6 +868,13 @@ def next_cycle(ctx):
     회차로 구분된다.
     """
     con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
+    # **회차 한정 노드는 회차와 함께 사라진다.** 행과 그래프에서 걷어낸다 —
+    # path_node 행은 (loop, cycle) 스코프라 회차가 오르면 저절로 조회 밖이고,
+    # 이력은 event(path_add) 가 갖고 있다.
+    for s in [x for x in cfg["stages"] if x.get("__dyn__")]:
+        con.execute("DELETE FROM stage WHERE loop_id=? AND stage=?",
+                    (lid, s["id"]))
+    cfg["stages"] = [x for x in cfg["stages"] if not x.get("__dyn__")]
     ids = stage_ids(cfg)
     # 작업 정의(무엇을·무엇이 끝인지)는 회차를 넘어 유지한다. 회차마다 다시 선언하게
     # 하면 긴 작업에서 기준이 표류한다 — 그게 완료 조건을 두는 이유와 정면으로 어긋난다.

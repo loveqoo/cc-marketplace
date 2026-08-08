@@ -1,5 +1,5 @@
 #!/bin/sh
-# **출시 인수 시나리오.** 이 일곱이 통과하면 출시한다.
+# **출시 인수 시나리오.** 이 여덟이 통과하면 출시한다.
 #   usage: sh plugins/step-seven-harness/tests/release.sh [repo-root]
 #
 # ## 왜 따로 있나 — smoke 와 무엇이 다른가
@@ -451,6 +451,72 @@ s_upgrade() {
   return 0
 }
 
+# ============================================================== ⑧ 중간 그래프
+
+s_graph() {
+  scenario "⑧ 중간 그래프 — 가감한 예시 그래프로 한 바퀴, 회차 중 자란 노드를 지나간다"
+
+  # 설계 합의(.dev/plan/dynamic-middle-graph.md)의 끝 조건 ②와 ④가 이 시나리오다:
+  # 중간 노드를 **가감한** 설정이 한 바퀴를 완주하고, 회차 진행 중 `path add` 로
+  # 자란 노드를 실제로 지나간다.
+  P2="$WORK/graph"
+  mkdir -p "$P2"
+  (cd "$P2" && python3 "$PLUG/scripts/harness.py" init) >/dev/null 2>&1
+  python3 - "$P2/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+sts = [s for s in cfg["stages"] if s["id"] != "context"]        # 하나 뺀다
+idx = [i for i, s in enumerate(sts) if s["id"] == "planning"][0]
+sts.insert(idx, {"id": "research", "label": "Research", "summary": "조사",
+                 "write": ["dev"], "exit_criteria": [], "stop_requires": []})
+cfg["stages"] = sts                                             # 하나 더한다
+json.dump(cfg, open(p, "w"), ensure_ascii=False, indent=2)
+PY
+  h2() { (cd "$P2" && "$P2/.claude/harness/bin/harness" "$@"); }
+  st2() { h2 status --json 2>/dev/null | jget "$1"; }
+
+  eq "가감한 그래프에서 시작한다" selection "$(st2 stage)"
+  h2 loop intent "중간 그래프 한 바퀴" >/dev/null 2>&1
+  h2 loop done-when "여덟 번째 시나리오가 통과한다" >/dev/null 2>&1
+  h2 advance >/dev/null 2>&1                       # Scaffolding
+
+  # 회차 진행 중 그래프가 앞쪽으로 자란다 — 추가는 동의 없이 기록만 남는다.
+  has "회차 중 노드를 더한다" "probe-step" \
+    "$(h2 path add probe-step --after research --reason '검증 앞 실험')"
+
+  h2 advance >/dev/null 2>&1
+  eq "더한 설정 노드에 들어선다 (뺀 노드는 지나가지 않는다)" research "$(st2 stage)"
+  h2 advance >/dev/null 2>&1
+  eq "회차 중 자란 노드를 지나간다" probe-step "$(st2 stage)"
+  h2 advance >/dev/null 2>&1                       # Planning
+
+  PFX2="$(st2 prefix)"
+  mkdir -p "$P2/.dev/plan" "$P2/.dev/retrospect"
+  printf '# 계획\n중간 그래프 검증.\n' > "$P2/.dev/plan/${PFX2}p.md"
+  h2 approve-plan ".dev/plan/${PFX2}p.md" >/dev/null 2>&1
+  h2 advance >/dev/null 2>&1                       # Execution
+  printf 'check:\n\t@true\n' > "$P2/Makefile"
+  has "검증은 하네스가 직접 돌린다" "검증 통과" "$(h2 verify -- make check 2>&1)"
+  h2 advance >/dev/null 2>&1                       # Verification
+  h2 advance >/dev/null 2>&1                       # Compounding
+  eq "가감한 그래프로 Compounding 까지 왔다" compounding "$(st2 stage)"
+
+  printf '# 회고\n그래프가 자라고 닫혔다.\n' > "$P2/.dev/retrospect/${PFX2}r.md"
+  h2 advance --cycle >/dev/null 2>&1
+  eq "advance --cycle 로 다음 회차가 열린다" scaffolding "$(st2 stage)"
+  case "$(h2 path 2>/dev/null)" in
+    *probe-step*) bad "회차가 닫히면 자란 노드가 사라진다" "probe-step 이 남아 있다" ;;
+    *) ok "회차가 닫히면 자란 노드가 사라진다" ;;
+  esac
+  has "자란 이력은 기록으로 남는다" "probe-step" "$(python3 -c "
+import sqlite3, sys
+rows = sqlite3.connect(sys.argv[1]).execute(
+  \"SELECT rule FROM event WHERE kind='path_add'\").fetchall()
+print(','.join(r[0] for r in rows))" "$P2/.claude/harness/harness.db")"
+  return 0
+}
+
 # ====================================================================== 실행
 
 echo "== 출시 인수 시나리오"
@@ -464,10 +530,11 @@ s_cycle
 s_metrics
 s_recover
 s_upgrade
+s_graph
 
 echo
-if [ "$SCENARIOS" -ne 7 ]; then
-  printf '시나리오를 %d개밖에 돌리지 않았다 (7개여야 한다)\n' "$SCENARIOS" >&2
+if [ "$SCENARIOS" -ne 8 ]; then
+  printf '시나리오를 %d개밖에 돌리지 않았다 (8개여야 한다)\n' "$SCENARIOS" >&2
   exit 1
 fi
 printf '시나리오 %d개, 단정 %d개 통과, %d개 실패\n' "$SCENARIOS" "$PASS" "$FAIL"

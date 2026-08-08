@@ -110,8 +110,12 @@ def status_report(ctx):
         "acceptance": acceptance_of(con, lid),
         "write": list(stage.get("write", [])),
         "prefix": file_prefix(con, lid),
+        # 회차 한정 노드는 행이 지연 생성이라 아직 없을 수 있다 — '?' 가 아니라
+        # pending 이 사실이다.
         "stages": [{"id": s["id"], "label": s["label"],
-                    "status": rows[s["id"]]["status"] if s["id"] in rows else "?"}
+                    "status": (rows[s["id"]]["status"] if s["id"] in rows
+                               else ("pending" if s.get("__dyn__") else "?")),
+                    "dynamic": bool(s.get("__dyn__"))}
                    for s in cfg["stages"]],
         "exit_met": [k for k in crit if k not in missing],
         "exit_missing": missing,
@@ -190,7 +194,9 @@ def render_status(d, cfg):
     print(t("  요약: %s") % d["summary"])
     print(t("  쓰기 허용: %s") % (", ".join(d["write"]) or t("(없음)")))
     print(t("  .dev/ 산출물 파일명 접두사: %s") % d["prefix"])
-    print(t("  단계: ") + " → ".join("%s(%s)" % (s["label"], s["status"])
+    print(t("  단계: ") + " → ".join("%s%s(%s)" % (s["label"],
+                                                 "+" if s.get("dynamic") else "",
+                                                 s["status"])
                                   for s in d["stages"]))
     if d["exit_met"] or d["exit_missing"]:
         print(t("  종료 조건: 충족 %s / 미충족 %s")

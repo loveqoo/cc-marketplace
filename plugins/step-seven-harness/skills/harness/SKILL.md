@@ -32,7 +32,11 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 | `advance` | 다음 단계로. 종료 조건이 남아 있으면 **거부되고 무엇이 남았는지 알려준다** | |
 | `advance --done` | (Compounding 에서만) 작업 종료 → Selection | |
 | `advance --cycle` | (Compounding 에서만) 다음 회차 → Scaffolding, 같은 작업 유지 | |
-| `skip <stage\|+N\|until:<stage>> --reason "..."` | 단계 건너뛰기 | ✅ 다이얼로그 |
+| `advance --to <stage> --reason "..."` | 분기 노드(`next` 가 여럿)에서 다음을 고른다. 선택도 기록이다 | |
+| `path` | 이번 회차의 실행 그래프 — 방문 상태·분기·회차 한정 노드 | |
+| `path add <id> --reason "..." [--after <node>] [--label\|--summary\|--write]` | **앞쪽에** 노드를 더한다 (회차 한정 — 회차가 닫히면 사라지고 이력만 남는다). 추가는 자유다 | |
+| `path remove <node> --reason "..."` | 미방문 회차 한정 노드를 뺀다 — **미방문 노드 삭제는 스킵의 위장**이다 | ✅ 다이얼로그 (스킵과 같은 동의) |
+| `skip <stage\|+N\|until:<stage>> --reason "..."` | 단계 건너뛰기. `+N`/`until:` 은 **기본 경로**(분기에서는 첫 선언)를 잰다 | ✅ 다이얼로그 |
 | `allow <glob> --reason "..." [--uses N]` | 쓰기 금지 경로에 예외 등록 (`docs/` 등) | ✅ 다이얼로그 |
 | `approve-plan <file>` | 계획에 대한 사람의 승인 기록. **다이얼로그에 계획 본문이 함께 표시된다** | ✅ 다이얼로그 (auto-mode 에서도) |
 | `recall [키워드\|경로] [--kind K] [--rule R]` | 과거 차단·실패·재편집 기록과 관련 회고 파일을 찾는다. **Context 단계의 주 도구** | |
@@ -54,6 +58,13 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 
 `skip` 은 **현재 단계부터 대상 단계까지**를 건너뛴 것으로 기록한다. 현재 단계를 정상적으로
 끝낸 뒤 다음 단계만 건너뛰려면 `advance` 로 넘어간 다음 `skip` 하라.
+
+**중간 그래프.** 처음 둘(Selection·Scaffolding)과 마지막(Compounding)은 틀이라 고정이고,
+그 사이는 회차마다 다를 수 있다. `stages.json` 의 중간 단계에 `next` 를 선언하면 분기가
+생기고(그 자리에서는 `advance --to` 로 골라야 한다), 진행 중에는 `path add` 로 앞쪽에
+노드를 더할 수 있다 — 회차 한정이라 회차가 닫히면 사라진다. 그래프는 **앞으로만** 간다:
+뒤로 가는 엣지는 무시되고 진단이 말한다. 기본 경로 밖의 분기 대상은 `skip` 이 아니라
+`advance --to` 의 일이다.
 
 **Selection 에 더 할 작업이 없으면** 스킵을 시도하지 마라. `harness status` 가 하네스가
 아는 할 일을 후보로 내놓는다 — 밀린 승격 결정, 재발한 승격(그 방법이 통하지 않았다는 증거),
