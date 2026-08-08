@@ -66,6 +66,14 @@ description: 작업 하네스의 현재 단계를 확인하고 제어한다 — 
 뒤로 가는 엣지는 무시되고 진단이 말한다. 기본 경로 밖의 분기 대상은 `skip` 이 아니라
 `advance --to` 의 일이다.
 
+기본 4개(Context·Planning·Execution·Verification)로 대부분 충분하지만, 부족한 자리는
+늘 **Planning 이전**(입력이 불확실)과 **Execution 주변**(위험·단계적)이다. 자주 쓰는
+노드 예시: `research`(범위·기존 코드 조사, Planning 앞) · `reproduce`(버그 재현,
+Planning 앞) · `spike`(불확실한 접근 실험, Planning↔Execution) · `review`(적대적 리뷰,
+Execution 뒤) · `rollback`(위험 변경 되돌리기, Execution 앞). 정해진 목록이 아니라
+예시다 — 이 작업에 필요한 노드를 만들어라. 무엇이 여러 작업에서 반복되는지는
+`harness stats`·`metrics` 가 보여주고, 반복되면 프리셋이나 기본 틀로 승격할 때다.
+
 **Selection 에 더 할 작업이 없으면** 스킵을 시도하지 마라. `harness status` 가 하네스가
 아는 할 일을 후보로 내놓는다 — 밀린 승격 결정, 재발한 승격(그 방법이 통하지 않았다는 증거),
 낡은 인덱스, `LEARNED.md` 예산 소진. **"새 작업이 없다"가 "할 일이 없다"는 뜻이 아니다.**
