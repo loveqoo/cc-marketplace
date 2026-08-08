@@ -96,6 +96,34 @@ def benign_head(cfg, key, head, default=()):
 BASH_SPLIT = re.compile(r"\|\||&&|[;&|\n]")
 
 
+# 따옴표로 감싼 히어독 구분자 (`<<'EOF'`·<<"EOF"`). 그 본문은 셸이 아무것도
+# 펼치지 않는 리터럴 데이터다.
+HEREDOC_QUOTED_RE = re.compile(r"<<-?\s*(['\"])(\w+)\1")
+
+
+def strip_quoted_heredocs(cmd):
+    """따옴표 구분자 히어독의 **본문**을 지운다.
+
+    BASH_SPLIT 이 `\\n` 으로 쪼개므로 히어독 본문의 각 줄이 명령 세그먼트로
+    판정됐다 — `cat > tests/run.sh <<'EOF'` 로 스크립트를 쓰는 것이 **본문
+    내용** 때문에 거부됐다(6회차). 쓰기 대상은 리다이렉트(`> tests/run.sh`)가
+    이미 말하고 있고, 따옴표 구분자 본문은 확장이 없는 데이터라 명령이 아니다.
+    따옴표 없는 히어독은 `$()` 가 본문에서 실행되므로 그대로 둔다(보수적)."""
+    if "\n" not in cmd or not HEREDOC_QUOTED_RE.search(cmd):
+        return cmd
+    out, skip_until = [], None
+    for ln in cmd.split("\n"):
+        if skip_until is not None:
+            if ln.strip() == skip_until:
+                skip_until = None
+            continue
+        out.append(ln)
+        m = HEREDOC_QUOTED_RE.search(ln)
+        if m:
+            skip_until = m.group(2)
+    return "\n".join(out)
+
+
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -195,11 +223,27 @@ def floor_verdict(cfg, root, cmd):
       · 원문에만 보인다  → `ask`   (셸 치환·인용·인라인 코드로 실행 시점에 정해진다)
     하나로 묶으면 호출자도 하나, 탐침도 하나다.
     """
-    hit = bash_protected_hit(cfg, root, cmd)
+    hit, unsure = bash_protected_scan(cfg, root, cmd)
     if hit:
-        return "deny", hit
+        return "deny", hit, None
+    if unsure:
+        # 바닥값을 담은 폴더가 대상인데 변경 명령인지 알 수 없다(`myrm -rf
+        # .claude`). 모르면 통과도 차단도 아니라 **묻는다** — deny 로 두면
+        # `git add .claude` 같은 읽기 명령이 막다른 길에 갇혔다(6회차 실측).
+        return "ask", unsure, t(
+            "이 명령이 하네스 자신을 담은 폴더(%s)를 대상으로 삼는데, 내용을 "
+            "바꾸는 명령인지 하네스가 판정하지 못했다. 바닥값은 엔진과 상태이고 "
+            "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 읽기라면 허용해도 "
+            "된다.") % unsure
     named = floor_named(cfg, cmd)
-    return ("ask", named) if named else (None, None)
+    if named:
+        return "ask", named, t(
+            "이 명령의 원문에 하네스 바닥값(%s)이 보이는데, 무엇을 대상으로 "
+            "삼는지 하네스가 특정하지 못했다. 셸 치환·인용·인터프리터 인라인 "
+            "코드가 섞이면 실행 시점에야 정해진다. 바닥값은 엔진과 상태이고 "
+            "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 경로를 그대로 "
+            "적으면 하네스가 대신 판정한다.") % named
+    return None, None, None
 
 
 # 하네스가 **펼치지 못하는** 셸 문법. `sh_expand` 는 글롭만 편다.
@@ -239,7 +283,7 @@ def bash_unresolved(cfg, cmd):
     `git log --oneline "$REF"` 는 지나가고 `cp x "$D/y"` 는 묻는다.
     """
     mut = bash_mutator_re(cfg)
-    for seg in BASH_SPLIT.split(cmd):
+    for seg in BASH_SPLIT.split(strip_quoted_heredocs(cmd)):
         toks = re.findall(r"\S+", seg)
         i = 0
         while i < len(toks) and ASSIGN_RE.match(toks[i]):
@@ -281,11 +325,14 @@ def bash_opaque(cmd):
     return None
 
 
-def bash_protected_hit(cfg, root, cmd, depth=0):
-    """Bash 명령이 보호 경로를 **대상으로** 삼는지. 실행하는 것은 대상이 아니다.
+def bash_protected_scan(cfg, root, cmd, depth=0):
+    """Bash 명령이 보호 경로를 **대상으로** 삼는지 → `(확정 hit, 불확실 hit)`.
 
     check_write 는 Write/Edit 만 본다. Bash 는 `rm`, `sed -i`, 리다이렉트,
     `sqlite3 ... UPDATE` 로 같은 파일을 바꿀 수 있었고 그 경로는 검사되지 않았다.
+
+    확정 hit 은 deny 감이고, 불확실 hit(바닥값을 담은 폴더가 대상인데 변경
+    명령인지 모름)은 ask 감이다 — 판정은 `floor_verdict` 가 내린다.
     """
     # 바닥값 ∪ 설정. 설정을 비워도(`protected_paths: []`) 바닥값은 남는다 —
     # 예전에는 여기서 `if not pats: return None` 으로 통째로 꺼졌다.
@@ -293,6 +340,13 @@ def bash_protected_hit(cfg, root, cmd, depth=0):
     floor = set(SELF_LOCK)
 
     mutating = bool(bash_mutator_re(cfg).search(cmd))
+    # 바닥값 containment 는 **설정** mutator 를 믿지 않되(아래 주석) 변경 여부
+    # 자체는 봐야 한다 — 안 보면 `git add .claude`·`du -sh .claude` 같은 읽기
+    # 명령까지 막았고, README 가 안내하는 커밋 절차가 첫 명령에서 거부됐다
+    # (6회차 실측). 코드 상수와 설정의 **합집합**이므로 설정을 좁혀 잠금을 푸는
+    # 방향은 여전히 막혀 있다.
+    floor_mut = mutating or bool(BASH_MUTATORS.search(cmd))
+    unsure = []
     # `>|경로` 의 `|` 를 BASH_SPLIT 이 파이프로 보고 쪼개면 경로가 다음 세그먼트의
     # **명령어 자리**로 밀려 '실행 대상' 으로 건너뛰어진다. 먼저 떼어놓는다.
     cmd = cmd.replace(">|", "> ")
@@ -327,12 +381,17 @@ def bash_protected_hit(cfg, root, cmd, depth=0):
                     return rel
                 # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
                 # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
-                # 바닥값에 대해서는 mutating 판정을 믿지 않는다 — `mutator_pattern` 을
-                # `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이 검사가
-                # 통째로 꺼졌다. 설정으로 잠금을 푸는 방향은 막는다.
+                # 바닥값에 대해서는 설정 mutating 판정만 믿지 않는다 — `mutator_pattern`
+                # 을 `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이
+                # 검사가 통째로 꺼졌다. 그래서 코드 상수를 합친 `floor_mut` 로 본다.
                 low = rel.lower()
                 if any(p.lower().startswith(low + "/") for p in floor):
-                    return rel
+                    if floor_mut:
+                        return rel
+                    # 변경 명령이 아니면(또는 모르는 명령이면) 확정하지 않고
+                    # 모아 둔다 — `floor_verdict` 가 ask 로 올린다.
+                    if rel not in unsure:
+                        unsure.append(rel)
                 if mutating and any(p.startswith(rel + "/") for p in use):
                     return rel
         return None
@@ -347,7 +406,7 @@ def bash_protected_hit(cfg, root, cmd, depth=0):
         while toks and ASSIGN_RE.match(toks[0]):
             hit = protected(toks[0])
             if hit:
-                return hit
+                return hit, None
             toks = toks[1:]
         if not toks:
             continue
@@ -376,15 +435,22 @@ def bash_protected_hit(cfg, root, cmd, depth=0):
         code = _inline_code(sh_tokens(seg)) if interp else None
         if code is not None:
             if depth < INLINE_DEPTH:
-                hit = bash_protected_hit(cfg, root, code, depth + 1)
+                hit, uns = bash_protected_scan(cfg, root, code, depth + 1)
                 if hit:
-                    return hit
+                    return hit, None
+                if uns and uns not in unsure:
+                    unsure.append(uns)
             continue
         for tok in toks[2 if interp else 1:]:
             hit = protected(tok)
             if hit:
-                return hit
-    return None
+                return hit, None
+    return None, (unsure[0] if unsure else None)
+
+
+def bash_protected_hit(cfg, root, cmd, depth=0):
+    """`bash_protected_scan` 의 확정 hit 만. 자기검사가 이 이름으로 묻는다."""
+    return bash_protected_scan(cfg, root, cmd, depth)[0]
 
 
 # 인라인 코드 안의 인라인 코드까지는 본다. 그보다 깊으면 원문 감시(`floor_named`)와
@@ -429,6 +495,10 @@ def _inline_code(toks):
 REDIRECT_RE = re.compile(r"^\d*(>>?\|?|&>>?)$")
 
 
+# 경로가 붙은 리다이렉트 (`>docs/y.md`, `2>err.txt`, `&>log`).
+ATTACHED_REDIR_RE = re.compile(r"^(\d*>>?|&>>?)(.+)$")
+
+
 # 이 명령들은 **마지막 경로만** 바꾼다. `cp src/a.py /tmp/b` 가 src 를 쓴다고 보면
 # 읽기만 하는 명령이 거부되고, 그 오판이 곧 마찰이다. `sed`·`perl` 도 여기 있다 —
 # 앞 인자는 파일이 아니라 식(`s/x/y/`)이다. `mv` 는 없다: 원본도 사라진다.
@@ -465,6 +535,14 @@ def _target(root, tok, sure):
     나머지는 추측이므로, 있는 파일이거나 `/` 를 포함한 자리만 경로로 본다 —
     `chmod 755 f` 의 `755`, `sed -i s/a/b/ f` 의 `s/a/b/` 를 거르기 위해서다.
     """
+    # 펼쳐지지 않은 `$VAR`·`~` 는 리포 경로가 **아니다** — 글자 그대로 이어붙이면
+    # `mkdir "$HOME/.cache"` 가 "source 클래스에 쓸 수 없다" 는 엉뚱한 판정과
+    # 메시지를 받았다(6회차 실측). 여기서 버리면 변경 세그먼트는
+    # `bash_unresolved` 가 "셸 확장이 섞였다" 로 **묻는다** — 설계("해석 불가 →
+    # ask")가 말하는 그 자리다.
+    bare = tok.strip("\"'")
+    if "$" in bare or "`" in bare or bare.startswith("~"):
+        return None
     for one in sh_expand(root, tok):
         for rel in rel_aliases(root, one):
             if rel == ".":
@@ -493,7 +571,7 @@ def bash_writes(cfg, root, cmd):
         if rel and rel not in out:
             out.append(rel)
 
-    for seg in BASH_SPLIT.split(cmd.replace(">|", "> ")):
+    for seg in BASH_SPLIT.split(strip_quoted_heredocs(cmd).replace(">|", "> ")):
         toks = sh_tokens(seg)
         # **정규화해서 넘긴다.** `mutator_pattern` 은 명령 **전체**에 대해 정의됐고
         # `(^|[;&|]\s*)` 로 앵커돼 있다. BASH_SPLIT 은 구분자를 지우므로 세그먼트 앞에
@@ -513,6 +591,16 @@ def bash_writes(cfg, root, cmd):
                 continue
             if tok in ("<", "<<", "<<<"):
                 k += 2                                  # 입력은 읽는다
+                continue
+            m = ATTACHED_REDIR_RE.match(tok)
+            if m:
+                # `>docs/y.md` 처럼 경로가 **붙은** 리다이렉트. 낱개 토큰만 보면
+                # 이 형태가 수집에서 통째로 빠져 단계 규칙 전체가 조용히
+                # 우회됐다 — deny 도 ask 도 기록도 없이(6회차 실측). `2>&1` 은
+                # fd 복제라 경로가 아니다.
+                if not m.group(2).startswith("&"):
+                    add(_target(root, m.group(2), True))
+                k += 1
                 continue
             if tok.startswith("of="):                   # dd
                 add(_target(root, tok[3:], True))
@@ -579,8 +667,11 @@ def ctrl_requests(cmd):
 
 
 def ctrl_known(sub):
-    return sub in set(CLI) | {"%s %s" % (k, v)
-                              for k, vs in CTRL_SUB2.items() for v in vs}
+    # `help`·`init`·`hook` 은 CLI 표가 아니라 `run_cli`/`main` 의 특례다. 표만 보면
+    # 하네스가 **스스로 안내하는 명령**(`harness help`, 복구의 `init`)이 모르는
+    # 이름이 되어 ask 다이얼로그를 띄웠다(6회차).
+    return sub in set(CLI) | {"help", "init", "hook"} | {
+        "%s %s" % (k, v) for k, vs in CTRL_SUB2.items() for v in vs}
 
 
 def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
@@ -600,6 +691,17 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
     elif sub not in consent_map(cfg):
         return
 
+    if not direct:
+        # 하네스를 부르는 것 같지만 세그먼트의 머리가 아니다 — 무엇이 실행될지
+        # 확신할 수 없다. **거부하지 않고 묻는다.** 여기서 거부하면 커밋 메시지에
+        # `harness skip` 을 쓴 것만으로 빠져나갈 길이 없어진다(막다른 길).
+        # 이 검사가 아래 skip 거부보다 **먼저**여야 한다 — 뒤에 두면 커밋 메시지의
+        # `harness skip gate` 가 "알 수 없는 대상: gate" 로 거부되는 바로 그
+        # 막다른 길이 재현된다(6회차 실측).
+        return pre_decision("ask", t("이 명령 안에 하네스 제어 호출(%s)이 보인다. "
+                                     "실제로 실행되는지 하네스가 확신할 수 없어 사람에게 "
+                                     "묻는다: `%s`") % (sub, cmd.strip()[:200]))
+
     if sub == "skip":
         # 불가능한 스킵은 **묻지 않고** 거부한다. 승인을 받아봐야 거부되고,
         # 그러면 모델이 다시 시도해 다이얼로그만 반복된다.
@@ -613,13 +715,6 @@ def ctrl_decision(con, cfg, root, sub, pos, direct, cmd, mode, lid, sid):
                 return pre_decision("deny", why)
 
     reason = raw_flag(cmd, "reason")
-    if not direct:
-        # 하네스를 부르는 것 같지만 세그먼트의 머리가 아니다 — 무엇이 실행될지
-        # 확신할 수 없다. **거부하지 않고 묻는다.** 여기서 거부하면 커밋 메시지에
-        # `harness skip` 을 쓴 것만으로 빠져나갈 길이 없어진다(막다른 길).
-        return pre_decision("ask", t("이 명령 안에 하네스 제어 호출(%s)이 보인다. "
-                                     "실제로 실행되는지 하네스가 확신할 수 없어 사람에게 "
-                                     "묻는다: `%s`") % (sub, cmd.strip()[:200]))
     if sub != "approve-plan" and not reason:
         record_event(con, lid, sid, "block", "no_reason", sub, cmd[:200])
         return pre_decision("deny",

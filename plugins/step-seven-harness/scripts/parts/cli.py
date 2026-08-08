@@ -84,7 +84,9 @@ def cli_advance(ctx, argv):
         if sid == last and want_done:
             nlid = rotate_loop(con, cfg, root, lid)
             if nlid is None:
-                raise RuntimeError(t("다른 호출이 먼저 이 작업을 닫았다"))
+                # 거절의 유일한 출구는 Refuse 다 — RuntimeError 는 아무도 잡지
+                # 않아 사용자에게 원시 traceback 이 나갔다(6회차).
+                raise Refuse(t("다른 호출이 먼저 이 작업을 닫았다"), code=2)
             nsid = cfg["stages"][0]["id"]
             done_task = True
         elif sid == last:
@@ -93,7 +95,7 @@ def cli_advance(ctx, argv):
             nlid, nsid, _ = _enter(ctx, stage_index(cfg, sid) + 1)
             done_task = False
             if nsid is None:
-                raise RuntimeError(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"))
+                raise Refuse(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"), code=2)
 
     if retro_note:
         keys, found, missing = retro_note
@@ -239,8 +241,18 @@ def cli_verify(ctx, argv):
     if not verification_hit(cfg, cmd):
         raise Refuse(t("검증 명령으로 보이지 않는다: %s") % cmd,
                      t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."), code=2)
+    # `CI=1 pytest` 의 앞 대입은 셸이라면 환경으로 넘겼을 것이다. 그대로 exec 에
+    # 주면 "CI=1 이라는 프로그램이 없다" 로 죽는다 — 판정(`verification_hit`)이
+    # 통과시킨 명령은 실행도 같은 뜻으로 해야 한다.
+    args, env = shlex.split(cmd), None
+    while args and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", args[0]):
+        key, _, val = args.pop(0).partition("=")
+        env = dict(env if env is not None else os.environ, **{key: val})
+    if not args:
+        raise Refuse(t("검증 명령으로 보이지 않는다: %s") % cmd,
+                     t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."), code=2)
     try:
-        rc = subprocess.call(shlex.split(cmd), cwd=root)
+        rc = subprocess.call(args, cwd=root, env=env)
     except OSError as e:
         raise Refuse(t("실행할 수 없다: %s") % e, code=2)
     if rc != 0:
@@ -845,7 +857,10 @@ def cli_init(argv):
     created = install_templates(root, pr)
     db_made, lid = install_db(root, load_config(root, pr))
     created += db_made
-    refresh_wrapper(root)
+    if refresh_wrapper(root) is None:
+        # None = 쓰지 못했다. 버리면 래퍼 없는 설치가 성공처럼 보인다.
+        print(t("주의: 실행 래퍼를 쓰지 못했다 — `.claude/harness/bin/` 의 쓰기 "
+                "권한을 확인하고 `harness init` 을 다시 실행하라."), file=sys.stderr)
 
     nperm = ensure_permissions(root)
     if nperm > 0:

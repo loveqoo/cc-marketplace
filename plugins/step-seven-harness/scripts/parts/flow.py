@@ -389,7 +389,21 @@ def verification_hit(cfg, cmd):
         bare = QUOTED_RE.sub(" ", seg).strip()
         if not bare:
             continue
-        if os.path.basename(bare.split()[0].strip("\"'")) in readers:
+        # 앞의 `VAR=값`(과 `env` 접두)은 대입이지 프로그램이 아니다. 건너뛰지
+        # 않으면 `CI=true npm test` 가 머리 앵커에 영원히 안 맞아 **정직하게
+        # 테스트를 돌린 명령**이 증거가 안 됐다(6회차 실측). `bash_unresolved`·
+        # `floor_named` 는 이미 같은 이유로 ASSIGN_RE 를 건너뛴다.
+        toks = bare.split()
+        while toks and ASSIGN_RE.match(toks[0]):
+            toks.pop(0)
+        if toks and os.path.basename(toks[0].strip("\"'")) == "env":
+            toks.pop(0)
+            while toks and (ASSIGN_RE.match(toks[0]) or toks[0].startswith("-")):
+                toks.pop(0)
+        if not toks:
+            continue
+        bare = " ".join(toks)
+        if os.path.basename(toks[0].strip("\"'")) in readers:
             continue
         # **머리에서부터** 맞아야 한다. `search` 였을 때 `true npm test` 가 통과했다 —
         # 실행되는 프로그램은 `true` 인데 인정된 것은 `npm test` 였다. `# npm test`,
@@ -611,8 +625,9 @@ def next_cycle(ctx):
     """같은 작업의 다음 회차. Selection 은 유지하고 나머지 단계를 초기화한다.
 
     증거를 초기화하지 않으면 2회차 Planning 이 1회차 계획서로 통과한다.
-    intent_set 만 남긴다 — 작업은 그대로이므로 다시 선정할 필요가 없다.
-    이전 회차의 계획·회고 파일은 파일로 남고, 파일명의 회차로 구분된다.
+    intent_set 과 acceptance(완료 조건)는 남긴다 — 작업은 그대로이므로 다시
+    선정할 필요가 없다. 이전 회차의 계획·회고 파일은 파일로 남고, 파일명의
+    회차로 구분된다.
     """
     con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
     ids = stage_ids(cfg)

@@ -61,16 +61,31 @@ def _write_if_changed(path, body, mode=None):
     셋을 둘로 뭉개면 실패가 "바꿀 것이 없었다" 와 구분되지 않는다. 읽기 전용
     파일시스템에서 승격이 LEARNED.md 반영에 실패했는데도 성공으로 보고됐다.
     """
+    tmp = None
     try:
         if os.path.isfile(path) and open(path, encoding="utf-8").read() == body:
             return False
+        # rename 은 디렉터리 권한만 본다 — 검사 없이 바꾸면 사람이 읽기 전용으로
+        # 잠근 파일까지 소리 없이 갈아치운다. 잠근 것은 존중한다.
+        if os.path.exists(path) and not os.access(path, os.W_OK):
+            return None
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+        # 임시파일 + rename. 제자리 덮어쓰기는 갱신 도중 다른 세션의 훅이 잘린
+        # 래퍼를 읽어 "변조를 되돌렸다" 로 오판했고, 셸이 그 순간 실행하면 잘린
+        # 스크립트가 돌았다(6회차). rename 은 같은 디렉터리 안에서 원자적이다.
+        tmp = "%s.tmp-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(body)
         if mode is not None:
-            os.chmod(path, mode)
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
         return True
     except Exception:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         return None
 
 
@@ -369,11 +384,17 @@ def quarantine_db(root):
                 os.replace(path, dst)
             except OSError:
                 return None
+            # 부속 파일은 지우지 않고 백업 옆으로 **옮긴다** — wal 에는 체크포인트
+            # 안 된 최근 커밋이 남아 있어, 지우면 "사람이 나중에 열어볼" 백업에서
+            # 마지막 기록이 떨어져 나간다(6회차). 원본 자리는 어차피 비워야 한다.
             for suffix in ("-wal", "-shm"):
                 try:
-                    os.remove(path + suffix)
+                    os.replace(path + suffix, dst + suffix)
                 except OSError:
-                    pass
+                    try:
+                        os.remove(path + suffix)
+                    except OSError:
+                        pass
             return dst
     return None
 

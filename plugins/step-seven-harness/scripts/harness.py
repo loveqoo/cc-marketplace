@@ -468,21 +468,35 @@ def swallow_note(line):
     if not SWALLOW_LOG:
         return
     try:
-        old = []
-        if os.path.isfile(SWALLOW_LOG):
+        # **append 로 쓴다.** 읽고-자르고-덮어쓰기는 동시 훅 둘이 삼키면 한쪽
+        # 기록을 지웠다 — 삼킴이 몰리는 상황(읽기 전용 FS 등)이 정확히 훅이
+        # 몰리는 상황이다(6회차). 자르기는 파일이 충분히 컸을 때만 하므로
+        # 경합 창이 드문 경로로 좁혀진다. 상한 자체는 유지된다.
+        entry = "%s  %s\n" % (now(), line)
+        if (os.path.isfile(SWALLOW_LOG)
+                and os.path.getsize(SWALLOW_LOG) > SWALLOW_KEEP * 200):
             with open(SWALLOW_LOG, encoding="utf-8") as fh:
                 old = fh.read().splitlines()[-(SWALLOW_KEEP - 1):]
-        with open(SWALLOW_LOG, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(old + ["%s  %s" % (now(), line)]) + "\n")
+            with open(SWALLOW_LOG, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(old) + "\n" + entry)
+        else:
+            with open(SWALLOW_LOG, "a", encoding="utf-8") as fh:
+                fh.write(entry)
     except OSError:
         pass
 
 
 def swallowed_recent(root):
-    """파일에 남은 삼킨 사실. 프로세스를 넘어 온 것들이다."""
+    """파일에 남은 삼킨 사실 — 최근 SWALLOW_KEEP 개.
+
+    쓰기는 append 라(경합 유실을 막으려고) 줄 수 상한을 즉시 강제하지 않는다.
+    상한은 두 겹으로 지킨다 — 파일 크기는 `swallow_note` 의 자르기가, 보이는
+    개수는 여기가.
+    """
     try:
         with open(os.path.join(root, SWALLOW_LOG_REL), encoding="utf-8") as fh:
-            return [x for x in fh.read().splitlines() if x.strip()]
+            return [x for x in fh.read().splitlines()
+                    if x.strip()][-SWALLOW_KEEP:]
     except OSError:
         return []
 
@@ -952,7 +966,7 @@ def hook_pre_tool_use(inp, ctx):
         # 하네스 자신을 Bash 로 건드리는 것을 먼저 막는다. 제어 명령 판정보다
         # 앞이어야 한다 — `rm <엔진> && harness status` 처럼 뒤에 제어 명령을
         # 붙이면 그 앞의 파괴가 검사 없이 통과했다.
-        decision, hit = floor_verdict(cfg, root, cmd)
+        decision, hit, why = floor_verdict(cfg, root, cmd)
         if decision == "deny":
             with con:
                 record_event(con, lid, sid, "block", "protected_bash", hit, cmd[:200])
@@ -962,14 +976,11 @@ def hook_pre_tool_use(inp, ctx):
                 "수정하라. 내용을 보려면 Read 도구를 쓰라. "
                 "이 차단은 `allow` 로도 열리지 않는다.") % hit)))
         if decision == "ask":
+            # 사유 문구는 `floor_verdict` 가 만든다 — 원문에만 보이는 것과
+            # 바닥값 부모가 대상인 것은 다른 설명이 필요하다.
             with con:
                 record_event(con, lid, sid, "ask", "floor_named", hit, cmd[:200])
-            return emit(pre_decision("ask", t(
-                "이 명령의 원문에 하네스 바닥값(%s)이 보이는데, 무엇을 대상으로 "
-                "삼는지 하네스가 특정하지 못했다. 셸 치환·인용·인터프리터 인라인 "
-                "코드가 섞이면 실행 시점에야 정해진다. 바닥값은 엔진과 상태이고 "
-                "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 경로를 그대로 "
-                "적으면 하네스가 대신 판정한다.") % hit))
+            return emit(pre_decision("ask", why))
 
         # 래퍼는 사전 승인돼 있으므로 **내용이 우리 것일 때만** 실행돼야 한다.
         # 이 검사를 모든 Bash 앞에 두는 이유: 변조는 앞선 호출에서 이미 끝나 있고,
@@ -991,6 +1002,13 @@ def hook_pre_tool_use(inp, ctx):
 
         for req_sub, req_pos, direct, seg in ctrl_requests(cmd):
             if not ctrl_known(req_sub):
+                if not direct:
+                    # 산문 속 `harness <낱말>` — 커밋 메시지("docs: explain harness
+                    # install flow")가 커밋할 때마다 ask 를 받았다(6회차 실측).
+                    # 실행 자리(머리)도 아니고 아는 하위 명령도 아니면 판정할
+                    # 제어 호출이 없다. 인라인 실행(`sh -c '…'`)은 인터프리터
+                    # 인라인 검사가 따로 묻고, 셸 치환은 아래 opaque 검사가 잡는다.
+                    continue
                 # 하네스를 부르는데 하위 명령을 읽을 수 없다(`$(echo skip)`, `$C`).
                 # **모르면 통과가 아니라 물음이다** — 이 판정이 세 번 뚫린 이유가
                 # 전부 "모르면 통과" 였다.
@@ -1071,7 +1089,10 @@ def hook_post_tool_use(inp, ctx):
         # 안 잡히고, 승격 검증이 "변경 관측 0/1" 로 **정상 승격을 무고**했다
         # (4회차 C⑦ 실측). "무엇을 쓰나" 의 답은 이미 하나 있다 — 그것을 쓴다.
         field = WRITE_TOOLS.get(tool)
-        if field:
+        # 실패한 쓰기는 Bash 만 걸렀다. Write/Edit 도 걸러야 한다 — 실패한
+        # Write 의 경로가 파일 증거(plan_file 등)로 적립되고, 파일이 없으면
+        # digest 가 NULL 이라 그 증거는 만료조차 안 됐다(6회차 실측).
+        if field and not tool_failed(inp):
             rels = [rel_to_root(root, ti.get(field))]
         elif tool == "Bash" and not tool_failed(inp):
             rels = bash_writes(cfg, root, ti.get("command") or "")
@@ -1956,7 +1977,15 @@ NO_CYCLES = "  (회차 종료 기록이 없다. `advance --cycle` 또는 `--done
 def run_cli(argv):
     cmd = argv[0]
     if cmd == "init":
-        return cli_init(argv[1:])
+        # 설치 경로에서도 삼킨 사실은 남아야 한다. `SWALLOW_LOG` 를 아래(설치된
+        # 프로젝트 기준)에서만 채우면 init 중 삼킨 실패(엔진 사본 갱신·설치 후
+        # 점검)가 파일에도 화면에도 안 남아 설치가 성공처럼 보였다(6회차).
+        target = os.path.abspath(argv[1]) if len(argv) > 1 else os.getcwd()
+        globals()["SWALLOW_LOG"] = os.path.join(target, SWALLOW_LOG_REL)
+        rc = cli_init(argv[1:])
+        for note in SWALLOWED:
+            print(t("주의(삼킨 실패): %s") % note, file=sys.stderr)
+        return rc
     root = find_root(os.getcwd())
     if not root:
         print(t("이 프로젝트에는 하네스가 설치되지 않았다. `harness init` 또는 "
@@ -1983,13 +2012,31 @@ def run_cli(argv):
         print(t("DB 또는 설정이 손상되었다: %s\n복구: `%s`")
               % (os.path.join(root, HARNESS_DIR), init_hint(root)), file=sys.stderr)
         return 1
+    def schema_help(exc):
+        # 스키마가 플러그인보다 오래됐을 때 traceback 대신 할 일을 알려준다.
+        # 마이그레이션은 하지 않는다 — DB 는 커밋하지 않는 런타임 상태이고,
+        # init 이 스키마를 다시 적용하는 것이 정해진 업그레이드 경로다.
+        print(t("DB 스키마가 플러그인 버전과 맞지 않는다 (%s).\n"
+              "`.claude/harness/bin/harness init` 을 다시 실행하라 — 파일은 "
+              "덮어쓰지 않고 스키마만 갱신한다. 그래도 안 되면 %s 를 지우고 "
+              "init 을 실행하라 (진행 중 상태만 사라지고 기록 파일은 남는다).")
+              % (exc, DB_REL.replace(os.sep, "/")), file=sys.stderr)
+        return 1
+
     try:
-        lid = head_loop(con)
-        sid = active_stage(con, lid) if lid else None
-        if not lid or not sid:
-            with con:
-                lid = create_loop(con, cfg, root, only_if_none=True)
-            sid = active_stage(con, lid) or cfg["stages"][0]["id"]
+        try:
+            lid = head_loop(con)
+            sid = active_stage(con, lid) if lid else None
+            if not lid or not sid:
+                with con:
+                    lid = create_loop(con, cfg, root, only_if_none=True)
+                sid = active_stage(con, lid) or cfg["stages"][0]["id"]
+        except sqlite3.OperationalError as exc:
+            # 0바이트·타 SQLite 파일은 `connect` 는 통과하고 **첫 질의**에서
+            # 죽는다. 훅이 안내하는 `status` 가 여기서 traceback 이면 복구
+            # 안내가 막다른 길이 된다 — 5회차에 init 만 고치고 이 자리를
+            # 남겼다(6회차 실측).
+            return schema_help(exc)
         if not stage_known(cfg, sid):
             print(t("활성 단계 '%s' 가 `%s` 에 없다 — 상태와 설정이 어긋났다. "
                     "단계 id 를 되돌리거나 `harness loop new --reason \"...\"` 로 "
@@ -2003,15 +2050,7 @@ def run_cli(argv):
         try:
             return fn(Ctx(con, cfg, root, lid, sid), argv[1:])
         except sqlite3.OperationalError as exc:
-            # 스키마가 플러그인보다 오래됐을 때 traceback 대신 할 일을 알려준다.
-            # 마이그레이션은 하지 않는다 — DB 는 커밋하지 않는 런타임 상태이고,
-            # init 이 스키마를 다시 적용하는 것이 정해진 업그레이드 경로다.
-            print(t("DB 스키마가 플러그인 버전과 맞지 않는다 (%s).\n"
-                  "`.claude/harness/bin/harness init` 을 다시 실행하라 — 파일은 "
-                  "덮어쓰지 않고 스키마만 갱신한다. 그래도 안 되면 %s 를 지우고 "
-                  "init 을 실행하라 (진행 중 상태만 사라지고 기록 파일은 남는다).")
-                  % (exc, DB_REL.replace(os.sep, "/")), file=sys.stderr)
-            return 1
+            return schema_help(exc)
     finally:
         con.close()
 

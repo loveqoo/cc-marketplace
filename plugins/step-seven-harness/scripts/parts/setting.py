@@ -202,6 +202,16 @@ def config_problems(cfg):
     # 게이트는 **자기 설정을 스스로 진단한다.** 여기서 게이트마다 적으면 게이트를
     # 더할 때 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
     out = gate_problems(cfg)
+    # 단계의 필수 키. 설정 편집은 이 도구가 권장하는 정상 행위인데, `summary` 나
+    # `label` 을 지우면 훅이 KeyError 로 죽어 게이트 전체가 꺼지고 안내는
+    # "init 으로 스키마 갱신" 이라는 엉뚱한 방향을 가리켰다(6회차 실측).
+    for i, st in enumerate(cfg.get("stages") or []):
+        if not isinstance(st, dict):
+            continue
+        for key in ("id", "label", "summary"):
+            if not st.get(key):
+                out.append(t("stages[%d] 에 %s 가 없다 — 이 단계를 표시하는 순간 "
+                             "훅이 죽는다. 키를 되돌려라") % (i, key))
     # recall 대상 폴더. 여기 오타가 나면 그 폴더의 기록은 **영원히 안 나온다** —
     # 파일은 있고 키워드도 맞는데 조회에 안 걸린다. 조용한 결함으로 실제로 있었다.
     dev_dirs = set(cfg.seq("folder_rules.dev_subdirs"))
