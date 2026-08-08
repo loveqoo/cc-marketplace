@@ -74,6 +74,14 @@ Execution 뒤) · `rollback`(위험 변경 되돌리기, Execution 앞). 정해�
 예시다 — 이 작업에 필요한 노드를 만들어라. 무엇이 여러 작업에서 반복되는지는
 `harness stats`·`metrics` 가 보여주고, 반복되면 프리셋이나 기본 틀로 승격할 때다.
 
+**프리셋 — 종료 조건을 가진 노드.** `stages.json` 의 `node_presets` 에 정의된 이름을
+`path add` 하면 label·요약·쓰기 허용에 더해 **종료 조건**까지 붙는다. 기본 제공되는
+`review` 가 그 예다 — `harness path add review --after execution --reason "..."` 로 넣으면
+리뷰 결과를 `.dev/review/` 아래 파일로 남겨야 그 노드를 끝낼 수 있다(`review_recorded`).
+외부 모델(코덱스 등)에게 받은 판단은 남기지 않으면 세션과 함께 휘발되므로, 이 노드는
+결과 파일 없이는 통과하지 않는다. 새 프리셋을 더하려면 `node_presets` 에 항목을 두고
+그 `exit_criteria` 가 가리키는 조건을 `criteria` 에 정의한다(오타는 진단이 잡는다).
+
 **Selection 에 더 할 작업이 없으면** 스킵을 시도하지 마라. `harness status` 가 하네스가
 아는 할 일을 후보로 내놓는다 — 밀린 승격 결정, 재발한 승격(그 방법이 통하지 않았다는 증거),
 낡은 인덱스, `LEARNED.md` 예산 소진. **"새 작업이 없다"가 "할 일이 없다"는 뜻이 아니다.**

@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS path_node (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   loop_id TEXT, cycle INTEGER, node TEXT, label TEXT, summary TEXT,
   write TEXT, after_node TEXT, reason TEXT, at TEXT,
+  exit_criteria TEXT, stop_requires TEXT,
   UNIQUE(loop_id, cycle, node));
 """
 

@@ -6,7 +6,11 @@
 
 ADDED_COLUMNS = (("evidence", "digest", "TEXT"),
                  # 승격 시점의 **이벤트 id**. 재발 판정을 벽시계에서 여기로 옮긴다.
-                 ("promotion", "after_id", "INTEGER"))
+                 ("promotion", "after_id", "INTEGER"),
+                 # 회차 한정 노드도 종료 조건을 가질 수 있다 (프리셋 review 등).
+                 # 0.68 에서 path_node 를 exit/stop 없이 낸 설치를 위해 여기서 채운다.
+                 ("path_node", "exit_criteria", "TEXT"),
+                 ("path_node", "stop_requires", "TEXT"))
 
 
 def migrate(con):
@@ -531,13 +535,21 @@ def path_rows(con, lid, cycle):
         return []
 
 
-def add_path_row(con, lid, cycle, node, label, summary, write, after, reason):
-    """노드 하나를 이번 회차에 더한다. 같은 이름은 한 번만 — 이겼으면 True."""
+def add_path_row(con, lid, cycle, node, label, summary, write, after, reason,
+                 exit_criteria=(), stop_requires=()):
+    """노드 하나를 이번 회차에 더한다. 같은 이름은 한 번만 — 이겼으면 True.
+
+    exit_criteria/stop_requires 는 프리셋(review 등)이 주는 종료 조건이다. 회차
+    한정 노드도 게이트를 가질 수 있어야 "리뷰 결과를 남겨야 통과" 가 성립한다.
+    """
     return claim(con, "INSERT OR IGNORE INTO path_node"
-                      "(loop_id,cycle,node,label,summary,write,after_node,reason,at) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)",
+                      "(loop_id,cycle,node,label,summary,write,after_node,reason,at,"
+                      "exit_criteria,stop_requires) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                  (lid, cycle, node, label, summary,
-                  json.dumps(write, ensure_ascii=False), after, reason, now()))
+                  json.dumps(write, ensure_ascii=False), after, reason, now(),
+                  json.dumps(list(exit_criteria), ensure_ascii=False),
+                  json.dumps(list(stop_requires), ensure_ascii=False)))
 
 
 def remove_path_row(con, lid, cycle, node):

@@ -31,7 +31,8 @@
       "retrospect",
       "log",
       "experiment",
-      "scratch"
+      "scratch",
+      "review"
     ],
     "docs_subdirs": [
       "spec",
@@ -48,7 +49,8 @@
       "troubleshooting",
       "retrospect",
       "log",
-      "experiment"
+      "experiment",
+      "review"
     ],
     "prefix_exempt_names": [
       "INDEX.md",
@@ -433,6 +435,28 @@
     "promotion_decided": {
       "satisfied_by": "no_pending_promotions",
       "help": "여러 작업에서 반복된 항목에 대한 승격 결정이 남았다 — `harness promote` 로 목록을 보고 하나씩 결정하라. 승격하지 않기로 하는 것도 결정이다 (--decline --reason \"...\")"
+    },
+    "review_recorded": {
+      "satisfied_by": "file",
+      "write_glob": [
+        ".dev/review/**/*.md"
+      ],
+      "help": "리뷰 결과를 .dev/review/ 아래에 파일로 남겨야 한다 — 외부 모델(코덱스 등)에게 받은 판단은 남기지 않으면 세션과 함께 휘발된다. 파일명은 이번 회차 접두사로 시작한다"
+    }
+  },
+  "node_presets": {
+    "review": {
+      "label": "Review",
+      "summary": "적대적 리뷰 — 결과를 .dev/review/ 에 파일로 남긴다. 외부 모델(코덱스 등) 결과는 남기지 않으면 휘발되므로, 이 노드는 결과 파일 없이는 끝나지 않는다.",
+      "write": [
+        "dev"
+      ],
+      "exit_criteria": [
+        "review_recorded"
+      ],
+      "stop_requires": [
+        "review_recorded"
+      ]
     }
   }
 }

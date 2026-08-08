@@ -906,8 +906,18 @@ def _path_add(ctx, argv, pos):
     cur = stage_index(cfg, sid)
     after = argv_value(argv, "after") \
         or (sid if 1 <= cur < len(ids) - 1 else ids[1])
-    write = [w.strip() for w in (argv_value(argv, "write") or "dev").split(",")
-             if w.strip()]
+    # **프리셋.** 노드 이름이 `node_presets` 에 있으면 label·summary·write·종료
+    # 조건을 거기서 채운다 (예: `path add review` → 리뷰 결과를 남겨야 통과). 사용자
+    # 플래그가 있으면 그것이 이긴다. 종료 조건은 프리셋만 준다 — 임의로 붙이면
+    # 아무 노드나 게이트가 되어 회피 도구가 된다.
+    preset = cfg.obj("node_presets").get(node) or {}
+    exit_criteria = list(preset.get("exit_criteria") or [])
+    stop_requires = list(preset.get("stop_requires") or [])
+    write_raw = argv_value(argv, "write")
+    if write_raw is not None:
+        write = [w.strip() for w in write_raw.split(",") if w.strip()]
+    else:
+        write = list(preset.get("write") or ["dev"])
     bad = [w for w in write if w not in known_classes(cfg)]
     if bad:
         raise Refuse(t("모르는 경로 클래스: %s (가능: %s)")
@@ -931,9 +941,10 @@ def _path_add(ctx, argv, pos):
                          % (after, ", ".join(sorted(allowed)) or t("(없음)"),
                             ", ".join(over)), code=1)
         if not add_path_row(con, lid, cyc, node,
-                            argv_value(argv, "label") or node,
-                            argv_value(argv, "summary") or t("회차 한정 노드"),
-                            write, after, reason):
+                            argv_value(argv, "label") or preset.get("label") or node,
+                            argv_value(argv, "summary") or preset.get("summary")
+                            or t("회차 한정 노드"),
+                            write, after, reason, exit_criteria, stop_requires):
             raise Refuse(t("'%s' 는 이번 회차에 이미 있다") % node, code=1)
         ensure_stage_row(con, lid, node)
         record_event(con, lid, sid, "path_add", node, after, reason)
@@ -941,6 +952,9 @@ def _path_add(ctx, argv, pos):
     print(t("노드 추가 (회차 %d 한정): %s — %s 뒤. 회차가 닫히면 사라지고 "
           "이력은 기록으로 남는다.") % (cyc, node, after))
     print(t("  쓰기 허용: %s · 그래프 확인: `harness path`") % ", ".join(write))
+    if exit_criteria:
+        print(t("  이 노드의 종료 조건: %s — 채워야 다음으로 넘어간다.")
+              % ", ".join(exit_criteria))
     return 0
 
 

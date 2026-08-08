@@ -142,4 +142,24 @@ def register(h):
             return out
 
         def problems(self, cfg):
-            return h.graph_problems(cfg)
+            out = list(h.graph_problems(cfg))
+            # 프리셋 노드의 종료 조건·쓰기 클래스가 실재하나. 오타면 그 프리셋은
+            # 조용히 게이트 없는 노드가 되거나(criteria 오타) 쓰기가 안 걸린다.
+            known = set(cfg.obj("criteria"))
+            classes = h.known_classes(cfg)
+            for name, spec in (cfg.obj("node_presets") or {}).items():
+                if not isinstance(spec, dict):
+                    out.append(h.t("node_presets.%s 가 객체가 아니다 — 무시된다") % name)
+                    continue
+                for field in ("exit_criteria", "stop_requires"):
+                    for k in spec.get(field) or []:
+                        if k not in known:
+                            out.append(h.t("node_presets.%s.%s 의 '%s' 가 criteria 에 "
+                                         "없다 — 채울 방법이 없어 이 프리셋 노드를 "
+                                         "끝낼 수 없다") % (name, field, k))
+                for w in spec.get("write") or []:
+                    if w not in classes:
+                        out.append(h.t("node_presets.%s.write 의 '%s' 는 모르는 경로 "
+                                     "클래스다 (%s 중에서)")
+                                   % (name, w, ", ".join(sorted(classes))))
+            return out

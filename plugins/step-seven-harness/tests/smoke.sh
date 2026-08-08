@@ -3584,6 +3584,40 @@ print(h.remove_path_row(con, lid, h.cycle_of(con, lid), 'execution'))
 " "$RG" "$(dirname "$ENGINE")")"
 rm -rf "$RG"
 
+echo "== 중간 그래프: 리뷰 노드 프리셋 (결과를 남겨야 통과)"
+# 외부 모델(코덱스 등) 결과는 남기지 않으면 휘발된다 — review 프리셋은 결과
+# 파일 없이는 노드를 못 끝내게 한다(Verification 이 검증 증거를 요구하는 것과 같은 결).
+RP="$(mktemp -d)"
+(cd "$RP" && git init -q . && python3 "$ENGINE" init >/dev/null)
+rp() { (cd "$RP" && python3 "$ENGINE" "$@"); }
+rpst() { rp status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+rpmiss() { rp status --json | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["exit_missing"]))'; }
+rp loop intent "리뷰 프리셋" >/dev/null
+rp loop done-when "끝" >/dev/null
+rp advance >/dev/null                                   # Scaffolding
+check "review 프리셋이 종료 조건을 붙인다" 'review_recorded' \
+  "$(rp path add review --after execution --reason '적대적 리뷰')"
+rp advance >/dev/null; rp advance >/dev/null            # Context, Planning
+RPFX="$(rpst prefix)"
+mkdir -p "$RP/.dev/plan"; printf '#\n' > "$RP/.dev/plan/${RPFX}p.md"
+rp approve-plan ".dev/plan/${RPFX}p.md" >/dev/null
+rp advance >/dev/null; rp advance >/dev/null            # Execution → review
+check "리뷰 노드에 들어섰다" '^review$' "$(rpst stage)"
+check "결과 없이는 advance 를 거부한다" 'review_recorded' "$(rp advance 2>&1)"
+# 파일 존재만으로 충족된다 — 관측(PostToolUse) 없이도. 훅 없는 도구·외부 모델 대응.
+mkdir -p "$RP/.dev/review"; printf '# 코덱스 리뷰\n- CRITICAL: ...\n' > "$RP/.dev/review/${RPFX}codex.md"
+check_empty "결과 파일이 있으면 종료 조건이 충족된다 (관측 없이)" "$(rpmiss)"
+check "결과를 남기면 advance 가 통과한다" 'Verification' "$(rp advance 2>&1)"
+# 프리셋 오타는 진단이 잡는다 (조용히 게이트 없는 노드가 되지 않게)
+python3 - "$RP/.claude/harness/stages.json" <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p))
+c.setdefault("node_presets", {}).setdefault("review", {})["exit_criteria"] = ["nonexistent_crit"]
+json.dump(c, open(p, "w"), ensure_ascii=False)
+PY
+check "프리셋의 없는 종료 조건을 진단한다" 'criteria 에 없다' "$(rp status 2>&1)"
+rm -rf "$RP"
+
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"
 rm -f "$WORK/.claude/harness/harness.db-wal" "$WORK/.claude/harness/harness.db-shm"

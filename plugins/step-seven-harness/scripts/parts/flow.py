@@ -130,17 +130,27 @@ def graph_splice(con, cfg, lid):
     """
     base = [s for s in (cfg.get("stages") or [])
             if not (isinstance(s, dict) and s.get("__dyn__"))]
+    def _jlist(row, col):
+        """저장된 JSON 배열을 읽는다. 없거나 깨졌으면 빈 목록 — 게이트 없는 노드다."""
+        keys = row.keys()
+        raw = row[col] if col in keys else None
+        try:
+            v = json.loads(raw) if raw else []
+        except ValueError:
+            v = []
+        return v if isinstance(v, list) else []
+
     chains = {}
     for r in path_rows(con, lid, cycle_of(con, lid)):
-        try:
-            write = json.loads(r["write"]) if r["write"] else ["dev"]
-        except ValueError:
-            write = ["dev"]
+        write = _jlist(r, "write") or ["dev"]
         chains.setdefault(r["after_node"], []).append({
             "id": r["node"], "label": r["label"] or r["node"],
             "summary": r["summary"] or t("회차 한정 노드"),
-            "write": write if isinstance(write, list) else ["dev"],
-            "exit_criteria": [], "stop_requires": [], "__dyn__": True,
+            "write": write,
+            # 프리셋(review 등)이 준 종료 조건. 회차 한정 노드도 게이트를 가진다.
+            "exit_criteria": _jlist(r, "exit_criteria"),
+            "stop_requires": _jlist(r, "stop_requires"),
+            "__dyn__": True,
         })
     out = []
 
