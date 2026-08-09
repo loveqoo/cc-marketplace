@@ -3828,6 +3828,42 @@ check "metrics 도 같은 사실을 말한다" '기본값에서 달라졌다' "$
 check_absent "넓혔다고 차단하지는 않는다" 'Refuse' "$V6C"
 rm -rf "$V6"
 
+echo "  -- 3차 §2 다른 언어의 소스를 품은 명령 (본문은 명령이 아니라 데이터다)"
+# 시험대가 **한 줄 명령 위주**였다. 실사용의 큰 몫은 본문을 품은 명령인데
+# (`python3 - <<'PY'`, `bash -c '…'`, `git commit -F -`) 코퍼스에 거의 없었다.
+# 그래서 본문이 셸 명령처럼 토큰화되는 것을 아무도 못 봤다 — `find … \;` 의
+# `\;` 변종을 놓쳤던 것과 같은 자리다: 명령의 **핵심부만** 흉내 내고 **껍데기**는
+# 흉내 내지 않았다.
+frheredoc() { # frheredoc <본문 한 줄> → 훅 판정
+  frb "$(printf 'python3 - <<%sPY%s\n%s\nprint(1)\nPY' "'" "'" "$1")"
+}
+# ① 오탐 — 본문에 든 **문자열**이 명령으로 읽히면 안 된다
+check_absent "본문의 문자열 + 2>&1 은 막히지 않는다" '"deny"' \
+  "$(frheredoc "needle = 'ls -la .claude/harness/ 2>&1'")"
+check_empty "본문의 문자열 + 2>&1 은 묻지도 않는다" \
+  "$(frheredoc "needle = 'ls -la .claude/harness/ 2>&1'")"
+check_empty "본문의 문자열 + 리다이렉트도 통과" \
+  "$(frheredoc "needle = 'ls .claude/harness/ > /tmp/o'")"
+check_empty "리다이렉트 없는 언급도 통과" \
+  "$(frheredoc "needle = 'ls -la .claude/harness/'")"
+# ② 경계 — 본문이 **진짜로** 바닥값을 건드리면 그대로 받는다.
+#    이쪽이 빨개지지 않으면 위 셋은 "게이트를 껐다" 와 구분되지 않는다.
+check "본문이 DB 를 열면 묻는다" '"ask"' \
+  "$(frheredoc "open('.claude/harness/harness.db','w')")"
+check "본문이 래퍼를 열면 묻는다" '"ask"' \
+  "$(frheredoc "open('.claude/harness/bin/harness','w')")"
+check "따옴표 없는 히어독도 받는다" '"ask"' \
+  "$(frb "$(printf 'python3 - <<PY\nopen(%s.claude/harness/harness.db%s,%sw%s)\nPY' "'" "'" "'" "'")")"
+# 히어독으로 **파일을 쓰는** 것은 본문이 아니라 리다이렉트가 말한다 — 그대로 막힌다.
+check "히어독으로 래퍼를 덮어쓰면 막힌다" '"deny"' \
+  "$(frb "$(printf 'cat > .claude/harness/bin/harness <<%sEOF%s\nevil\nEOF' "'" "'")")"
+# ③ 껍데기마다 계약이 다르다 — 그 차이를 못 박는다.
+#    히어독 본문은 셸이 확장도 하지 않는 **데이터**라 안 본다(통과).
+#    `-c` 는 **코드**라 읽을 수 없으므로 묻는다(ask). 둘 다 deny 는 아니다.
+BC="$(frb "bash -c \"echo 'ls .claude/harness/ 2>&1'\"")"
+check "bash -c 는 코드라 묻는다" '"ask"' "$BC"
+check_absent "그래도 막지는 않는다" '"deny"' "$BC"
+
 echo "  -- §7 이미 무시되는 경로에 다시 붙이지 않는다"
 FG="$(mktemp -d)"
 (cd "$FG" && git init -q .)

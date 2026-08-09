@@ -391,6 +391,30 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
     pats = protected_pats(cfg)
     floor = set(SELF_LOCK)
 
+    # **본문은 명령이 아니라 데이터다.** `bash_writes`·`bash_unresolved` 는 이미
+    # 이렇게 보는데 여기만 빠져 있었다. 그래서 `BASH_SPLIT` 이 `\n` 으로 쪼갤 때
+    # 히어독 본문의 각 줄이 명령 세그먼트가 됐고, **본문에 든 문자열** 때문에
+    # 프로그램 실행이 거부됐다(3차 현장 보고 §2, 실측):
+    #
+    #     python3 - <<'PY'
+    #     needle = 'ls -la .claude/harness/ 2>&1'      ← 이 줄이 명령으로 읽혔다
+    #     print(repr(needle))
+    #     PY
+    #     → "하네스 자신(.claude/harness)은 Bash 로도 변경할 수 없다"
+    #
+    # 리다이렉트를 뺀 같은 스크립트는 지나갔다 — `2>&1` 이 그 줄을 '변경 명령'
+    # 으로 만들었기 때문이다. 0.71.0 이 명령줄 쪽 리다이렉트는 고쳤는데 본문
+    # 쪽에는 그 고침이 닿지 않았다.
+    #
+    # 이건 추측을 하나 더 다듬는 것이 아니다. **문법이 답을 갖고 있다** —
+    # 따옴표 구분자 히어독은 셸이 확장조차 하지 않는 리터럴이다. 그래서 새 규칙을
+    # 만들지 않고 이미 있는 함수를 빠진 자리에 적용한다.
+    #
+    # 경계는 약해지지 않는다. 본문이 **진짜로** 바닥값을 건드리면
+    # (`python3 - <<'PY'` 안에서 `open('.claude/harness/harness.db','w')`)
+    # 원문 감시(`floor_named`)가 명령 전체 텍스트를 따로 훑어 ask 로 받는다.
+    # 층이 겹쳐 있어서 이쪽을 비워도 바닥이 남는다 — 실측으로 확인했다.
+    cmd = strip_quoted_heredocs(cmd)
     mutating = bool(bash_mutator_re(cfg).search(cmd))
     # 바닥값 containment 는 **설정** mutator 를 믿지 않되(아래 주석) 변경 여부
     # 자체는 봐야 한다 — 안 보면 `git add .claude`·`du -sh .claude` 같은 읽기
