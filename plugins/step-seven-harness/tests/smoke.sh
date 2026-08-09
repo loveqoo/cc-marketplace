@@ -1149,15 +1149,31 @@ CHW="$(mktemp -d)"
 (cd "$CHW" && git init -q . && python3 "$ENGINE" init >/dev/null)
 chb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$CHW" "$1" \
   | CLAUDE_PROJECT_DIR="$CHW" python3 "$ENGINE" hook; }
+chseen() { # 이 저장소에 지금까지 기록된 추측 대상 전부
+  python3 -c "
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1] + '/.claude/harness/harness.db')
+print(' '.join(r[0] for r in c.execute(
+    \"select target from event where kind='bash_write_seen'\")))" "$CHW"; }
+# 이제 막지 않으므로 **수집됐는지**를 단정한다. 원래 이 절의 목적이 판정이 아니라
+# `BASH_SPLIT` 회귀(뒤 세그먼트가 통째로 새는 것)였다 — 목적은 그대로다.
 for C in "true && touch src/a.py" \
          "echo a; touch src/a.py" \
          "cd . && mkdir -p src/newdir" \
          "false || sed -i s/a/b/ .claude/settings.json"; do
-  check "체인 뒤도 막힌다: $C" '"permissionDecision": "deny"' "$(chb "$C")"
+  chb "$C" >/dev/null
+  check "체인 뒤도 수집된다: $C" '[a-z]' "$(chseen)"
 done
 # 첫 세그먼트 형태도 계속 막혀야 한다 (한쪽만 고치는 것을 막는다)
-check "첫 세그먼트도 여전히 막힌다" '"permissionDecision": "deny"' \
-  "$(chb "touch src/a.py")"
+chb "touch src/a.py" >/dev/null
+check "첫 세그먼트도 여전히 수집된다" 'src/a.py' "$(chseen)"
+# 그리고 **차단으로 세지 않는다.** 추측을 `block` 으로 세면 마찰 추세가 거짓이
+# 된다 — 이 저장소에는 Bash 만 들어갔으므로 block 은 0이어야 한다.
+check "추측은 차단 통계에 섞이지 않는다" '^0$' \
+  "$(python3 -c "
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1] + '/.claude/harness/harness.db')
+print(len(list(c.execute(\"select 1 from event where kind='block'\"))))" "$CHW")"
 # 과잉 차단 반대편: 체인이어도 읽기는 지나간다
 check_empty "체인이어도 읽기는 지나간다" "$(chb "cd . && cat README.md")"
 rm -rf "$CHW"
@@ -1207,13 +1223,20 @@ for OK in "cat .claude/harness/LEARNED.md" \
   check_empty "허용: $OK" "$(gb "$OK")"
 done
 
-echo "== Bash 쓰기와 Write 의 판정이 같다 (규칙 엔진이 하나다)"
-# 이 리팩터가 세우는 불변식이다. 사례를 손으로 고르지 않고 **경로마다 두 문으로 같은
-# 질문을 넣어** 결과를 대조한다. 예전에는 Bash 가 쓰기 규칙 일곱 개 중 하나만(그것도
-# 훅에 손으로 베낀 채) 받았고, `sed -i` 한 줄로 `stage_write` 가 통째로 우회됐다.
+echo "== Bash 와 Write 의 판정은 **의도적으로 갈린다** (경계와 가시성)"
+# 예전 불변식은 "두 문이 같은 판정" 이었다. 그 불변식은 **은퇴했다.**
+#
+# 같으려면 Bash 명령에서 정확한 경로를 알아내야 하는데 그건 정적으로 결정
+# 불가능하다 — 19번 고쳤고 매번 다음이 있었다
+# (`.dev/shell-write-detection-is-undecidable.md`). 그래서 층을 갈랐다:
+#
+#   Write/Edit : 도구가 경로를 그대로 준다 → **추측 없음 → 막는다**
+#   Bash       : 추측이다              → **막지 않고 기록한다**
+#   바닥값      : 둘 다 막는다 (경계는 그대로다)
+#
+# 새 불변식도 경로마다 두 문에 같은 질문을 넣어 확인한다. 갈리는 것 자체가
+# 계약이므로, **갈리는 방식**을 단정한다.
 SYMW="$(mktemp -d)"
-# `.claude/hooks` 를 미리 만든다. 부모가 없는 경로는 Bash 쓰기가 **어차피 실패하므로**
-# 수집에서 빠진다(`_plausible`). 같은 현실을 두 문에 넣어야 비교가 정직하다.
 (cd "$SYMW" && git init -q . && python3 "$ENGINE" init >/dev/null && mkdir -p src docs/01-a .dev/plan .claude/hooks && touch src/a.py docs/01-a/01-n.md)
 sym_decision() { # <tool-json> -> deny|ask|allow|-
   printf '%s' "$1" | CLAUDE_PROJECT_DIR="$SYMW" python3 -c '
@@ -1233,25 +1256,32 @@ for REL in "src/a.py" "docs/01-a/01-n.md" "docs/새.md" ".claude/hooks/x.json" \
            ".dev/plan/p.md" ".claude/harness/stages.json" "README.md"; do
   SP="$(sym_pair "$REL")"
   case "$SP" in
-    "write=deny bash=deny"|"write=- bash=-"|"write=ask bash=ask")
-      PASS=$((PASS + 1)); printf '  ok   %s: 같은 판정 (%s)\n' "$REL" "$SP" ;;
-    *) FAIL=$((FAIL + 1)); printf '  FAIL %s: 판정이 갈린다\n     %s\n' "$REL" "$SP" ;;
+    # Write 가 막는 곳은 Bash 가 통과시킨다. 둘 다 통과하는 곳은 그대로 둘 다 통과.
+    "write=deny bash=-"|"write=- bash=-")
+      PASS=$((PASS + 1)); printf '  ok   %s: 계약대로 (%s)\n' "$REL" "$SP" ;;
+    *) FAIL=$((FAIL + 1)); printf '  FAIL %s: 계약과 다르다\n     %s\n' "$REL" "$SP" ;;
   esac
 done
-# 갈리지 않는다는 것만으로는 부족하다 — 둘 다 통과여도 '같다'가 된다. 실제로 막는
-# 경로가 하나는 있어야 검사에 의미가 있다.
-check "적어도 하나는 실제로 막힌다" 'bash=deny' "$(sym_pair ".claude/hooks/x.json")"
-# 그리고 `sed -i` 로도 같아야 한다 — 리다이렉트만 막고 sed 는 지나가던 것이 결함이었다.
-check "sed -i 도 단계 규칙을 받는다" '"permissionDecision": "deny"' \
-  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/hooks/x.json"}}' "$SYMW" \
-     | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
-check "규칙 이름이 아니라 무엇을 바꾸는지 말한다" "이 명령이 '.claude/hooks/x.json' 를 바꾼다" \
-  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/hooks/x.json"}}' "$SYMW" \
-     | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
-# 부모를 **만드는** 명령은 그 필터를 건너뛴다 — 아니면 `mkdir -p` 로 새 디렉터리를
-# 만드는 것이 규칙 밖이 된다.
-check "mkdir -p 는 없는 부모도 대상으로 본다" '"permissionDecision": "deny"' \
-  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"mkdir -p .claude/새폴더/깊이"}}' "$SYMW" \
+# 둘 다 통과여도 위 검사가 초록이 된다 — **Write 가 실제로 막는 경로가 하나는
+# 있어야** 구분력이 생긴다. 그것이 곧 "경계는 살아 있다" 의 단정이다.
+check "Write 는 실제로 막는다" 'write=deny' "$(sym_pair ".claude/hooks/x.json")"
+# 그리고 Bash 는 통과시키되 **기록을 남긴다.** 통과만 확인하면 기능이 통째로
+# 죽어도 초록이다.
+printf '%s' "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/hooks/x.json"}}' "$SYMW")" \
+  | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook >/dev/null
+check "sed -i 는 막히지 않는다" '^-$' \
+  "$(sym_decision "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/hooks/x.json"}}' "$SYMW" | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)")"
+check "그 대신 기록이 남는다" 'x.json' \
+  "$(python3 -c "
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1] + '/.claude/harness/harness.db')
+print(' '.join(r[0] for r in c.execute(
+    \"select target from event where kind='bash_write_seen'\")))" "$SYMW")"
+check "기록은 recall 로 다시 찾아진다" 'bash_write_seen' \
+  "$( (cd "$SYMW" && python3 "$ENGINE" recall 2>&1) )"
+# 바닥값은 Bash 로도 그대로 막힌다 — 경계는 이 변경에서 하나도 약해지지 않는다.
+check "바닥값은 Bash 로도 막힌다" '"permissionDecision": "deny"' \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/harness/bin/harness"}}' "$SYMW" \
      | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
 # 훅에서 실제로 `ask` 가 나오는지. 판정 함수만 검사하면 훅이 그 값을 안 쓸 수 있다.
 OPQ="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls | xargs rm"}}' "$SYMW" \
@@ -3682,7 +3712,7 @@ check_empty "A..B 는 쓰기 대상이 아니다" \
 check_empty "A...B 도 마찬가지" \
   "$(frb 'git log origin/main...HEAD --oneline > /tmp/y.txt')"
 # 상위 폴더(`..`)는 진짜 경로다 — 문법으로 가르므로 이 구분이 유지돼야 한다.
-check "상위 폴더는 여전히 경로로 본다" 'a.py' "$(frb 'touch ../a.py; touch src/a.py')"
+check_empty "상위 폴더가 있어도 막지는 않는다" "$(frb 'touch ../a.py; touch src/a.py')"
 
 echo "  -- §3·§4 회귀: 해석하지 못하는 것은 여전히 묻는다"
 check "따옴표가 안 맞는 변경 명령은 묻는다" '쪼갤 수 없다' "$(frb 'touch "src/a.py')"

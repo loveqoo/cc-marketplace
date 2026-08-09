@@ -172,6 +172,7 @@ EVENT_KINDS = {
     "bypass": "게이트 우회",
     "tool_fail": "도구 실패",
     "edit": "파일 편집",
+    "bash_write_seen": "Bash 로 단계 밖 쓰기 (추측)",
     "promote": "승격 결정",
     "promote_declined": "승격 보류",
     "promote_verify": "승격 시 변경 관측",
@@ -878,6 +879,20 @@ def check_write(ctx, rel):
     return None, None
 
 
+def stage_would_block(ctx, rel):
+    """이 경로가 단계 규칙에 걸리나 — **부작용 없이.** `(규칙 id, 사유)` 또는 None.
+
+    `check_write` 와 달리 기록도 남기지 않고 예외도 소모하지 않는다. Bash 경로는
+    **추측**이라(아래) 그 추측으로 예외를 태우거나 차단 통계를 만들면 안 된다.
+
+    바닥값은 여기서 보지 않는다 — 훅이 이미 앞에서 `floor_verdict` 로 판정했고,
+    그건 추측이 아니라 경계다.
+    """
+    if floor_hit(ctx.root, rel):
+        return None, None
+    return _first_violation(WriteReq(ctx, rel), write_rules(ctx.cfg))
+
+
 def grant_blind_block(ctx, rel):
     """**예외를 걸어도** 남는 차단. `(규칙 id, 사유)` 또는 `(None, None)`.
 
@@ -1067,15 +1082,29 @@ def hook_pre_tool_use(inp, ctx):
         # `harness` 라는 낱말과 위치 인자 하나만 있으면 쓰기 규칙과 opaque 검사가
         # 통째로 꺼졌다 — `echo "harness 관련" > docs/x.md` 가 그대로 통과했다.
 
-        # Bash 쓰기도 **같은 규칙 엔진**을 지난다. 예전에는 `docs_readonly` 규칙 하나만
-        # 여기 손으로 베껴져 있었고, 나머지 여섯 규칙은 Bash 에 없었다 — `stage_write`
-        # 까지 없었으므로 `sed -i` 한 줄로 단계 게이트가 통째로 우회됐다.
+        # Bash 의 단계 규칙은 **막지 않는다. 기록한다.**
+        #
+        # 예전에는 여기서 `check_write` 로 막았다. 그러려면 명령에서 **정확한
+        # 경로**를 알아내야 하는데, 그건 정적으로 결정 불가능하다 — `eval`·`$(…)`·
+        # 변수 확장 때문에 명령이 실행 중에 조립된다. 근사로 19번 고쳤고 매번
+        # 다음이 있었다. 업계 누구도 이 방법을 쓰지 않는다(OS 격리·접두사
+        # 허용목록·컨테이너로 우회한다). 조사와 출처는
+        # `.dev/shell-write-detection-is-undecidable.md`.
+        #
+        # 정확성 요구를 없앤다. 추측은 남지만 아무도 막지 않으므로 **틀려도
+        # 고칠 이유가 없다.** 그것이 이 변경의 값이다.
+        #
+        # 이건 성격을 바꾸는 것이 아니다. `BASH_OPAQUE` 주석이 이미 적어 두었다 —
+        # "이것은 경계가 아니라 가시성이다. 경계는 바닥값과 래퍼 무결성이다."
+        # 단계 규칙은 원래 경계가 아니었는데 구현만 경계처럼 하고 있었다.
+        #
+        # 경계는 그대로다: 바닥값은 위에서 `floor_verdict` 가 막고, Write/Edit 은
+        # 도구가 경로를 그대로 주므로 **추측 없이** 아래에서 막는다.
         for rel in bash_writes(cfg, root, cmd):
-            with con:
-                decision, reason = check_write(ctx, rel)
-            if decision:
-                return emit(pre_decision(decision, t(
-                    "이 명령이 '%s' 를 바꾼다. %s") % (rel, reason)))
+            name, reason = stage_would_block(ctx, rel)
+            if reason:
+                with con:
+                    record_event(con, lid, sid, "bash_write_seen", name, rel, reason)
 
         # 대상을 특정할 수 없는 파괴는 **모른다고 말하고 넘긴다.** 막으면 정상 정리
         # 작업이 막히고, 통과시키면 구멍이다. 자세한 근거는 `BASH_OPAQUE` 에 적었다.
@@ -1083,10 +1112,14 @@ def hook_pre_tool_use(inp, ctx):
         if why:
             with con:
                 record_event(con, lid, sid, "ask", "opaque_write", "", cmd[:200])
+            # 사유가 바뀌었다. 단계 규칙은 이제 막지 않으므로 "단계 규칙을 적용할
+            # 대상을 정할 수 없어서" 는 거짓이다. 이 물음이 실제로 지키는 것은
+            # **바닥값**이다 — `find . -name harness.db -delete` 는 토큰에 바닥값이
+            # 없어 어떤 문자열 검사도 지나간다.
             return emit(pre_decision("ask", t(
-                "이 명령이 무엇을 바꿀지 하네스가 알 수 없다 — %s. 단계별 쓰기 규칙을 "
-                "적용할 대상을 정할 수 없으므로 사람이 봐야 한다. 대상이 분명한 형태로 "
-                "바꿔 쓰면(예: 경로를 직접 적으면) 규칙이 대신 판정한다.")
+                "이 명령이 무엇을 바꿀지 하네스가 알 수 없다 — %s. 하네스 자신(엔진·"
+                "상태 DB·사전 승인된 래퍼)을 건드리는지 판정할 수 없으므로 사람이 "
+                "봐야 한다. 대상이 분명한 형태로 바꿔 쓰면 하네스가 대신 판정한다.")
                 % why))
         return
 
@@ -1133,15 +1166,36 @@ def hook_post_tool_use(inp, ctx):
         # 실패한 쓰기는 Bash 만 걸렀다. Write/Edit 도 걸러야 한다 — 실패한
         # Write 의 경로가 파일 증거(plan_file 등)로 적립되고, 파일이 없으면
         # digest 가 NULL 이라 그 증거는 만료조차 안 됐다(6회차 실측).
+        # **증거로 세는 것과 이력으로 세는 것을 가른다.** Bash 경로는 추측이라
+        # 틀릴 수 있는데, 틀린 추측이 종료 조건을 채우면(예: `.dev/plan/**` 에
+        # 쓴 것으로 오인) **사람이 안 만든 계획으로 단계가 열린다.** 이력(churn)이
+        # 지저분해지는 것과는 값이 다르다.
+        #
+        # 그래서 증거에는 **문법이 증명한 경로만** 넣는다 — 리다이렉트 대상과
+        # `of=`. Write/Edit 은 도구가 경로를 그대로 주므로 전부 증명된 것이다.
+        field = WRITE_TOOLS.get(tool)
+        # 실패한 쓰기는 Bash 만 걸렀다. Write/Edit 도 걸러야 한다 — 실패한
+        # Write 의 경로가 파일 증거(plan_file 등)로 적립되고, 파일이 없으면
+        # digest 가 NULL 이라 그 증거는 만료조차 안 됐다(6회차 실측).
         if field and not tool_failed(inp):
             rels = [rel_to_root(root, ti.get(field))]
+            proven = set(rels)
         elif tool == "Bash" and not tool_failed(inp):
-            rels = bash_writes(cfg, root, ti.get("command") or "")
+            cmd_txt = ti.get("command") or ""
+            # **여기는 실행 뒤다 — 추측할 필요가 없다.** 디스크를 본다.
+            # 파일로 존재하지 않는 추측(`origin/main..HEAD`, `.git` 디렉터리)이
+            # 재편집 지표에 섞이면, 우리가 재려던 "한 파일을 몇 번 고쳤나" 가
+            # 추측으로 오염된다. PreToolUse 는 실행 전이라 이 확인을 할 수 없다.
+            rels = [r for r in bash_writes(cfg, root, cmd_txt)
+                    if os.path.isfile(os.path.join(root, r))]
+            proven = set(bash_writes(cfg, root, cmd_txt, proven_only=True))
         else:
-            rels = []
+            rels, proven = [], set()
         for rel in [r for r in rels if r]:
             # 편집 이력. 한 루프에서 같은 파일을 몇 번 고쳤는지가 구조 냄새다.
             record_event(con, lid, sid, "edit", None, rel)
+            if rel not in proven:
+                continue                # 추측은 증거가 되지 못한다
             # write_glob 이 없는 조건(cli·observed·no_pending)은 그냥 지나간다.
             for kind, sig in signals.items():
                 # `write_glob` 은 `satisfied_by: file` 의 어휘다. 방식을 보지 않고

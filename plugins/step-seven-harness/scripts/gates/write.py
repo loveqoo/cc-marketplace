@@ -127,8 +127,12 @@ def register(h):
                      h._bind(bh, 'cp evil "$D/x"'), True),
                     (h.t("인터프리터 인라인 코드는 묻는다"),
                      h._bind(bh, 'python3 -c "open(\'src/a.py\',\'w\')"'), True),
+                    # **바닥값에 대고 묻는다.** 예전에는 `touch docs/probe.md` 로
+                    # 물었는데, Bash 의 단계 규칙이 기록으로 내려가면서 그 질문은
+                    # 늘 "안 막힘" 이 됐다 — 페일세이프를 시험하지 못한다.
+                    # 깨진 설정으로도 지켜야 하는 것은 이제 바닥값이다.
                     (h.t("설정 정규식이 깨져도 막는다"),
-                     h._bind(broken_re, "touch docs/probe.md", "selection"), True),
+                     h._bind(broken_re, "rm " + h.ENGINE_REL, "selection"), True),
                     (h.t("셸 치환으로도 바닥값을 열 수 없다"),
                      h._bind(bh, 'cp evil "$(pwd)/' + h.WRAPPER_CMD + '"'), True),
                     (h.t("인터프리터 인라인 코드도 마찬가지"),
@@ -142,10 +146,16 @@ def register(h):
                     # 단계별 쓰기 규칙 — Write 와 Bash 가 **같은 판정**을 받아야 한다
                     (h.t("단계별 쓰기 허용 (Write)"), h._bind(wr, ".claude/settings.json",
                                                     "selection"), True),
-                    (h.t("단계별 쓰기 허용 (Bash)"),
-                     h._bind(br, "printf x > .claude/settings.json", "selection"), True),
-                    (h.t("sed -i 도 같은 판정"),
-                     h._bind(br, "sed -i s/a/b/ .claude/settings.json", "selection"), True),
+                    # **Bash 의 단계 규칙은 막지 않는다 — 기록한다.** 예전에는 이
+                    # 둘이 "Write 와 같은 판정" 을 단정했다. 그 불변식은 은퇴했다:
+                    # 같으려면 명령에서 정확한 경로를 알아내야 하는데 그건 정적으로
+                    # 결정 불가능하다(`.dev/shell-write-detection-is-undecidable.md`).
+                    # 통과하는 쪽 단정으로 남긴다 — 과잉 차단이 되돌아오면 여기가
+                    # 먼저 빨개진다.
+                    (h.t("Bash 단계 규칙은 막지 않는다"),
+                     h._bind(br, "printf x > .claude/settings.json", "selection"), False),
+                    (h.t("sed -i 도 막지 않는다"),
+                     h._bind(br, "sed -i s/a/b/ .claude/settings.json", "selection"), False),
                     (h.t("docs/ 쓰기 (사람의 영역)"), h._bind(wr, "docs/probe.md"), True),
                     (h.t("설정의 보호 경로"),
                      h._bind(wr, ".claude/harness/LEARNED.md", "scaffolding"), True),

@@ -277,6 +277,17 @@ def _hint_on_enter(ctx, lid, sid):
         print(t("\n이 루프에서 관측된 것 — 회고 대상:"))
         for r in rows:
             print("  - %s/%s %s ×%d" % (r["kind"], r["rule"] or "-", r["target"], r["c"]))
+    # Bash 로 단계 밖에 쓴 것 — **막지 않은 것**이라 여기서만 보인다.
+    # 위 목록과 섞지 않는다: 저건 관측된 사실이고 이건 **추측**이다. 섞으면
+    # 회고가 추측을 사실로 읽는다.
+    seen = con.execute(
+        "SELECT rule, target, COUNT(*) c FROM event "
+        "WHERE loop_id=? AND kind='bash_write_seen' "
+        "GROUP BY rule, target ORDER BY c DESC LIMIT 5", (lid,)).fetchall()
+    if seen:
+        print(t("\nBash 로 단계 밖에 쓴 것으로 **보이는** 것 (막지 않았다 — 추측이라 틀릴 수 있다):"))
+        for r in seen:
+            print("  - %s/%s ×%d" % (r["rule"] or "-", r["target"], r["c"]))
     churn = con.execute(
         "SELECT target, COUNT(*) c FROM event WHERE loop_id=? AND kind='edit' "
         "GROUP BY target HAVING c >= 4 ORDER BY c DESC LIMIT 5", (lid,)).fetchall()

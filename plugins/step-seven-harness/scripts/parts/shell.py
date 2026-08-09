@@ -229,9 +229,16 @@ def floor_named(cfg, cmd):
         i = 0
         while i < len(toks) and ASSIGN_RE.match(toks[i]):
             i += 1
-        if (i < len(toks) and ">" not in seg
+        if (i < len(toks)
                 and os.path.basename(toks[i].strip("\"'")) in BASH_READERS_DEFAULT):
-            continue
+            # 읽기 명령은 **리다이렉트 대상만** 쓴다. `>` 유무로 가르면
+            # `ls … 2>&1` 이 변경 명령이 된다 (2차 현장 보고 §1).
+            wrote = redirect_targets(toks[i:])
+            if not wrote:
+                continue
+            # 쓰는 곳이 있으면 그 자리만 본다.
+            if not any(FLOOR_RE.search(w) for w in wrote):
+                continue
         for m in FLOOR_RE.finditer(seg):
             if not _invocation(seg, m.end()):
                 return m.group(0)
@@ -333,7 +340,10 @@ def bash_unresolved(cfg, cmd):
             return t("인터프리터에 인라인으로 넘긴 코드는 하네스가 읽지 못한다")
         if not mut.search(seg.strip()):
             continue
-        if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) and ">" not in seg:
+        # 읽기 명령은 리다이렉트 **대상만** 쓴다. 쓰는 곳이 없으면 물을 것도 없다
+        # — `ls … 2>&1` 을 되묻는 것이 §1 오탐의 다른 얼굴이다.
+        if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) \
+                and not redirect_targets(toks[i:]):
             continue
         # 쪼개지 못한 변경 세그먼트. `bash_writes` 는 여기서 아무 대상도 모으지
         # 않으므로, 받아 주지 않으면 단계 규칙이 조용히 사라진다.
@@ -460,7 +470,15 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
         # 이름은 읽기로 선언될 수 없다**(NEVER_READERS). 그 위장만 막으면 되고,
         # 읽기는 원래대로 통째로 건너뛴다 — `cat` 으로 DB를 읽는 것까지 막으면
         # 과잉 차단이고, 마찰은 게이트를 끄게 만든다.
-        if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) and ">" not in seg:
+        if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT):
+            # 읽기 명령이 쓰는 것은 **리다이렉트 대상뿐이다.** 그 대상만 검사하고
+            # 인자는 원래 성격(읽기)대로 둔다. `>` 유무로 통째로 가르면
+            # `ls -la .claude/harness/ 2>&1` 이 "하네스를 변경한다" 가 됐다
+            # (2차 현장 보고 §1). `cat x > <엔진>` 은 그 대상이 잡아낸다.
+            for w in redirect_targets(toks):
+                hit = protected(w)
+                if hit:
+                    return hit, None
             continue
         # 인터프리터도 같은 검사를 받는다. `interpreters: ["rm"]` 로 다음 인자를
         # '실행 대상'으로 건너뛰게 만들면 설정만으로 잠금이 풀렸다 — 5차 리뷰.
@@ -548,6 +566,48 @@ REDIRECT_RE = re.compile(r"^\d*(>>?\|?|&>>?)$")
 ATTACHED_REDIR_RE = re.compile(r"^(\d*>>?|&>>?)(.+)$")
 
 
+def redirect_targets(toks):
+    """이 세그먼트가 리다이렉트로 **쓰는 곳**. 파일 디스크립터 복제는 뺀다.
+
+    `2>&1` 의 `&1` 은 파일이 아니라 다른 fd 다. `>&2` 도 같다.
+    """
+    out, k = [], 0
+    while k < len(toks):
+        tok = toks[k]
+        if REDIRECT_RE.match(tok) and k + 1 < len(toks):
+            if not toks[k + 1].startswith("&"):
+                out.append(toks[k + 1])
+            k += 2
+            continue
+        m = ATTACHED_REDIR_RE.match(tok)
+        if m and not m.group(2).startswith("&"):
+            out.append(m.group(2))
+        k += 1
+    return out
+
+
+def reader_writes(cfg, toks):
+    """읽기 명령인데 **리다이렉트로 무언가를 쓰나.** 그 대상들 (아니면 None).
+
+    예전에는 세그먼트에 `>` 가 하나라도 있으면 읽기 면제를 통째로 껐다. 목적은
+    `cat x > <엔진>` 이었는데, 그 한 글자가 **꼬리표까지** 잡았다:
+
+        ls -la .claude/harness/ 2>&1        → "하네스 자신은 변경할 수 없다"
+        ls -la .claude/harness/ 2>/dev/null → 같은 메시지
+
+    파이프는 멀쩡한데 리다이렉트만 뒤집혔다. 그런데 `2>&1` 은 쓰는 곳이 아예
+    없고, `2>/dev/null` 이 쓰는 곳은 `/dev/null` 이다 — 둘 다 `.claude/harness`
+    와 무관하다. **리다이렉트는 명령의 성격을 바꾸지 않는다.** 쓰는 것은
+    리다이렉트 대상이지 인자가 아니다(2차 현장 보고 §1).
+
+    이 오탐의 값이 특히 비쌌다. 에이전트가 치는 명령에는 꼬리표가 거의 항상
+    붙어서 **평소에** 걸렸고, "변경할 수 없다"는 메시지를 반복해서 받은 모델은
+    **읽는 것조차 금지됐다고 학습**했다. 1차 보고 §5 의 "쪼개면 새어 나간다"는
+    우회는 그 학습의 결과였다 — 오탐 하나가 우회 하나를 만들었다.
+    """
+    return redirect_targets(toks) or None
+
+
 # 이 명령들은 **마지막 경로만** 바꾼다. `cp src/a.py /tmp/b` 가 src 를 쓴다고 보면
 # 읽기만 하는 명령이 거부되고, 그 오판이 곧 마찰이다. `sed`·`perl` 도 여기 있다 —
 # 앞 인자는 파일이 아니라 식(`s/x/y/`)이다. `mv` 는 없다: 원본도 사라진다.
@@ -598,35 +658,28 @@ def _target(root, tok, sure):
                 continue
             if sure or os.path.lexists(os.path.join(root, rel)):
                 return rel
-            # 없는 파일은 **추측**이다. `/` 하나로 경로라고 보면 URL 과 도커 태그가
-            # 쓰기 대상이 된다 — `curl … > /tmp/x.tgz` 가 "신규 최상위 폴더
-            # 'https:/'" 로 거부됐고, `docker build -t myorg/app:1.0 . > log` 도
-            # 같았다(4회차 B#13). 메시지가 엉뚱하면 사용자는 고장으로 보고 게이트를
-            # 끈다. **콜론이 든 자리는 경로 문법이 아니다** — 이름 목록이 아니라
-            # 문법이라 늘려야 할 다음 항목이 없다.
-            if "/" in rel and not any(":" in part for part in rel.split("/")):
-                if _rev_range(rel):
-                    continue
+            # ## 여기 있던 예외 셋을 지웠다 — 고친 것이 아니라 **지운 것**이다
+            #
+            # `sure=False` 는 추측이다. 그 추측을 정확하게 만들려고 예외가 셋
+            # 붙어 있었다: 콜론 든 마디 제외(`https:/`·`org/app:1.0`), `..` 든
+            # 마디 제외(`origin/main..HEAD`), find 문법으로 자르기(`-name '.git'`).
+            # 넷째가 오는 것은 시간 문제였다.
+            #
+            # 정확해질 수 없기 때문이다 — 셸이 무엇을 쓰는지는 정적으로 **결정
+            # 불가능**하고, 같은 도구도 플래그로 규약이 뒤집힌다(`cp` 와 `cp -t`
+            # 는 쓰는 인자가 반대다). 조사는
+            # `.dev/shell-write-detection-is-undecidable.md`.
+            #
+            # 그래서 정확성 **요구**를 없앴다. 이 추측의 결과는 이제 아무도 막지
+            # 않고 기록만 남긴다(`bash_write_seen`). 틀린 기록은 지저분할 뿐이라
+            # 예외를 붙일 이유가 없다. 예외를 남겨 두면 "정확해야 한다"는 압력이
+            # 남고, 그러면 다섯 번째가 붙는다.
+            if "/" in rel:
                 return rel
     return None
 
 
-def _rev_range(rel):
-    """git 리비전 범위(`A..B`·`A...B`)인가. 경로가 아니다.
-
-    `git diff origin/main..HEAD > out` 이 "'origin/main..HEAD' 를 바꾼다"로
-    거부됐다(현장 보고 §4). `/` 가 있고 `:` 가 없으니 위의 경로 추측을 통과한
-    것이다. 그리고 그 오탐이 `stage_write` 차단 기록에 그대로 쌓였다 —
-    마찰이 늘었는지 실수가 늘었는지 `metrics` 가 구분하지 못하게 된다.
-
-    **`..` 를 담은 이름 마디**만 거른다. 마디가 정확히 `..` 인 것은 상위 폴더라
-    진짜 경로다 (`../src/a.py` 는 그대로 판정된다). 이름 목록이 아니라 문법이라
-    늘려야 할 다음 항목이 없다 — `:` 를 거를 때와 같은 판단이다.
-    """
-    return any(".." in part and part != ".." for part in rel.split("/"))
-
-
-def bash_writes(cfg, root, cmd):
+def bash_writes(cfg, root, cmd, proven_only=False):
     """이 명령의 **변경 세그먼트**가 대상으로 삼는 경로들 (순서 보존).
 
     확실하지 않은 것은 넣지 않는다. 여기서 빠진 것을 바닥값이 놓치지는 않는다.
@@ -679,7 +732,7 @@ def bash_writes(cfg, root, cmd):
                     and not tok.startswith(("-", "<", ">", "&")):
                 args.append(tok)          # `k=v` 는 옵션이지 경로가 아니다
             k += 1
-        if reads_only:
+        if reads_only or proven_only:
             args = []
         elif head in BASH_TARGET_LAST:
             args = args[-1:]
