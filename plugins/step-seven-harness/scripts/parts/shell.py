@@ -26,8 +26,15 @@ CTRL_NAMES = ("harness", "harness.py")
 QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
 
 
+# `BASH_SPLIT` 이 `;`·`\n` 을 구분자로 **지우면서**, 그것을 이스케이프하던
+# 백슬래시가 세그먼트 끝에 홀로 남는다. `find … -exec echo {} \;` 와 줄 이어붙임
+# (`\` + 개행)이 그 모양이다. 쪼개면서 우리가 낸 상처이므로 우리가 되돌린다.
+# 이미 이스케이프된 백슬래시(`\\`)는 진짜 데이터라 건드리지 않는다.
+DANGLING_BS_RE = re.compile(r"(?<!\\)\\$")
+
+
 def sh_tokens(seg):
-    """셸 토큰으로 쪼갠다. **따옴표는 토크나이저가 처리한다.**
+    """셸 토큰으로 쪼갠다. **못 쪼개면 None** — 지어내지 않는다.
 
     예전에는 `QUOTED_RE.sub("_", seg)` 로 따옴표 구간을 `_` 로 뭉갰다. 목적은
     `--reason "a b"` 의 `b` 가 위치 인자로 오인되지 않게 하는 것이었는데, 같은
@@ -36,13 +43,34 @@ def sh_tokens(seg):
     게이트가 사라졌다** — 5차 리뷰가 찾았고 재현했다.
 
     근사를 고치지 않고 진짜 파서를 쓴다(`symtable` 때와 같은 판단). shlex 는
-    따옴표를 소비하고 `--reason "a b"` 를 한 토큰으로 준다. 따옴표가 안 맞으면
-    예외가 나므로, 그때는 옛 방식으로 떨어진다 — 판정을 아예 못 하는 것보다 낫다.
+    따옴표를 소비하고 `--reason "a b"` 를 한 토큰으로 준다.
+
+    그때 그 폴백을 **남겨 둔 것**이 다음 결함이었다. shlex 가 실패하면 같은
+    마스킹이 다시 돌았고, 이번에는 지우는 대신 **지어냈다**:
+    `"$HOME"/.claude/plugins` → `_/.claude/plugins` 라는 존재하지 않는 리포
+    경로가 만들어져 그 가짜 경로에 단계 규칙이 적용됐다. 사용자는 저장소 밖을
+    읽는 명령이 "신규 최상위 폴더를 만든다"로 거부되는 것을 봤다 — 차단보다
+    **사유가 틀린 것**이 비쌌다(현장 보고 §3·§4, tech-writer).
+
+    그리고 그 실패는 드문 일이 아니었다. `BASH_SPLIT` 이 `;` 로 먼저 쪼개므로
+    `find … \\;` 는 **매번** 이 경로로 떨어졌다.
+
+    이제 둘로 나눈다. 쪼개면서 우리가 만든 상처(끝에 남은 백슬래시)는 되돌려
+    다시 파싱하고, 그래도 안 되면 **None 을 준다.** 모르면 지어내는 것이 아니라
+    모른다고 말한다 — `bash_opaque`·`bash_unresolved` 와 같은 정책이고, 그 둘이
+    ask 로 받는다. 판정을 못 하는 것이 **틀린 판정보다 낫다.**
     """
     try:
         return shlex.split(seg)
     except ValueError:
-        return QUOTED_RE.sub("_", seg).split()
+        pass
+    repaired = DANGLING_BS_RE.sub("", seg)
+    if repaired != seg:
+        try:
+            return shlex.split(repaired)
+        except ValueError:
+            pass
+    return None
 
 
 BASH_READERS_DEFAULT = ("cat", "less", "more", "head", "tail", "grep", "rg", "wc",
@@ -292,13 +320,25 @@ def bash_unresolved(cfg, cmd):
             # `VAR=$(...)` 만 있는 세그먼트. 대입 자체는 아무것도 안 쓴다.
             continue
         head = os.path.basename(toks[i].strip("\"'"))
+        # **제어 판정에는 제대로 쪼갠 토큰을 준다.** 위의 `re.findall` 은 따옴표를
+        # 모르므로 `sh -c '<래퍼> status'` 의 인라인 코드가 `'<래퍼>` 에서 잘리고,
+        # 그러면 조회 명령 하나가 "읽지 못하는 코드"로 되물어진다. 예전에는 잘린
+        # 조각을 옛 폴백이 다시 뭉개서 우연히 통했다 — 근사가 근사를 가린 자리다.
+        ctrl_toks = sh_tokens(seg) or toks
+        j = 0
+        while j < len(ctrl_toks) and ASSIGN_RE.match(ctrl_toks[j]):
+            j += 1
         if (benign_head(cfg, "interpreters", head, BASH_INTERPRETERS_DEFAULT)
-                and INLINE_CODE_RE.search(seg) and not ctrl_exec_seg(toks[i:])):
+                and INLINE_CODE_RE.search(seg) and not ctrl_exec_seg(ctrl_toks[j:])):
             return t("인터프리터에 인라인으로 넘긴 코드는 하네스가 읽지 못한다")
         if not mut.search(seg.strip()):
             continue
         if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) and ">" not in seg:
             continue
+        # 쪼개지 못한 변경 세그먼트. `bash_writes` 는 여기서 아무 대상도 모으지
+        # 않으므로, 받아 주지 않으면 단계 규칙이 조용히 사라진다.
+        if sh_tokens(seg) is None:
+            return t("따옴표가 맞지 않아 이 명령을 토큰으로 쪼갤 수 없다")
         if EXPAND_RE.search(seg):
             return t("셸 확장이 섞여 무엇을 쓸지 실행 시점에야 정해진다")
     return None
@@ -314,7 +354,9 @@ def ctrl_exec_seg(toks, depth=0):
     if any(os.path.basename(x.strip("\"'")) in CTRL_NAMES for x in toks[:2]):
         return True
     code = _inline_code(toks) if depth < INLINE_DEPTH else None
-    return bool(code) and ctrl_exec_seg(sh_tokens(code), depth + 1)
+    inner = sh_tokens(code) if code else None
+    # 못 쪼개면 "하네스 실행이 아니다" — 이 면제를 확신 없이 주지 않는다.
+    return bool(inner) and ctrl_exec_seg(inner, depth + 1)
 
 
 def bash_opaque(cmd):
@@ -432,7 +474,14 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
         # `floor_named` 는 이미 "실행은 언급이 아니다" 를 알고 `_invocation` 으로
         # 가른다. 여기만 그것을 몰랐다. 안쪽에 같은 질문을 다시 던지면 답이 하나가
         # 된다 — 실행이면 지나가고, `sh -c 'rm <DB>'` 는 그대로 거절된다.
-        code = _inline_code(sh_tokens(seg)) if interp else None
+        parsed = sh_tokens(seg)
+        if interp and parsed is None:
+            # 인터프리터인데 쪼개지 못했다. 평평한 토큰으로 훑으면 인라인 코드
+            # **안**의 실행 대상이 변경 대상으로 읽힌다. 여기서 지어내지 않고
+            # 넘긴다 — 원문 감시(`floor_named`)와 `bash_unresolved` 가 뒤에서
+            # 같은 명령을 ask 로 받고, 그 둘은 **맞는 사유**를 말할 수 있다.
+            continue
+        code = _inline_code(parsed) if interp else None
         if code is not None:
             if depth < INLINE_DEPTH:
                 hit, uns = bash_protected_scan(cfg, root, code, depth + 1)
@@ -556,8 +605,25 @@ def _target(root, tok, sure):
             # 끈다. **콜론이 든 자리는 경로 문법이 아니다** — 이름 목록이 아니라
             # 문법이라 늘려야 할 다음 항목이 없다.
             if "/" in rel and not any(":" in part for part in rel.split("/")):
+                if _rev_range(rel):
+                    continue
                 return rel
     return None
+
+
+def _rev_range(rel):
+    """git 리비전 범위(`A..B`·`A...B`)인가. 경로가 아니다.
+
+    `git diff origin/main..HEAD > out` 이 "'origin/main..HEAD' 를 바꾼다"로
+    거부됐다(현장 보고 §4). `/` 가 있고 `:` 가 없으니 위의 경로 추측을 통과한
+    것이다. 그리고 그 오탐이 `stage_write` 차단 기록에 그대로 쌓였다 —
+    마찰이 늘었는지 실수가 늘었는지 `metrics` 가 구분하지 못하게 된다.
+
+    **`..` 를 담은 이름 마디**만 거른다. 마디가 정확히 `..` 인 것은 상위 폴더라
+    진짜 경로다 (`../src/a.py` 는 그대로 판정된다). 이름 목록이 아니라 문법이라
+    늘려야 할 다음 항목이 없다 — `:` 를 거를 때와 같은 판단이다.
+    """
+    return any(".." in part and part != ".." for part in rel.split("/"))
 
 
 def bash_writes(cfg, root, cmd):
@@ -573,6 +639,11 @@ def bash_writes(cfg, root, cmd):
 
     for seg in BASH_SPLIT.split(strip_quoted_heredocs(cmd).replace(">|", "> ")):
         toks = sh_tokens(seg)
+        if toks is None:
+            # 못 쪼갠 세그먼트에서는 **아무 대상도 수집하지 않는다.** 지어낸
+            # 경로에 규칙을 적용하는 것이 §3·§4 였다. 통과가 아니다 —
+            # `bash_unresolved` 가 같은 세그먼트를 ask 로 받는다.
+            continue
         # **정규화해서 넘긴다.** `mutator_pattern` 은 명령 **전체**에 대해 정의됐고
         # `(^|[;&|]\s*)` 로 앵커돼 있다. BASH_SPLIT 은 구분자를 지우므로 세그먼트 앞에
         # 공백이 남고, 그러면 `^` 가 안 맞아 `a && touch x` 의 touch 가 통째로 샜다.

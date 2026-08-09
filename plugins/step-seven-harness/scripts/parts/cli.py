@@ -264,12 +264,19 @@ def cli_verify(ctx, argv):
     # 돌리면 안 되는(또는 그 반대) 일이 생긴다.
     # 패턴이 없으면 검사를 건너뛰었다 — 그 순간 이 명령은 게이트를 지나는 **셸**이
     # 된다. 없으면 거부한다. 무엇이 검증인지 모르면 아무것도 돌리지 않는 것이 맞다.
-    if not cfg.at("criteria.verification_evidence.bash_pattern"):
-        raise Refuse(t("`criteria.verification_evidence.bash_pattern` 이 없다 — 무엇이 검증인지 "
-                       "정해지지 않았으므로 아무것도 실행하지 않는다."), code=2)
+    if not cfg.at("criteria.verification_evidence.bash_pattern") \
+            and not cfg.seq("criteria.verification_evidence.commands"):
+        raise Refuse(t("`criteria.verification_evidence` 에 bash_pattern 도 commands 도 없다 "
+                       "— 무엇이 검증인지 정해지지 않았으므로 아무것도 실행하지 않는다."), code=2)
     if not verification_hit(cfg, cmd):
+        # **막으면서 갈 곳을 준다.** 예전에는 여기서 끝이었고, 그러면 남은 길은
+        # 정규식을 넓히는 것뿐이었다 — 거절당한 쪽이 거절 기준을 고치게 된다.
         raise Refuse(t("검증 명령으로 보이지 않는다: %s") % cmd,
-                     t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."), code=2)
+                     t("이 자리는 검증을 돌리는 곳이다. 임의의 명령을 돌리는 곳이 아니다."),
+                     t("이 프로젝트의 러너가 표준이 아니면 `bash_pattern` 을 넓히지 말고 "
+                       "`criteria.verification_evidence.commands` 에 명령을 그대로 적어라 "
+                       "— 정규식이 아니라 목록이라 넓힐 여지가 없다."),
+                     code=2)
     # `CI=1 pytest` 의 앞 대입은 셸이라면 환경으로 넘겼을 것이다. 그대로 exec 에
     # 주면 "CI=1 이라는 프로그램이 없다" 로 죽는다 — 판정(`verification_hit`)이
     # 통과시킨 명령은 실행도 같은 뜻으로 해야 한다.
@@ -298,13 +305,23 @@ def cli_verify(ctx, argv):
 
 
 def cli_allow(ctx, argv):
-    con, cfg, lid = ctx.con, ctx.cfg, ctx.lid
+    con, cfg, root, lid = ctx.con, ctx.cfg, ctx.root, ctx.lid
     pos = argv_positional(argv)
     glob = pos[0] if pos else None
     reason = argv_value(argv, "reason")
     uses = argv_value(argv, "uses")
     if not glob or not reason:
         raise Refuse(t("사용법: harness allow <glob> --reason \"...\" [--uses N]"), code=2)
+    # **열지 못하는 예외는 등록하지 않는다.** 성공을 출력하고도 다음 쓰기가 같은
+    # 메시지로 막히면, 사용자는 승인을 받고도 막다른 길에 선다 (현장 보고 §1).
+    probe = rel_to_root(root, glob) or glob.lstrip("./")
+    name, blocked = grant_blind_block(ctx, probe)
+    if blocked:
+        raise Refuse(
+            t("이 예외는 그 차단을 열지 못한다 — 등록하지 않았다."),
+            t("'%s' 는 예외로 열리지 않는 규칙(%s)에 걸린다:") % (probe, name),
+            "  " + blocked,
+            code=2)
     with con:
         grant_write(con, lid, glob, reason, int(uses) if uses else 3)
     # 예전에는 무조건 "사용자 승인" 이라고 적었다. `consent.allow` 를 빼면 아무도

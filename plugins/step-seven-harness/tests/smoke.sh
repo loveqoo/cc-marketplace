@@ -102,6 +102,15 @@ import harness as h
 print(len(h.GATES) * 2)' 2>/dev/null || echo 0)"
 [ "${SF_MIN:-0}" -ge 2 ] || { echo "탐침 하한을 엔진에서 세지 못했다"; exit 1; }
 
+# 기본 쓰기 규칙 개수도 **템플릿에서 세어 온다.** 파일에 박으면 규칙이 늘 때마다
+# 사람이 기대값을 고치게 되고, 그 습관이 진짜 회귀도 함께 고친다 — SF_MIN 과 같은
+# 이유다(규칙 하나를 더하자 네 자리가 한꺼번에 빨개졌다).
+NRULES="$(python3 -c '
+import json, os, sys
+p = os.path.join(os.path.dirname(os.environ["ENGINE_PATH"]), "..", "templates", "stages.json")
+print(len(json.load(open(p, encoding="utf-8"))["write_rules"]))' 2>/dev/null || echo 0)"
+[ "${NRULES:-0}" -ge 1 ] || { echo "쓰기 규칙 개수를 템플릿에서 세지 못했다"; exit 1; }
+
 check_selftest() { # <label> <기대-실패수> <status 출력>
   local OUT
   OUT="$(printf '%s' "$3" | SF_WANT="$2" SF_MIN="$SF_MIN" python3 -c '
@@ -270,7 +279,12 @@ check "래퍼 쓰기 차단" '하네스 자신은 수정할 수 없다' \
   "$(hook "$(W .claude/harness/bin/harness)")"
 check "DB 쓰기 차단 (손상시키면 게이트가 꺼진다)" '하네스 자신은 수정할 수 없다' \
   "$(hook "$(W .claude/harness/harness.db)")"
-cli allow '.claude/harness/bin/**' --reason '엔진 수정 시도' >/dev/null
+# 열지 못하는 예외는 **등록 자체가 거절된다.** 예전에는 성공을 출력하고도 다음
+# 쓰기가 그대로 막혔고, 소모되지 않은 예외만 DB 에 남았다 (현장 보고 §1).
+check "바닥값에는 예외를 등록조차 못 한다" '이 예외는 그 차단을 열지 못한다' \
+  "$(cli allow '.claude/harness/bin/**' --reason '엔진 수정 시도' 2>&1 || true)"
+check "거절 사유로 그 차단의 메시지를 그대로 보여준다" '하네스 자신은 수정할 수 없다' \
+  "$(cli allow '.claude/harness/bin/**' --reason '엔진 수정 시도' 2>&1 || true)"
 check "예외 등록으로도 열리지 않는다" '하네스 자신은 수정할 수 없다' \
   "$(hook "$(W .claude/harness/bin/harness.py)")"
 
@@ -2625,7 +2639,7 @@ EPLUG="$( (cd "$EW" && python3 "$ENGINE" advance 2>&1) || true )"
 EWRAP="$( (cd "$EW" && .claude/harness/bin/harness advance 2>&1) || true )"
 check "플러그인 엔진이 도움말을 안다" 'harness loop intent' "$EPLUG"
 check "래퍼도 같은 도움말을 낸다" 'harness loop intent' "$EWRAP"
-check "래퍼도 쓰기 규칙 7개를 안다" '^7$' \
+check "래퍼도 쓰기 규칙 $NRULES 개를 안다" "^$NRULES\$" \
   "$(cd "$EW" && python3 -c "
 import sys, os
 sys.path.insert(0, '.claude/harness/bin')
@@ -3272,7 +3286,7 @@ echo "== 강제되는 것을 숫자로 보여준다 (예측이 아니라 결과)
 EF="$(mktemp -d)"
 (cd "$EF" && git init -q . && python3 "$ENGINE" init >/dev/null)
 ef() { (cd "$EF" && python3 "$ENGINE" "$@"); }
-check "정상 상태를 숫자로 보여준다" '보호 경로 7 .*쓰기 규칙 7/7' "$(ef status 2>&1)"
+check "정상 상태를 숫자로 보여준다" "보호 경로 7 .*쓰기 규칙 $NRULES/$NRULES" "$(ef status 2>&1)"
 check "게이트 있는 단계 수를 보여준다" '종료 조건 4/7' "$(ef status 2>&1)"
 python3 -c "
 import json, sys
@@ -3319,7 +3333,7 @@ for r in cfg['write_rules']:
     r['when'] = {'class': 'nonexistent_class'}
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$EF2/.claude/harness/stages.json"
-check "죽은 규칙은 발동 가능 0 으로 보인다" '쓰기 규칙 0/7' "$(ef2 status 2>&1)"
+check "죽은 규칙은 발동 가능 0 으로 보인다" "쓰기 규칙 0/$NRULES" "$(ef2 status 2>&1)"
 check "모르는 class 를 지적한다" "path_classes 에 없다" "$(ef2 status 2>&1)"
 check "가능한 class 를 알려준다" 'context/dev/docs/source/tests' "$(ef2 status 2>&1)"
 check_empty "실제로 아무것도 막지 못한다" \
@@ -3334,7 +3348,7 @@ cfg['write_rules'] = json.load(open(sys.argv[2], encoding='utf-8'))['write_rules
 cfg['write_rules'][4]['require'] = {}
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$EF2/.claude/harness/stages.json" "$EF2/.claude/harness/bin/defaults.json"
-check "판정이 없는 규칙도 발동 불가로 센다" '쓰기 규칙 6/7' "$(ef2 status 2>&1)"
+check "판정이 없는 규칙도 발동 불가로 센다" "쓰기 규칙 $((NRULES - 1))/$NRULES" "$(ef2 status 2>&1)"
 rm -rf "$EF2"
 
 echo "  -- 검증 패턴은 탐침으로 본다 (텍스트를 읽지 않는다)"
@@ -3617,6 +3631,188 @@ json.dump(c, open(p, "w"), ensure_ascii=False)
 PY
 check "프리셋의 없는 종료 조건을 진단한다" 'criteria 에 없다' "$(rp status 2>&1)"
 rm -rf "$RP"
+
+# ---------------------------------------------------------------------------
+# 현장 보고 (tech-writer, 0.69.0)
+#
+# **일하는 명령**을 훅에 먹인다. 여기까지의 코퍼스는 전부 "어떻게 뚫나" 에서
+# 나왔고, 그래서 잘 만들어진 공격 문자열뿐이었다. 조사할 때 쓰는 평범한 관용구는
+# 하나도 없었다 — `find … \;` 는 스모크에 두 번 나오는데 훅에 먹인 것은 하필
+# `+` 변종이었고, 버그가 있는 갈래만 정확히 비껴갔다.
+#
+# 명령은 보고서에 적힌 **원문 그대로** 둔다. 다듬으면 그 사람이 실제로 친 것이
+# 아니게 되고, 다시 겪어야 알게 된다.
+# ---------------------------------------------------------------------------
+echo "== 현장 보고 — 일하는 명령이 과잉 차단되지 않는다"
+FR="$(mktemp -d)"
+(cd "$FR" && git init -q . && python3 "$ENGINE" init >/dev/null)
+mkdir -p "$FR/src" "$FR/.dev/plan" && touch "$FR/src/a.py"
+
+# 따옴표·백슬래시를 파이썬이 JSON 으로 감싼다 — 셸에서 두 번 이스케이프하면
+# 시험하려는 문자열 자체가 달라진다(그 실수가 이 버그를 숨긴 이유이기도 하다).
+frhook() { # frhook <도구> <키> <값>
+  FRD="$FR" python3 -c '
+import json, os, sys
+print(json.dumps({"hook_event_name": "PreToolUse", "cwd": os.environ["FRD"],
+                  "tool_name": sys.argv[1],
+                  "tool_input": {sys.argv[2]: sys.argv[3]}}))' "$1" "$2" "$3" \
+  | CLAUDE_PROJECT_DIR="$FR" python3 "$ENGINE" hook
+}
+frb() { frhook Bash command "$1"; }
+
+echo "  -- §3·§4 저장소 밖을 읽는 명령이 '리포 경로를 바꾼다' 가 되지 않는다"
+# `BASH_SPLIT` 이 `;` 로 먼저 쪼개면 세그먼트 끝에 백슬래시가 홀로 남고, shlex 가
+# 거기서 죽으면 옛 폴백이 `"$HOME"` 을 `_` 로 뭉갰다. 그 `_/…` 가 저장소 상대
+# 경로로 판정돼 단계 규칙이 걸렸다 — 차단보다 **사유가 틀린 것**이 비쌌다.
+FR1="$(frb 'find "$HOME"/.claude/plugins/marketplaces -maxdepth 1 -name "cc-marketplace" -exec echo {} \;')"
+check_absent "지어낸 '_/' 경로가 나오지 않는다" '_/' "$FR1"
+check_absent "저장소 밖 읽기를 deny 하지 않는다" '"deny"' "$FR1"
+check "모르면 묻는다 — 사유는 find 다" 'find 가' "$FR1"
+FR2="$(frb 'find "$HOME"/.claude -name "*.json" -exec grep -l x {} \;')"
+check_absent "-exec grep 도 지어내지 않는다" '_/' "$FR2"
+check_absent "-exec grep 을 deny 하지 않는다" '"deny"' "$FR2"
+# 세그먼트 끝 백슬래시는 `\;` 만의 일이 아니다 — 줄 이어붙임도 같은 모양이다.
+check_absent "줄 이어붙임도 지어내지 않는다" '_/' \
+  "$(frb 'cp "$HOME/a.txt" /tmp/b.txt \
+  && echo done')"
+
+echo "  -- §4 git 리비전 범위는 경로가 아니다"
+check_empty "A..B 는 쓰기 대상이 아니다" \
+  "$(frb 'git diff origin/main..HEAD > /tmp/x.diff')"
+check_empty "A...B 도 마찬가지" \
+  "$(frb 'git log origin/main...HEAD --oneline > /tmp/y.txt')"
+# 상위 폴더(`..`)는 진짜 경로다 — 문법으로 가르므로 이 구분이 유지돼야 한다.
+check "상위 폴더는 여전히 경로로 본다" 'a.py' "$(frb 'touch ../a.py; touch src/a.py')"
+
+echo "  -- §3·§4 회귀: 해석하지 못하는 것은 여전히 묻는다"
+check "따옴표가 안 맞는 변경 명령은 묻는다" '쪼갤 수 없다' "$(frb 'touch "src/a.py')"
+check "셸 확장이 섞이면 묻는다" '실행 시점' "$(frb 'mkdir "$HOME/.cache/x"')"
+check "인터프리터 인라인 코드는 묻는다" '읽지 못한다' \
+  "$(frb 'python3 -c "open(\"src/a.py\",\"w\")"')"
+check "find -exec rm 은 바닥값에서 막힌다" '하네스 자신' \
+  "$(frb "find .claude/harness -name '*.py' -exec rm {} +")"
+
+echo "  -- §5 하네스 자신을 **읽는 것**은 막지 않는다 (보고서가 지키라고 한 쪽)"
+check_empty "ls -la 는 통과한다" "$(frb 'ls -la .claude/harness/')"
+check_empty "stat 도 통과한다" "$(frb 'stat .claude/harness/harness.db')"
+# 쪼개서 읽는 것은 '통과'가 아니라 **ask** 였다. 하네스는 잡았고, 실제로 통과한
+# 것은 그 환경의 권한 모드였다 — 계약을 여기 못 박아 둔다.
+check "쪼갠 경로로 읽어도 묻기는 한다" '"ask"' \
+  "$(frb 'python3 -c "import json; d=json.load(open(\".claude/harn\"+\"ess/stages.json\")); print(1)"')"
+
+echo "  -- §2 남의 작업 기록과 새 파일은 **다른 말**을 듣는다"
+printf 'old\n' > "$FR/.dev/plan/260101-0888de-1-other-task-note.md"
+FRE="$(frhook Edit file_path '.dev/plan/260101-0888de-1-other-task-note.md')"
+check "다른 작업의 기록이라고 말한다" '다른 작업(260101-0888de)' "$FRE"
+check "새 파일로 쓰라고 안내한다" '새 파일' "$FRE"
+check_absent "접두사를 덧붙인 이름을 제안하지 않는다" '1-260101-0888de-1-' "$FRE"
+FRN="$(frhook Write file_path '.dev/plan/014-new-thing.md')"
+check "새 파일에는 이름만 고치라고 한다" '대신' "$FRN"
+check_absent "새 파일을 남의 기록으로 오해하지 않는다" '다른 작업' "$FRN"
+
+echo "  -- §1 열지 못하는 예외는 등록되지 않는다"
+FRA="$( (cd "$FR" && python3 "$ENGINE" allow '.dev/plan/260101-0888de-1-other-task-note.md' \
+        --reason '앞 작업 기록 정정' --uses 1 2>&1) || true )"
+check "거짓 성공 대신 거절한다" '열지 못한다' "$FRA"
+check_absent "성공했다고 말하지 않는다" '예외 등록' "$FRA"
+check "소모되지 않은 예외가 남지 않는다" '^0$' \
+  "$(python3 -c "
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(len(list(c.execute('select 1 from wgrant'))))" "$FR/.claude/harness/harness.db")"
+
+echo "  -- §6 비표준 러너는 정규식을 넓히지 않고 선언한다"
+# 이 저장소의 러너는 직접 만든 셸 스크립트다. 표준 러너 목록과 겹치는 것이 하나도
+# 없어서 무엇을 돌려도 증거가 안 잡혔고, help 가 안내하는 탈출구(`verify --`)마저
+# **같은 정규식으로 다시** 걸러서 실제로는 존재하지 않는 탈출구였다. 그래서 막힌
+# 에이전트가 한 일은 하나뿐이었다 — 거절 기준을 넓혀서 통과했다.
+V6="$(mktemp -d)"
+mkdir -p "$V6/tests"
+(cd "$V6" && git init -q . && python3 "$ENGINE" init >/dev/null)
+printf '#!/bin/sh\necho green\nexit 0\n' > "$V6/tests/run.sh"
+v6() { (cd "$V6" && python3 "$ENGINE" "$@" 2>&1) || true; }
+v6set() { # v6set <json-경로> <값(JSON)>
+  python3 -c "
+import json, sys
+p = sys.argv[1] + '/.claude/harness/stages.json'
+c = json.load(open(p, encoding='utf-8'))
+c['criteria']['verification_evidence'][sys.argv[2]] = json.loads(sys.argv[3])
+json.dump(c, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)" "$V6" "$1" "$2"
+}
+# Execution 까지 올린다 — verify 는 거기서만 쓴다.
+v6 loop intent "러너 선언" >/dev/null
+v6 loop done-when "verify 통과" >/dev/null
+v6 advance >/dev/null
+V6PFX="$( (cd "$V6" && python3 "$ENGINE" status --json) | jq1 prefix | tr -d '"')"
+mkdir -p "$V6/.dev/plan" && printf '# 계획\n' > "$V6/.dev/plan/${V6PFX}plan.md"
+v6 skip until:execution --reason '시험' >/dev/null
+check "Execution 까지 왔다" '^"execution"$' "$( (cd "$V6" && python3 "$ENGINE" status --json) | jq1 stage)"
+
+V6A="$(v6 verify -- bash tests/run.sh)"
+check "선언 전에는 거부한다" '검증 명령으로 보이지 않는다' "$V6A"
+# **막으면서 갈 곳을 준다.** 이 한 줄이 없어서 남은 길이 정규식뿐이었다.
+check "정규식 말고 commands 로 가라고 말한다" 'commands' "$V6A"
+check "정규식을 넓히지 말라고 못 박는다" '넓히지 말고' "$V6A"
+
+v6set commands '["bash tests/run.sh"]'
+V6B="$(v6 verify -- bash tests/run.sh)"
+check "선언하면 하네스가 직접 돌린다" 'green' "$V6B"
+check "통과하면 증거가 된다" '증거로 기록했다' "$V6B"
+check "정규식은 그대로다" '^0$' \
+  "$(python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1] + '/.claude/harness/stages.json', encoding='utf-8'))
+b = json.load(open(sys.argv[1] + '/.claude/harness/bin/defaults.json', encoding='utf-8'))
+k = 'bash_pattern'
+print(0 if a['criteria']['verification_evidence'][k]
+      == b['criteria']['verification_evidence'][k] else 1)" "$V6")"
+# 목록이라 넓힐 여지가 없다 — 그 성질을 단정으로 남긴다.
+check "선언은 접두 위장을 인정하지 않는다" '검증 명령으로 보이지 않는다' \
+  "$(v6 verify -- bash tests/run.sh-evil)"
+check "선언은 다른 명령을 인정하지 않는다" '검증 명령으로 보이지 않는다' \
+  "$(v6 verify -- rm -rf /tmp/x)"
+check "선언과 무관한 명령은 인정하지 않는다" '검증 명령으로 보이지 않는다' \
+  "$(v6 verify -- echo hi)"
+# 선언을 더했다고 원래 알던 것을 잃지 않는다. (pytest 가 없는 환경이면 실행에서
+# 실패하는데, 그건 **판정을 지났다는 증거**다 — 판정이 막았으면 여기 못 온다.)
+check_absent "선언이 있어도 표준 러너는 그대로 인정된다" '검증 명령으로 보이지 않는다' \
+  "$(v6 verify -- pytest tests/)"
+check "metrics 가 무엇을 인정하는지 보여준다" 'bash tests/run.sh' "$(v6 metrics)"
+
+echo "  -- §6 정규식을 넓히면 그 사실이 남는다 (잠그지 않는다 — 보이게 한다)"
+v6set commands '[]'
+python3 -c "
+import json, sys
+p = sys.argv[1] + '/.claude/harness/stages.json'
+c = json.load(open(p, encoding='utf-8'))
+ve = c['criteria']['verification_evidence']
+ve['bash_pattern'] = ve['bash_pattern'] + r'|(bash\s+)?(\./)?tests/run\.sh\b'
+json.dump(c, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)" "$V6"
+check "넓힌 정규식은 실제로 통과시킨다 (사실은 사실대로)" '증거로 기록했다' \
+  "$(v6 verify -- bash tests/run.sh)"
+V6C="$(v6 status)"
+check "status 가 기준이 달라졌다고 말한다" 'bash_pattern 이 기본값과 다르다' "$V6C"
+check "기본값을 품은 채 늘었다는 것까지 말한다" '품은 채 늘었다' "$V6C"
+check "metrics 도 같은 사실을 말한다" '기본값에서 달라졌다' "$(v6 metrics)"
+# 막지는 않는다 — 잠그기로 한 것이 아니다.
+check_absent "넓혔다고 차단하지는 않는다" 'Refuse' "$V6C"
+rm -rf "$V6"
+
+echo "  -- §7 이미 무시되는 경로에 다시 붙이지 않는다"
+FG="$(mktemp -d)"
+(cd "$FG" && git init -q .)
+# 현장과 같은 모양 — 폴더를 통째로 막고 규칙 파일만 `!` 로 되살린다.
+printf '!.claude/harness/\n.claude/harness/*\n!.claude/harness/POLICY.md\n' > "$FG/.gitignore"
+(cd "$FG" && python3 "$ENGINE" init >/dev/null 2>&1)
+check "git 이 이미 무시하면 한 줄도 안 붙는다" '^3$' "$(wc -l < "$FG/.gitignore" | tr -d ' ')"
+(cd "$FG" && python3 "$ENGINE" init >/dev/null 2>&1)
+check "두 번째 init 도 조용하다" '^3$' "$(wc -l < "$FG/.gitignore" | tr -d ' ')"
+rm -rf "$FG"
+# 회귀: 무시 규칙이 없는 저장소에는 여전히 붙는다
+FG2="$(mktemp -d)"
+(cd "$FG2" && git init -q . && python3 "$ENGINE" init >/dev/null 2>&1)
+check "규칙이 없으면 붙인다" '[1-9]' "$(grep -c 'harness.db' "$FG2/.gitignore")"
+rm -rf "$FG2" "$FR"
 
 echo "== 손상 내성 (fail-open 은 종료 코드까지 포함한다)"
 echo 'not a database' > "$WORK/.claude/harness/harness.db"

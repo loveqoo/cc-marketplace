@@ -64,7 +64,9 @@ def plan_preview(root, cmd):
     **파일 이름만** 보여주고 있었다. 읽지 않고 찍는 도장은 마찰만 있고 정보가 없다 —
     그렇게 남은 `plan_approved` 기록은 가짜다. 무엇을 승인하는지 보여준다.
     """
-    pos = [it for it in sh_tokens(cmd) if not it.startswith("--")]
+    # 표시용이다. 못 쪼개면 거친 분해로도 계획 파일을 찾아본다 — 여기서 판정하는
+    # 것은 없으므로 근사가 해롭지 않다.
+    pos = [it for it in (sh_tokens(cmd) or cmd.split()) if not it.startswith("--")]
     path = None
     for i, it in enumerate(pos):
         if it == "approve-plan" and i + 1 < len(pos):
@@ -427,6 +429,14 @@ def metrics_report(ctx):
         "survival": _survival(con, cfg),
         "buckets": buckets,
         "verdict": trend_verdict(avgs),
+        # **판정 기준 자신도 재는 대상이다.** 다른 셋은 하네스가 무엇을 잡았나를
+        # 재는데, 이것은 "무엇을 잡기로 했는가" 가 움직였나를 잰다.
+        "evidence": {
+            "commands": [c for c in cfg.seq("criteria.verification_evidence.commands")
+                         if isinstance(c, str) and c.strip()],
+            "drift": _evidence_widened(
+                cfg, (default_cfg(ctx.root) or {}).get("criteria") or {}),
+        },
     }
 
 
@@ -474,6 +484,21 @@ def render_metrics(d):
                   % (t("%d-%d회") % (b["from"], b["to"]), b["fails"], b["refails"],
                      _pct(b["refails"], b["fails"]).strip()))
         print(t("  '이전에도 실패한 것' = 그 회차 시작 전에 이미 같은 명령이 실패한 적 있음."))
+
+    print(t("\n④ 판정 기준 — 무엇을 '검증' 으로 인정하나"))
+    ev = d.get("evidence") or {}
+    if ev.get("commands"):
+        print(t("  이 프로젝트가 선언한 검증 명령 %d개:") % len(ev["commands"]))
+        for c in ev["commands"]:
+            print("    %s" % c)
+    else:
+        print(t("  선언한 명령 없음 — 표준 러너 패턴만으로 판정한다."))
+    if ev.get("drift"):
+        # 잠그지 않기로 했으므로, 남는 것은 이 한 줄이다. 조용하면 없는 것과 같다.
+        print(t("  ⚠ 표준 러너 패턴이 기본값에서 달라졌다 — 거절 기준을 거절당한 쪽이 "
+                "고쳤을 수 있다. status 가 자세히 말한다."))
+    else:
+        print(t("  표준 러너 패턴은 기본값 그대로."))
 
     print(t("\n측정하지 못하는 것: 결과물의 품질, 그 회차가 필요했는지, 사람이 아낀 시간."))
     print(t("점수를 만들지 않는 이유: 하나로 합치면 그 하나를 최적화하게 된다."))

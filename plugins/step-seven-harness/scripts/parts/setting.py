@@ -51,6 +51,16 @@ def consent_map(cfg):
     return {k: t(v) for k, v in m.items() if isinstance(v, str)} if m else {}
 
 
+def default_cfg(root):
+    """**기본값 설정.** 플러그인 템플릿이 먼저고, 사본으로 실행 중이면 엔진 옆의 것.
+
+    두 곳에서 같은 두 줄을 적고 있었다. 대조하는 자리가 늘 때마다 그 두 줄이
+    갈릴 여지가 생긴다 — 갈리면 한쪽만 표류를 못 본다.
+    """
+    return (jload(os.path.join(plugin_root(), "templates", "stages.json"))
+            or jload(os.path.join(root, DEFAULTS_REL)))
+
+
 def drift_problems(cfg, root):
     """**내장 조건의 판정 방식이 기본값에서 바뀐 것**을 알린다.
 
@@ -63,8 +73,7 @@ def drift_problems(cfg, root):
     대신 **기본값과 대조해 달라진 것을 말한다.** 사용자가 정의한 조건은 기본값에
     없으므로 아무것도 말하지 않는다(오진 없음).
     """
-    tpl = jload(os.path.join(plugin_root(), "templates", "stages.json")) \
-        or jload(os.path.join(root, DEFAULTS_REL))
+    tpl = default_cfg(root)
     if not isinstance(tpl, dict):
         return []
     base = tpl.get("criteria") or {}
@@ -86,8 +95,32 @@ def drift_problems(cfg, root):
                 and "**" not in (want.get("write_glob") or []):
             out.append(t("criteria.%s.write_glob 이 '**' 로 넓어졌다 — 이 회차 "
                          "접두사가 붙은 **아무 파일이나** 이 조건을 채운다") % name)
+    out += _evidence_widened(cfg, base)
     out += _rules_dropped(cfg, tpl)
     return out
+
+
+def _evidence_widened(cfg, base):
+    """**무엇이 검증인가의 기준**이 기본값에서 달라진 것.
+
+    거절당한 쪽이 거절 기준을 고칠 수 있으면 게이트가 아니다. 그런데 잠그는
+    대신 **보이게** 하기로 했다 — 잠그면 "stages.json 은 고칠 수 있다"는 약속과
+    충돌하고, 프리셋 게이트는 관찰한 뒤에 올리는 것이 이 저장소의 방식이다.
+
+    막지 않는다. 넓혔다는 **사실**만 말한다. 그 사실이 status 맨 위와 `metrics`
+    ④에 남으므로, "막혔다 → 기준을 넓혔다" 가 조용히 지나가지 않는다.
+    """
+    want = (base.get("verification_evidence") or {}).get("bash_pattern")
+    have = cfg.at("criteria.verification_evidence.bash_pattern")
+    if not want or not have or want == have:
+        return []
+    grew = len(have) > len(want) and want in have
+    return [t("criteria.verification_evidence.bash_pattern 이 기본값과 다르다 "
+              "(%d자 → %d자%s) — **무엇이 검증인가**의 기준 자체가 달라졌다. "
+              "이 프로젝트의 러너를 알리려는 것이면 정규식을 넓히는 대신 "
+              "`criteria.verification_evidence.commands` 에 명령을 그대로 적어라. "
+              "의도한 것이면 그대로 두어라.")
+            % (len(want), len(have), t(", 기본값을 품은 채 늘었다") if grew else "")]
 
 
 def _rules_dropped(cfg, tpl):

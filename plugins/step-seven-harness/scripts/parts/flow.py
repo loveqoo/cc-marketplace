@@ -345,6 +345,39 @@ def file_prefix(con, lid):
     return "%s-%d-" % (lid, cycle_of(con, lid))
 
 
+# 산출물 이름 앞의 작업 표식 — `<yymmdd-해시6>-<회차>-` (`new_loop_id` 참고).
+LOOP_MARK_RE = re.compile(r"^(\d{6}-[0-9a-f]{6})-\d+-")
+
+
+def record_owner(basename):
+    """이 파일 이름은 **어느 작업**의 것인가. 표식이 없으면 None."""
+    m = LOOP_MARK_RE.match(basename)
+    return m.group(1) if m else None
+
+
+def foreign_loop_record(w):
+    """다른 작업이 남긴 기록을 고치려 하나 (`write_rules` 의 predicate).
+
+    이 자리가 없을 때 `loop_prefix` 하나가 두 상황을 같은 메시지로 처리했다.
+    **새 파일**을 만들 때는 그 메시지가 맞다 — 이름만 고치면 된다. 그런데
+    닫힌 앞 작업이 남긴 **기존 파일**을 고칠 때도 같은 말을 해서, 접두사를
+    덧붙인 이름을 제안했다:
+
+        '260809-a1e76b-1-260809-0888de-1-harness-post-upgrade-check.md' 로 써라
+
+    아무도 원하지 않는 이름이고, 시키는 대로 하면 남의 문서의 **복사본**이
+    하나 더 생긴다(현장 보고 §2). 막는 것은 옳다 — 틀린 것은 **무엇을 하라고
+    말하는가**였다. 두 상황을 가르면 각자 맞는 말을 할 수 있다.
+    """
+    if not os.path.exists(os.path.join(w.ctx.root, w.rel)):
+        return False                    # 새 파일이다 — 이름만 고치면 된다
+    owner = record_owner(w.parts[-1])
+    return bool(owner) and owner != w.ctx.lid
+
+
+WRITE_PREDICATES["foreign_loop_record"] = foreign_loop_record
+
+
 def evidence_digest(root, item):
     """이 증거가 가리키는 **파일의 지문.** 파일이 아니면 None.
 
@@ -719,13 +752,35 @@ def verification_hit(cfg, cmd):
     데이터이므로 지우고, 읽기 명령(`bash.readers`)은 아무것도 실행하지 않으므로 건너뛴다.
     `sh -c "npm test"` 도 이제 증거가 아니다 — 게이트가 잘못 열리는 것보다 `harness
     verify` 를 한 번 더 치는 편이 낫다.
+
+    ## 두 자리 — 표준 러너의 **패턴**과 이 프로젝트의 **명령**
+
+    `bash_pattern` 은 세상의 표준 러너 목록이다. 그런데 러너가 직접 만든 셸
+    스크립트(`bash tests/run.sh`)면 겹치는 것이 하나도 없어서, 무엇을 돌려도
+    증거가 안 잡히고 Verification 이 매번 스킵으로만 지나갔다. 그리고 `help` 가
+    안내하는 탈출구(`harness verify -- <명령>`)마저 **같은 정규식으로 다시**
+    걸러서, 실제로는 존재하지 않는 탈출구였다.
+
+    그래서 막힌 에이전트가 한 일은 하나뿐이었다 — **정규식을 넓혔다.** 거절당한
+    쪽이 거절 기준을 고쳐서 통과했고, 통과했으므로 초록이 됐다(현장 보고 §6,
+    tech-writer). 구조가 그것 말고 다른 선택지를 주지 않았다.
+
+    `commands` 는 그 다른 선택지다. **정규식이 아니라 명령 목록**이라 넓힐
+    여지가 없다 — 한 줄로 세상의 절반을 인정하게 만들 수 없고, 무엇을 인정했는지
+    사람이 그대로 읽을 수 있다. 잠그지는 않는다(그건 별개의 결정이다). 다만
+    `drift_problems` 와 `metrics` 가 **정규식이 기본값에서 달라진 사실**을
+    말하므로, 넓히는 길을 고르면 그 사실이 남는다.
     """
     pat = cfg.at("criteria.verification_evidence.bash_pattern")
-    if not pat:
-        return False
-    try:
-        vre = re.compile(pat)
-    except re.error:
+    decl = [c.strip() for c in cfg.seq("criteria.verification_evidence.commands")
+            if isinstance(c, str) and c.strip()]
+    vre = None
+    if pat:
+        try:
+            vre = re.compile(pat)
+        except re.error:
+            vre = None
+    if vre is None and not decl:
         return False
     readers = tuple(cfg.seq("bash.readers", BASH_READERS_DEFAULT)) + ("echo", "printf")
     for seg in BASH_SPLIT.split(cmd):
@@ -753,7 +808,12 @@ def verification_hit(cfg, cmd):
         # `false npm test`, `sleep 0 npm test` 도 같았다. 무해한 머리 이름을 목록으로
         # 모으는 것은 끝이 없다(`time`·`env`·`nice` 는 정상이다). 대신 패턴이
         # **프로그램 자리**를 가리키게 한다 — 그것이 패턴의 원래 뜻이다.
-        if vre.match(bare):
+        # 선언한 명령은 **머리부터 그대로** 맞아야 한다. 토큰 경계까지 보므로
+        # `bash tests/run.sh` 선언이 `bash tests/run.sh-evil` 을 인정하지 않는다.
+        # 뒤에 붙는 인자(`--verbose`)는 같은 러너를 돌리는 것이라 허용한다.
+        if any(bare == c or bare.startswith(c + " ") for c in decl):
+            return True
+        if vre is not None and vre.match(bare):
             return True
     return False
 

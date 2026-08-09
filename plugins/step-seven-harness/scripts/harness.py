@@ -772,6 +772,7 @@ def _w_fields(w, req):
         "subdir": w.parts[1] if len(w.parts) > 1 else "",
         "prefix": file_prefix(w.ctx.con, w.ctx.lid),
         "top": new_toplevel_dir(w.ctx.root, w.rel) or "",
+        "owner": record_owner(w.parts[-1]) or "",
     }
     if req.get("class_in_stage_write"):
         f["allowed"] = ", ".join(w.stage.get("write") or []) or t("(없음)")
@@ -875,6 +876,33 @@ def check_write(ctx, rel):
                 record_event(ctx.con, ctx.lid, ctx.sid, "block", name, rel, reason)
                 return "deny", reason
     return None, None
+
+
+def grant_blind_block(ctx, rel):
+    """**예외를 걸어도** 남는 차단. `(규칙 id, 사유)` 또는 `(None, None)`.
+
+    `allow` 는 등록에 성공했다고 출력하고도 그 차단을 열지 못했다. 예외는
+    `grant_opens` 를 단 규칙만 비켜 가는데(`_first_violation`), `loop_prefix`
+    같은 이름 규칙에는 그 표시가 없기 때문이다. 사용자는 "승인까지 받았는데 왜
+    안 되지"에서 멈췄고, 소모되지 않은 예외만 DB 에 남았다(현장 보고 §1).
+
+    막는 설계 자체는 옳다 — 기록을 나중에 안 것으로 덮어쓰면 "무엇을 언제
+    알았는가"가 사라진다. 틀린 것은 **막는 방식이 아니라 안내 방식**이다.
+    그래서 판정을 등록 시점으로 당긴다. 예외가 있다고 **가정하고** 한 번 물어
+    보면, 열 수 없는 예외는 등록되기 전에 거절된다.
+    """
+    aliased = floor_hit(ctx.root, rel)
+    if aliased:
+        return "self_lock", t(SELF_LOCK_MSG) % aliased
+    # **글롭은 이름 규칙으로 판정하지 않는다.** `docs/spec/**` 의 마지막 마디를
+    # 파일명으로 읽으면 `NNN-name.md` 가 아니라서 정상적인 예외까지 거절된다.
+    # 확실할 때만 거절한다 — 모르면 등록시킨다. 과잉 차단은 마찰이고, 마찰은
+    # 게이트를 끄게 만든다.
+    if any(ch in rel for ch in "*?["):
+        return None, None
+    w = WriteReq(ctx, rel)
+    w.grant = {"id": -1}          # 예외가 걸린 셈 치고 판정한다
+    return _first_violation(w, write_rules(ctx.cfg))
 
 
 # 이 프로그램들에 넘긴 경로는 '실행 대상'이다. 하네스 래퍼를 python3 로 돌리는 것은

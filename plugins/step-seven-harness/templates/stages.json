@@ -116,6 +116,19 @@
       "deny": ".dev/ 하위 폴더는 {allowed} 만 허용한다. '{subdir}' 는 규칙 위반이다. 특정 회차에 속하지 않는 누적 문서는 `.dev/` 직속에 둘 수 있다."
     },
     {
+      "id": "foreign_record",
+      "when": {
+        "class": "dev",
+        "min_depth": 3,
+        "subdir_in": "loop_prefixed_dirs",
+        "basename_not_in": "prefix_exempt_names"
+      },
+      "require": {
+        "predicate": "foreign_loop_record"
+      },
+      "deny": "다른 작업({owner})이 남긴 기록은 고칠 수 없다 ({rel}). 기록을 나중에 안 것으로 덮어쓰면 '무엇을 언제 알았는가'가 사라진다. 이어지는 내용이나 정정은 **새 파일**로 쓰고 첫 줄에서 앞 문서를 링크하라. 이 차단은 `allow` 로 열리지 않는다."
+    },
+    {
       "id": "loop_prefix",
       "when": {
         "class": "dev",
@@ -126,7 +139,7 @@
       "require": {
         "basename_starts_with": "<loop_prefix>"
       },
-      "deny": "이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. '{basename}' 대신 '{prefix}{basename}' 로 써라. 앞단 해시({loop})로 grep 하면 한 작업의 산출물이 회차와 무관하게 모인다."
+      "deny": "이 작업의 산출물은 파일명이 '<작업해시>-<회차>-' 로 시작해야 한다. '{basename}' 대신 '{prefix}{basename}' 로 써라. 앞단 해시({loop})로 grep 하면 한 작업의 산출물이 회차와 무관하게 모인다. 이 차단은 `allow` 로 열리지 않는다 — 이름을 고쳐라."
     },
     {
       "id": "docs_naming",
@@ -417,12 +430,13 @@
         "verification"
       ],
       "bash_pattern": "(npm|pnpm|yarn|bun)(\\s+-\\S+)*(\\s+(run|workspace\\s+\\S+|-r|--filter\\s+\\S+))*\\s+(test|check|lint|typecheck)\\b|(python3?|py)\\s+-m\\s+(pytest|unittest|mypy|ruff)\\b|(uvx?|poetry|pipenv|hatch|pdm|rye|nox|tox)(\\s+run)?\\s+\\S*(pytest|test|check|lint)\\b|(npx|pnpm\\s+dlx|yarn\\s+dlx)\\s+\\S*(playwright|vitest|jest|tsc|eslint|cypress)\\b|(mvn|gradle|\\./gradlew|dotnet|deno|swift|ctest|rspec|phpunit|bundle\\s+exec\\s+rspec)(\\s+-\\S+)*\\s*(test|check|verify)?\\b|go\\s+test\\b|cargo\\s+(test|nextest\\s+run|clippy)\\b|make\\s+(test|check|lint|typecheck|verify)\\b|cmake\\s+--build\\s+\\S+\\s+--target\\s+test\\b|(bin/|script/)?(rails|rake)\\s+test\\b|(pytest|vitest|jest|tsc|ruff|mypy|eslint|nx\\s+test|tox|ctest)\\b",
+      "commands": [],
       "tools": [
         "Agent",
         "Task"
       ],
       "tool_pattern": "^mcp__(claude-in-chrome|playwright)__(navigate|computer|read_page|get_page_text|find|form_input|browser_batch)$",
-      "help": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, 브라우저 확인, dry-run 중 하나를 수행하라. 관측이 안 잡히면 `harness verify -- <명령>` 으로 하네스가 직접 돌리게 하라 (통과해야 증거가 된다)"
+      "help": "검증 증거가 없다 — 테스트 실행, 서브에이전트 검토, 브라우저 확인, dry-run 중 하나를 수행하라. 관측이 안 잡히면 `harness verify -- <명령>` 으로 하네스가 직접 돌리게 하라 (통과해야 증거가 된다). 이 프로젝트의 러너가 표준이 아니면 `bash_pattern` 을 넓히지 말고 `commands` 에 명령을 그대로 적어라 (예: [\"bash tests/run.sh\"]) — 정규식이 아니라 목록이라 넓힐 여지가 없다"
     },
     "retro_file": {
       "satisfied_by": "file",

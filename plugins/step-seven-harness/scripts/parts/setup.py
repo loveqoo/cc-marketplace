@@ -430,6 +430,27 @@ def install_db(root, cfg):
     return made, lid
 
 
+def _git_ignores(root, pattern):
+    """git 이 이 규칙이 덮을 경로를 **이미** 무시하나.
+
+    gitignore 의 의미론(부정 `!`, 폴더 제외, 우선순위)을 우리가 다시 구현하지
+    않는다 — 셸을 재구현하지 않기로 한 것과 같은 판단이다. 답을 아는 프로그램에
+    묻는다. git 이 없거나 저장소가 아니면 예전처럼 행동한다(붙인다).
+    """
+    import subprocess
+    probe = pattern.rstrip("/").replace("*", "x")   # 글롭·폴더는 대표 경로로 묻는다
+    if pattern.endswith("/"):
+        probe += "/x"
+    try:
+        with open(os.devnull, "w") as null:
+            # `--no-index` 로 "추적 중인가"가 아니라 **규칙이 덮는가**만 묻는다.
+            return subprocess.call(
+                ["git", "-C", root, "check-ignore", "-q", "--no-index", probe],
+                stdout=null, stderr=null) == 0
+    except OSError:
+        return False
+
+
 def install_gitignore(root):
     """런타임 상태를 커밋 대상에서 뺀다."""
     gi = os.path.join(root, ".gitignore")
@@ -442,6 +463,12 @@ def install_gitignore(root):
     # "이미 있다"고 판단해 실제 ignore 규칙을 넣지 않는다.
     lines = {ln.strip() for ln in have.splitlines()}
     add = [w for w in want if w not in lines]
+    # 줄이 없다고 **무시되지 않는 것은 아니다.** `.claude/harness/*` 한 줄이
+    # 폴더를 통째로 막고 규칙 파일만 `!` 로 되살린 저장소에서는 우리가 넣을
+    # 다섯 줄이 이미 전부 무시되는데도 매번 다시 붙었다. 지우면 `init` 마다
+    # 되살아나므로 사용자는 결국 군더더기를 그대로 두게 된다(현장 보고 §7).
+    # 줄을 찾지 말고 **git 에게 결과를 묻는다** — 판정자가 하나가 된다.
+    add = [w for w in add if not _git_ignores(root, w)]
     if not add:
         return []
     with open(gi, "a", encoding="utf-8") as fh:
