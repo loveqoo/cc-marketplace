@@ -296,6 +296,13 @@ INLINE_FLAG_RE = re.compile(r"^-(?:[A-Za-z]*c|e|-eval)$")
 INLINE_CODE_RE = re.compile(r"(?:^|\s)-(?:[A-Za-z]*c|e|-eval)(?:\s|=|$)|<<\s*\w")
 
 
+# 하네스가 자기 영역이라고 부르는 **낱말**. 경로 상수에서 뽑는다 — 손으로 적으면
+# `HARNESS_DIR` 이 바뀔 때 조용히 어긋난다. 앞의 `.` 은 떼고, 마디 그대로 쓴다.
+TERRITORY_RE = re.compile(
+    "|".join(re.escape(p.lstrip(".")) for p in HARNESS_DIR.split(os.sep) if p),
+    re.I)
+
+
 def bash_unresolved(cfg, cmd):
     """이 명령이 무엇을 쓸지 **내가 해석할 수 있나.** 못 하면 그 이유.
 
@@ -335,8 +342,35 @@ def bash_unresolved(cfg, cmd):
         j = 0
         while j < len(ctrl_toks) and ASSIGN_RE.match(ctrl_toks[j]):
             j += 1
+        # **인라인 코드라고 무조건 묻지 않는다 — 우리 영역을 언급할 때만 묻는다.**
+        #
+        # 이 물음은 5회차 적대적 리뷰가 실제 우회 셋을 재현해 만든 것이고, 그때는
+        # 옳았다. 그런데 0.71.0 이 층을 가르면서 전제가 바뀌었다: Bash 의 단계별
+        # 쓰기 규칙은 이제 막지 않으므로, 이 물음이 지키는 것은 **바닥값 하나**다.
+        #
+        # 그 바닥값을 이름 그대로 부르면 `floor_named` 가 이미 잡는다 — 더 정확한
+        # 사유까지 달아서. 그래서 뭉뚱그린 물음의 **유일한 고유 기여**는 경로를
+        # 쪼개 조립하는 경우뿐이었는데(`'.claude/harn'+'ess'`), 그건 규칙을
+        # 지키려는 모델이 실수로 하는 일이 아니다. README 가 범위 밖이라고
+        # 선언한 상대다.
+        #
+        # 그 대가로 `python3 -c "print(1+1)"` 까지 매번 사람을 세웠다 — auto mode
+        # 를 켠 사용자에게도(현장 관측). **선언하지 않은 보증을 위해 모든 인라인
+        # 스크립트가 비용을 내고 있었다.**
+        #
+        # 원문에 우리 영역 낱말이 보일 때만 묻는다. 조립도 대부분 남는다 —
+        # `'.claude/harn'+'ess'` 에는 `claude` 가, `'.cla'+'ude/harness'` 에는
+        # `harness` 가 그대로 있다. 낱말까지 전부 쪼개는 난독화는 놓치고,
+        # 그것은 알고 놓는다.
+        #
+        # **세그먼트가 아니라 명령 전체를 본다.** `BASH_SPLIT` 은 인라인 코드
+        # **안의** `;` 로도 쪼개므로, 영역 낱말이 인터프리터 머리와 다른 조각에
+        # 떨어진다 — `python3 -c "import json; …open('.claude/…')"` 가 그 모양이고,
+        # 세그먼트만 보면 그냥 지나갔다(회귀 단정이 잡았다). 넓게 보는 쪽이
+        # 안전한 방향이고, 이 물음의 값은 정밀도가 아니라 존재다.
         if (benign_head(cfg, "interpreters", head, BASH_INTERPRETERS_DEFAULT)
-                and INLINE_CODE_RE.search(seg) and not ctrl_exec_seg(ctrl_toks[j:])):
+                and INLINE_CODE_RE.search(seg) and TERRITORY_RE.search(cmd)
+                and not ctrl_exec_seg(ctrl_toks[j:])):
             return t("인터프리터에 인라인으로 넘긴 코드는 하네스가 읽지 못한다")
         if not mut.search(seg.strip()):
             continue

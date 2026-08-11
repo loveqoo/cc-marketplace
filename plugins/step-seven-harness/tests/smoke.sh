@@ -3717,7 +3717,13 @@ check_empty "상위 폴더가 있어도 막지는 않는다" "$(frb 'touch ../a.
 echo "  -- §3·§4 회귀: 해석하지 못하는 것은 여전히 묻는다"
 check "따옴표가 안 맞는 변경 명령은 묻는다" '쪼갤 수 없다' "$(frb 'touch "src/a.py')"
 check "셸 확장이 섞이면 묻는다" '실행 시점' "$(frb 'mkdir "$HOME/.cache/x"')"
-check "인터프리터 인라인 코드는 묻는다" '읽지 못한다' \
+# 인라인 코드는 **우리 영역을 언급할 때만** 묻는다. 그냥 인라인이라는 이유로
+# 물으면 `print(1+1)` 까지 사람을 세우고, auto mode 를 켠 사용자도 매번 멈춘다.
+check "인라인이 바닥값을 조립하면 묻는다" '읽지 못한다' \
+  "$(frb 'python3 -c "open(\".claude/harn\"+\"ess/x\",\"w\")"')"
+check_empty "평범한 인라인 스크립트는 묻지 않는다" \
+  "$(frb 'python3 -c "print(1+1)"')"
+check_empty "인라인으로 소스를 써도 묻지 않는다 (단계 규칙은 기록이다)" \
   "$(frb 'python3 -c "open(\"src/a.py\",\"w\")"')"
 check "find -exec rm 은 바닥값에서 막힌다" '하네스 자신' \
   "$(frb "find .claude/harness -name '*.py' -exec rm {} +")"
