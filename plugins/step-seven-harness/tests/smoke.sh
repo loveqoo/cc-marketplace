@@ -3717,23 +3717,44 @@ check_empty "상위 폴더가 있어도 막지는 않는다" "$(frb 'touch ../a.
 echo "  -- §3·§4 회귀: 해석하지 못하는 것은 여전히 묻는다"
 check "따옴표가 안 맞는 변경 명령은 묻는다" '쪼갤 수 없다' "$(frb 'touch "src/a.py')"
 check "셸 확장이 섞이면 묻는다" '실행 시점' "$(frb 'mkdir "$HOME/.cache/x"')"
-# 인라인 코드는 **우리 영역을 언급할 때만** 묻는다. 그냥 인라인이라는 이유로
-# 물으면 `print(1+1)` 까지 사람을 세우고, auto mode 를 켠 사용자도 매번 멈춘다.
-check "인라인이 바닥값을 조립하면 묻는다" '읽지 못한다' \
-  "$(frb 'python3 -c "open(\".claude/harn\"+\"ess/x\",\"w\")"')"
-check_empty "평범한 인라인 스크립트는 묻지 않는다" \
-  "$(frb 'python3 -c "print(1+1)"')"
-check_empty "인라인으로 소스를 써도 묻지 않는다 (단계 규칙은 기록이다)" \
+# **인라인이라는 이유만으로는 되묻지 않는다** (0.73.0 에서 규칙을 지웠다).
+# 두 번 좁혀 봤지만 정확해지지 않았다 — 조각을 잡으면 남의 조각도 잡히고,
+# 정확히 잡으면 `floor_named` 와 중복이다. 중간이 없었다.
+#
+# 아래는 전부 **하네스와 무관한 정상 작업**이다. 하나라도 되물으면 그 규칙이
+# 어떤 형태로든 되살아난 것이다.
+check_empty "평범한 인라인 스크립트" "$(frb 'python3 -c "print(1+1)"')"
+check_empty "인라인으로 소스 쓰기 (단계 규칙은 기록이다)" \
   "$(frb 'python3 -c "open(\"src/a.py\",\"w\")"')"
+check_empty "스크래치패드 경로 (세션마다 나온다)" \
+  "$(frb 'python3 -c "import sys; sys.path.insert(0, \"/private/tmp/claude-501/x/scratchpad\")"')"
+check_empty "CLAUDE.md 읽기" \
+  "$(frb 'python3 -c "print(open(\"CLAUDE.md\").read()[:10])"')"
+check_empty "플러그인 소스 훑기 (1차 보고가 실제로 한 일)" \
+  "$(frb 'python3 -c "import glob; print(glob.glob(\"/Users/x/.claude/plugins/*\"))"')"
+check_empty "훅 설정 읽기" \
+  "$(frb 'python3 -c "print(open(\".claude/settings.json\").read())"')"
+check_empty "에이전트 정의 훑기" \
+  "$(frb 'node -e "console.log(require(&#39;fs&#39;).readdirSync(&#39;.claude/agents&#39;))"')"
+# 지운 대가는 명시한다: **조각 조립은 이제 안 잡힌다.** 알고 놓는 것이라
+# 단정으로 박아 둔다 — 나중에 "왜 안 잡히지" 로 다시 규칙을 만들지 않도록.
+check_empty "조각 조립은 놓친다 (선언된 범위 밖)" \
+  "$(frb 'python3 -c "open(\".claude/harn\"+\"ess/x\",\"w\")"')"
+# 그리고 **이름 그대로 부르면 여전히 잡힌다** — 바닥값을 지키는 것은 이쪽이다.
+check "인라인이 바닥값을 이름으로 부르면 묻는다" '"ask"' \
+  "$(frb 'python3 -c "open(\".claude/harness/harness.db\",\"w\")"')"
 check "find -exec rm 은 바닥값에서 막힌다" '하네스 자신' \
   "$(frb "find .claude/harness -name '*.py' -exec rm {} +")"
 
 echo "  -- §5 하네스 자신을 **읽는 것**은 막지 않는다 (보고서가 지키라고 한 쪽)"
 check_empty "ls -la 는 통과한다" "$(frb 'ls -la .claude/harness/')"
 check_empty "stat 도 통과한다" "$(frb 'stat .claude/harness/harness.db')"
-# 쪼개서 읽는 것은 '통과'가 아니라 **ask** 였다. 하네스는 잡았고, 실제로 통과한
-# 것은 그 환경의 권한 모드였다 — 계약을 여기 못 박아 둔다.
-check "쪼갠 경로로 읽어도 묻기는 한다" '"ask"' \
+# 1차 §5 는 "쪼개면 새어 나간다" 였다. **지금은 새어 나가는 것이 맞고, 그것이
+# 결정이다** (0.73.0). 그 우회를 잡으려면 경로 조각을 잡아야 하는데, 조각을
+# 잡으면 `.claude/*` 를 만지는 정상 작업이 전부 걸린다 — 두 번 좁혀 보고 확인했다.
+# 그리고 그 규칙은 `ask` 만 냈으므로 bypass 모드의 적대자에게는 애초에 통하지
+# 않았다. **정확하지 않은 통제는 통제가 아니다.**
+check_empty "쪼갠 경로는 이제 통과한다 (선언된 범위 밖)" \
   "$(frb 'python3 -c "import json; d=json.load(open(\".claude/harn\"+\"ess/stages.json\")); print(1)"')"
 
 echo "  -- §2 남의 작업 기록과 새 파일은 **다른 말**을 듣는다"
@@ -3863,12 +3884,15 @@ check "따옴표 없는 히어독도 받는다" '"ask"' \
 # 히어독으로 **파일을 쓰는** 것은 본문이 아니라 리다이렉트가 말한다 — 그대로 막힌다.
 check "히어독으로 래퍼를 덮어쓰면 막힌다" '"deny"' \
   "$(frb "$(printf 'cat > .claude/harness/bin/harness <<%sEOF%s\nevil\nEOF' "'" "'")")"
-# ③ 껍데기마다 계약이 다르다 — 그 차이를 못 박는다.
-#    히어독 본문은 셸이 확장도 하지 않는 **데이터**라 안 본다(통과).
-#    `-c` 는 **코드**라 읽을 수 없으므로 묻는다(ask). 둘 다 deny 는 아니다.
+# ③ 껍데기가 무엇이든 **언급만으로는 아무 일도 없다.** 예전에는 `-c` 를
+#    "읽을 수 없는 코드" 라며 되물었지만, 그 규칙은 0.73.0 에서 지웠다 —
+#    바닥값을 이름 그대로 부를 때만 원문 감시가 받는다.
 BC="$(frb "bash -c \"echo 'ls .claude/harness/ 2>&1'\"")"
-check "bash -c 는 코드라 묻는다" '"ask"' "$BC"
-check_absent "그래도 막지는 않는다" '"deny"' "$BC"
+check_empty "bash -c 안의 언급은 통과한다" "$BC"
+# 껍데기 안이라도 경로가 **그대로** 있으면 `_inline_code` 가 껍데기를 벗겨
+# 판정한다 — 되묻는 게 아니라 **막는다.** 지운 규칙보다 이쪽이 강하다.
+check "그래도 바닥값을 이름으로 부르면 막는다" '"deny"' \
+  "$(frb "bash -c \"rm .claude/harness/harness.db\"")"
 
 echo "  -- 4차 §1 회차 도중 stages.json 에 끼운 단계 (세 자리가 같은 원인을 말한다)"
 # 단계 행은 **회차가 열릴 때** 만들어진다. 회차 도중에 설정에 단계를 끼우면

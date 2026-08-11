@@ -292,17 +292,6 @@ EXPAND_RE = re.compile(r"\$\(|`|\$\{|\$[A-Za-z_]|\$'")
 INLINE_FLAG_RE = re.compile(r"^-(?:[A-Za-z]*c|e|-eval)$")
 
 
-# 그 형태가 명령 안에 있나. 그 안은 셸 토큰이 아니다.
-INLINE_CODE_RE = re.compile(r"(?:^|\s)-(?:[A-Za-z]*c|e|-eval)(?:\s|=|$)|<<\s*\w")
-
-
-# 하네스가 자기 영역이라고 부르는 **낱말**. 경로 상수에서 뽑는다 — 손으로 적으면
-# `HARNESS_DIR` 이 바뀔 때 조용히 어긋난다. 앞의 `.` 은 떼고, 마디 그대로 쓴다.
-TERRITORY_RE = re.compile(
-    "|".join(re.escape(p.lstrip(".")) for p in HARNESS_DIR.split(os.sep) if p),
-    re.I)
-
-
 def bash_unresolved(cfg, cmd):
     """이 명령이 무엇을 쓸지 **내가 해석할 수 있나.** 못 하면 그 이유.
 
@@ -334,44 +323,30 @@ def bash_unresolved(cfg, cmd):
             # `VAR=$(...)` 만 있는 세그먼트. 대입 자체는 아무것도 안 쓴다.
             continue
         head = os.path.basename(toks[i].strip("\"'"))
-        # **제어 판정에는 제대로 쪼갠 토큰을 준다.** 위의 `re.findall` 은 따옴표를
-        # 모르므로 `sh -c '<래퍼> status'` 의 인라인 코드가 `'<래퍼>` 에서 잘리고,
-        # 그러면 조회 명령 하나가 "읽지 못하는 코드"로 되물어진다. 예전에는 잘린
-        # 조각을 옛 폴백이 다시 뭉개서 우연히 통했다 — 근사가 근사를 가린 자리다.
-        ctrl_toks = sh_tokens(seg) or toks
-        j = 0
-        while j < len(ctrl_toks) and ASSIGN_RE.match(ctrl_toks[j]):
-            j += 1
-        # **인라인 코드라고 무조건 묻지 않는다 — 우리 영역을 언급할 때만 묻는다.**
+        # ## 인터프리터 인라인 코드를 되묻던 규칙을 **지웠다** (0.73.0)
         #
-        # 이 물음은 5회차 적대적 리뷰가 실제 우회 셋을 재현해 만든 것이고, 그때는
-        # 옳았다. 그런데 0.71.0 이 층을 가르면서 전제가 바뀌었다: Bash 의 단계별
-        # 쓰기 규칙은 이제 막지 않으므로, 이 물음이 지키는 것은 **바닥값 하나**다.
+        # 5회차 적대적 리뷰가 만든 규칙이었고 그때는 옳았다. 0.71.0 이 층을
+        # 가르면서 이 물음이 지키는 것은 바닥값 하나가 됐고, 그러자 두 번의
+        # 좁히기로도 정확해지지 않았다:
         #
-        # 그 바닥값을 이름 그대로 부르면 `floor_named` 가 이미 잡는다 — 더 정확한
-        # 사유까지 달아서. 그래서 뭉뚱그린 물음의 **유일한 고유 기여**는 경로를
-        # 쪼개 조립하는 경우뿐이었는데(`'.claude/harn'+'ess'`), 그건 규칙을
-        # 지키려는 모델이 실수로 하는 일이 아니다. README 가 범위 밖이라고
+        #   느슨하게 잡으면  조립(`'.claude/harn'+'ess'`)은 잡지만 `.claude/*` 를
+        #                   만지는 **모든 정상 작업**이 걸린다 (스크래치패드
+        #                   `/private/tmp/claude-501/…`, `CLAUDE.md`,
+        #                   `~/.claude/plugins`, `.claude/settings.json` …)
+        #   정확하게 잡으면  오탐은 없지만 조립을 못 잡아 `floor_named` 와 **완전히
+        #                   중복**이다
+        #
+        # 중간이 없다. 조각을 잡으려면 남의 조각도 잡힌다.
+        #
+        # 그리고 이 규칙은 **한 번도 막은 적이 없다** — `ask` 만 냈다. 적대적
+        # 모델에게 `ask` 는, 특히 bypass 모드에서, 자동 승인이다. 적대자만 하는
+        # 행동을, 적대자에게는 통하지 않는 방법으로, 모든 정상 작업에 비용을
+        # 물려 가며 감시하고 있었다.
+        #
+        # **정확하지 않은 통제는 통제가 아니다.** 남는 것은 `floor_named` 인데,
+        # 그것은 고정 상수 문자열을 찾으므로 오탐이 구조적으로 불가능하다.
+        # 잃는 것은 인라인 코드의 조각 조립 하나이고, README 가 범위 밖이라고
         # 선언한 상대다.
-        #
-        # 그 대가로 `python3 -c "print(1+1)"` 까지 매번 사람을 세웠다 — auto mode
-        # 를 켠 사용자에게도(현장 관측). **선언하지 않은 보증을 위해 모든 인라인
-        # 스크립트가 비용을 내고 있었다.**
-        #
-        # 원문에 우리 영역 낱말이 보일 때만 묻는다. 조립도 대부분 남는다 —
-        # `'.claude/harn'+'ess'` 에는 `claude` 가, `'.cla'+'ude/harness'` 에는
-        # `harness` 가 그대로 있다. 낱말까지 전부 쪼개는 난독화는 놓치고,
-        # 그것은 알고 놓는다.
-        #
-        # **세그먼트가 아니라 명령 전체를 본다.** `BASH_SPLIT` 은 인라인 코드
-        # **안의** `;` 로도 쪼개므로, 영역 낱말이 인터프리터 머리와 다른 조각에
-        # 떨어진다 — `python3 -c "import json; …open('.claude/…')"` 가 그 모양이고,
-        # 세그먼트만 보면 그냥 지나갔다(회귀 단정이 잡았다). 넓게 보는 쪽이
-        # 안전한 방향이고, 이 물음의 값은 정밀도가 아니라 존재다.
-        if (benign_head(cfg, "interpreters", head, BASH_INTERPRETERS_DEFAULT)
-                and INLINE_CODE_RE.search(seg) and TERRITORY_RE.search(cmd)
-                and not ctrl_exec_seg(ctrl_toks[j:])):
-            return t("인터프리터에 인라인으로 넘긴 코드는 하네스가 읽지 못한다")
         if not mut.search(seg.strip()):
             continue
         # 읽기 명령은 리다이렉트 **대상만** 쓴다. 쓰는 곳이 없으면 물을 것도 없다
@@ -386,21 +361,6 @@ def bash_unresolved(cfg, cmd):
         if EXPAND_RE.search(seg):
             return t("셸 확장이 섞여 무엇을 쓸지 실행 시점에야 정해진다")
     return None
-
-
-def ctrl_exec_seg(toks, depth=0):
-    """이 세그먼트가 **하네스를 실행**하나. 그러면 인라인 코드가 아니다.
-
-    `sh -c '<래퍼> status'` 의 하네스 이름은 `toks[:2]` 밖 — 인라인 코드 **안**에
-    있다. 밖만 보면 조회 명령 하나가 "읽지 못하는 코드" 로 되물어진다. 껍데기를
-    벗기고 같은 질문을 다시 한다.
-    """
-    if any(os.path.basename(x.strip("\"'")) in CTRL_NAMES for x in toks[:2]):
-        return True
-    code = _inline_code(toks) if depth < INLINE_DEPTH else None
-    inner = sh_tokens(code) if code else None
-    # 못 쪼개면 "하네스 실행이 아니다" — 이 면제를 확신 없이 주지 않는다.
-    return bool(inner) and ctrl_exec_seg(inner, depth + 1)
 
 
 def bash_opaque(cmd):
@@ -586,8 +546,9 @@ INLINE_DEPTH = 3
 def _inline_code(toks):
     """인터프리터에 **코드로** 넘긴 문자열. 없으면 None.
 
-    `INLINE_CODE_RE` 는 그것이 **있는지**를 보고, 여기서는 **무엇인지**를 꺼낸다.
-    같은 어휘를 둘로 적지 않도록 플래그 모양은 `INLINE_FLAG_RE` 하나로 둔다.
+    남은 쓰임은 하나다 — `bash_protected_scan` 이 인라인 코드를 **평평한 경로
+    목록으로 읽지 않도록** 껍데기를 벗기는 것. "인라인이면 되묻는다"는 규칙은
+    0.73.0 에서 지웠다(정확해질 수 없었다 — `bash_unresolved` 주석 참고).
     """
     for i, tok in enumerate(toks[1:], 1):
         if INLINE_FLAG_RE.match(tok):
