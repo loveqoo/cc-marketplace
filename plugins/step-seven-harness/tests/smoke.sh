@@ -3716,7 +3716,18 @@ check_empty "상위 폴더가 있어도 막지는 않는다" "$(frb 'touch ../a.
 
 echo "  -- §3·§4 회귀: 해석하지 못하는 것은 여전히 묻는다"
 check "따옴표가 안 맞는 변경 명령은 묻는다" '쪼갤 수 없다' "$(frb 'touch "src/a.py')"
-check "셸 확장이 섞이면 묻는다" '실행 시점' "$(frb 'mkdir "$HOME/.cache/x"')"
+# 변수를 썼다는 이유만으로 되묻던 규칙은 0.74.0 에서 지웠다. 실사용 589개를
+# 재생해 재보니 멈춤 126건 중 67건이 이것이었고, 대부분 이 모양이었다:
+#     SP=/private/tmp/claude-501/…/scratchpad/x.mjs
+# 임시 경로를 변수로 빼는 정상 습관이다. `$SP` 가 무엇인지는 실행해야 알므로
+# 정확해질 수 없다 — POLICY 10 대로 지웠다.
+check_empty "변수를 썼다는 이유만으로는 되묻지 않는다" \
+  "$(frb 'mkdir "$HOME/.cache/x"')"
+check_empty "임시 경로를 변수로 빼도 통과한다 (실사용에서 가장 많던 모양)" \
+  "$(frb 'SP=/private/tmp/claude-501/x/scratchpad; cp index.js "$SP/head.js"')"
+# 남은 계약: 원문에 바닥값 이름이 보이면 확장 안이라도 받는다.
+check "확장 안이라도 바닥값 이름이 보이면 받는다" '"ask"' \
+  "$(frb 'cp evil "$(pwd)/.claude/harness/harness.db"')"
 # **인라인이라는 이유만으로는 되묻지 않는다** (0.73.0 에서 규칙을 지웠다).
 # 두 번 좁혀 봤지만 정확해지지 않았다 — 조각을 잡으면 남의 조각도 잡히고,
 # 정확히 잡으면 `floor_named` 와 중복이다. 중간이 없었다.
