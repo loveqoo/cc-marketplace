@@ -64,6 +64,10 @@ def cli_advance(ctx, argv):
         else:
             print(t("정당한 사유가 있으면 `harness skip %s --reason \"...\"` 로 "
                   "사람의 승인을 받아라.") % sid)
+        # 세 번째 문. 조건이 남은 이유가 "이 단계로는 부족해서" 일 수 있다.
+        hint = add_node_hint(con, cfg, root, lid, sid)
+        if hint:
+            print(hint.strip())
         return 1
 
     # 회고가 나중에 찾아지는지 확인한다. 통찰의 질은 채점하지 않지만 찾아지는지는
@@ -117,7 +121,7 @@ def cli_advance(ctx, argv):
             nlid, nsid, _ = _enter(ctx, stage_index(cfg, nsid0))
             done_task = False
             if nsid is None:
-                raise Refuse(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"), code=2)
+                raise Refuse(stage_row_missing_reason(con, cfg, lid), code=2)
 
     if retro_note:
         keys, found, missing = retro_note
@@ -216,7 +220,7 @@ def cli_skip(ctx, argv):
         nlid, nsid, cycled = _enter(
             ctx, stage_index(cfg, nxt[0]) if nxt else len(cfg["stages"]))
         if nsid is None:
-            raise RuntimeError(t("다음 단계 행이 없다 — 상태와 설정이 어긋났다"))
+            raise Refuse(stage_row_missing_reason(con, cfg, lid), code=2)
     print(t("스킵(%s): %s") % (t("자동 승인") if by == "auto" else t("사용자 승인"),
                             ", ".join(skipped) or t("(없음)")))
     print(t("사유: %s") % reason)
@@ -887,9 +891,17 @@ def _path_show(ctx, argv, pos):
     print(t("작업 %s · 회차 %d 의 실행 그래프 (%d 노드)")
           % (lid, cycle_of(con, lid), len(cfg["stages"])))
     marks = {"active": "●", "done": "✓", "skipped": "~"}
+    # **설정에만 있는 단계를 pending 과 같은 표시로 두지 않는다.** 회차 도중에
+    # `stages.json` 에 끼운 단계는 행이 없어 들어갈 수 없는데, 예전에는 둘 다
+    # `·` 라 그래프가 "8노드 전부 갈 수 있다"고 거짓말했다. 그 화면을 믿고
+    # advance 했다가 "다음 단계 행이 없다" 를 받는다(현장 보고 ①).
+    late = []
     for s in cfg["stages"]:
         row = rows.get(s["id"])
-        mark = marks.get(row["status"], "·") if row else "·"
+        if row is None and not s.get("__dyn__") and rows:
+            late.append(s["id"])
+        mark = marks.get(row["status"], "·") if row else (
+            "!" if s["id"] in late else "·")
         bits = ""
         # **successors 를 쓴다** — `valid_next` 는 dyn 노드에 늘 [] 라, 회차 한정
         # 노드 사슬 끝에서 유예된 분기가 안 보였다(위상 리뷰가 지적). successors 는
@@ -901,7 +913,14 @@ def _path_show(ctx, argv, pos):
             bits += "  → %s" % nxt[0]
         if s.get("__dyn__"):
             bits += t("  (회차 한정)")
+        if s["id"] in late:
+            bits += t("  ← 이번 회차 그래프에 없다")
         print("  %s %-16s %s%s" % (mark, s["id"], s["label"], bits))
+    if late:
+        print(t("! 표시(%s)는 `stages.json` 에는 있지만 **이번 회차에는 들어갈 수 "
+              "없는** 단계다 — 단계 행은 회차가 열릴 때 만들어진다. 다음 회차부터 "
+              "반영되고, 지금 필요하면 설정에서 빼고 `path add` 로 더해라.")
+              % ", ".join(late))
     print(t("노드 추가는 자유다: `harness path add <id> --reason \"...\"`. "
           "미방문 노드 삭제는 스킵과 같은 동의를 받는다: `harness path remove <id>`"))
     return 0
@@ -1019,6 +1038,12 @@ def cli_path(ctx, argv):
 
 CLI = {
     "status": cli_status,
+    # `status` 는 이미 진단기 넷(config/drift/install/language)과 탐침 50개를
+    # 돌린다 — 다른 도구의 `doctor` 가 하는 일보다 오히려 많다. 그런데 모델은
+    # "이 도구 상태를 진단" 하려 할 때 `doctor` 를 **먼저 친다**(brew·flutter·
+    # npm 의 관용어다). 이름이 없어서 못 찾고 소스를 뒤졌다(현장 보고).
+    # 기능을 만들지 않는다 — 찾는 이름을 준다.
+    "doctor": cli_status,
     "advance": cli_advance,
     "skip": cli_skip,
     "verify": cli_verify,

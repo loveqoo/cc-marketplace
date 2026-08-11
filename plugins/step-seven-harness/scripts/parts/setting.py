@@ -220,6 +220,44 @@ def language_problems(root):
     return []
 
 
+DEV_GLOB_RE = re.compile(r"^\.dev/([^/*?]+)/")
+
+
+def _unreachable_evidence_dirs(cfg):
+    """**설정 둘이 서로 모순된 자리.** 채울 수 없는 종료 조건을 찾는다.
+
+    조건이 `.dev/<sub>/` 에 파일을 요구하는데 `folder_rules.dev_subdirs` 가 그
+    `<sub>` 를 허용하지 않으면, 그 조건은 **아무도 채울 수 없다** — 쓰기 규칙이
+    그 폴더를 먼저 막기 때문이다. 게이트가 조용히 막다른 길이 된다.
+
+    실제로 그랬다(현장 보고 ②): 기본 제공 `review` 프리셋은 `.dev/review/` 에
+    결과를 요구하는데, 낡은 설치의 `dev_subdirs` 에는 `review` 가 없었다. 하네스는
+    **아무 말도 하지 않았고** 사용자는 폴더를 못 만드는 이유를 찾느라 시간을 썼다.
+
+    **템플릿과 대조하지 않는다.** 그 방향은 "덜어낸 것을 되살리지 않는다" 는
+    작업 방식과 충돌한다 — 의도적으로 지운 것까지 매번 잔소리하게 된다. 여기서
+    보는 것은 오직 **이 설정 안의 모순**이라, 사용자가 정의한 조건에도 그대로
+    작동하고 조건째로 덜어냈으면 침묵한다.
+    """
+    subs = set(cfg.seq("folder_rules.dev_subdirs"))
+    if not subs:
+        return []                      # 규칙을 통째로 비웠으면 막는 것도 없다
+    out = []
+    for name, spec in sorted((cfg.obj("criteria") or {}).items()):
+        if not isinstance(spec, dict) or spec.get("satisfied_by") != "file":
+            continue
+        for pat in spec.get("write_glob") or []:
+            m = DEV_GLOB_RE.match(pat if isinstance(pat, str) else "")
+            if m and m.group(1) not in subs:
+                out.append(t("criteria.%s 는 `%s` 에 파일을 요구하는데 "
+                             "folder_rules.dev_subdirs 에 '%s' 가 없다 — 그 폴더는 "
+                             "쓰기 규칙이 먼저 막으므로 **이 조건은 채울 수 없다.** "
+                             "'%s' 를 dev_subdirs 에 넣거나 write_glob 을 고쳐라.")
+                           % (name, pat, m.group(1), m.group(1)))
+                break
+    return out
+
+
 def config_problems(cfg):
     """설정의 **오타**를 찾는다. 규칙 위반이 아니라 어휘 오류만 본다.
 
@@ -234,7 +272,7 @@ def config_problems(cfg):
     """
     # 게이트는 **자기 설정을 스스로 진단한다.** 여기서 게이트마다 적으면 게이트를
     # 더할 때 이 자리를 잊게 되고, 잊어도 조용하다 — 오늘 그것으로 세 번 당했다.
-    out = gate_problems(cfg)
+    out = gate_problems(cfg) + _unreachable_evidence_dirs(cfg)
     # 단계의 필수 키. 설정 편집은 이 도구가 권장하는 정상 행위인데, `summary` 나
     # `label` 을 지우면 훅이 KeyError 로 죽어 게이트 전체가 꺼지고 안내는
     # "init 으로 스키마 갱신" 이라는 엉뚱한 방향을 가리켰다(6회차 실측).

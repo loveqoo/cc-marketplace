@@ -774,6 +774,9 @@ def _w_fields(w, req):
         "prefix": file_prefix(w.ctx.con, w.ctx.lid),
         "top": new_toplevel_dir(w.ctx.root, w.rel) or "",
         "owner": record_owner(w.parts[-1]) or "",
+        # 세 번째 문. 지금 더할 수 없으면 빈 문자열이라 메시지가 조용해진다.
+        "add_node": add_node_hint(w.ctx.con, w.ctx.cfg, w.ctx.root,
+                                  w.ctx.lid, w.ctx.sid),
     }
     if req.get("class_in_stage_write"):
         f["allowed"] = ", ".join(w.stage.get("write") or []) or t("(없음)")
@@ -2197,7 +2200,8 @@ USAGE = """step-seven-harness — 작업 하네스
                                    └─ 회차 계속  → 1 Scaffolding
 
 현재 상태
-  status                       현재 작업·회차·단계·종료 조건·증거·스킵 기록·예외
+  status  (= doctor)           현재 작업·회차·단계·종료 조건·증거·스킵 기록·예외.
+                               설정 진단(오타·모순·표류)과 게이트 자기검사도 함께 낸다
 
   보고 명령(status·metrics·tidy·promote)은 `--json` 으로 구조를 그대로 낸다.
   산문 대신 값을 검사해야 할 때 쓴다.

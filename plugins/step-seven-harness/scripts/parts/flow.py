@@ -297,6 +297,17 @@ def path_add_block_reason(con, cfg, root, lid, node, after):
     if not node or not re.match(r"^[a-z][a-z0-9_-]{0,31}$", node):
         return t("노드 이름은 소문자·숫자·'-'·'_' 32자 이내여야 한다: %s") % (node or "")
     if node in ids:
+        # **설정에 있는 것과 이번 회차 그래프에 있는 것은 다르다.** 단계 행은
+        # 회차가 열릴 때 만들어지므로, 회차 도중에 `stages.json` 을 고쳐 단계를
+        # 끼우면 설정에는 있고 DB 에는 없는 노드가 생긴다. 그 상태에서 예전
+        # 메시지는 "이미 있는 단계다 — 다른 이름을 써라" 였는데, **이름 문제가
+        # 아니다.** 이름을 바꿔도 그 단계는 이번 회차에 못 들어간다(현장 보고 ①).
+        if node not in stage_rows(con, lid):
+            return t("'%s' 는 `stages.json` 에는 있지만 **이번 회차의 그래프에는 "
+                     "없다** — 단계 행은 회차가 열릴 때 만들어지므로, 회차 도중에 "
+                     "설정에 끼운 단계는 **다음 회차부터** 반영된다. 지금 필요하면 "
+                     "설정에서 그 단계를 빼고 `harness path add %s --after <앵커> "
+                     "--reason \"...\"` 로 이번 회차에 더해라.") % (node, node)
         return t("'%s' 는 이미 있는 단계다 — 다른 이름을 써라") % node
     cur = stage_index(cfg, active_stage(con, lid) or ids[0])
     if cur >= len(ids) - 1:
@@ -1007,6 +1018,74 @@ MUST_VERIFY = ("npm test", "pnpm -r test", "yarn workspace app test", "bun test"
                "mvn -q test", "gradle check", "./gradlew test", "dotnet test",
                "deno test", "swift test", "ctest", "rspec", "bin/rails test",
                "make check", "make test", "npx tsc --noEmit", "ruff check .", "mypy .")
+
+
+def add_node_hint(con, cfg, root, lid, sid):
+    """**세 번째 문.** 지금 노드를 더할 수 있으면 그 안내, 아니면 빈 문자열.
+
+    단계 밖 작업을 하려다 막힌 모델에게 지금까지 두 문만 안내했다 — `advance`
+    (앞으로)와 `skip`(건너뛰기). 정작 필요한 것이 "이 회차에 단계가 하나 더
+    필요하다" 일 때 어느 쪽도 답이 아니고, 그래서 모델이 자기 길을 만들었다:
+    소스코드를 읽거나 `stages.json` 을 직접 고쳤다(현장 보고 ①).
+
+    문서에 더 쓰는 것으로는 못 고친다 — Scaffolding·Planning 힌트에 이미 861자·
+    865자가 들어 있는데도 못 찾았다. **막힌 자리에서 가리켜야 한다.**
+
+    다만 `path add` 는 아무 때나 되지 않는다(계획 승인 뒤 고정, 마지막 틀, 지난
+    자리 뒤). 안 되는 때에 안내하면 "하라고 해서 했는데 거부당하는" 새 마찰이
+    된다. 그래서 판정기에게 먼저 물어보고, **가능할 때만** 말한다.
+    """
+    ids = stage_ids(cfg)
+    # **앵커는 현재 단계가 아니라 '지금 끼울 수 있는 첫 자리'다.** 현재 단계를
+    # 그대로 쓰면 Selection 에서 늘 막힌다(첫 틀 뒤에는 못 끼운다) — 정작 단계
+    # 밖 쓰기로 가장 자주 막히는 자리인데 아무 말도 못 하게 된다.
+    cur = stage_index(cfg, sid)
+    anchor = ids[max(1, min(cur, len(ids) - 2))]
+    why = path_add_block_reason(con, cfg, root, lid, "probe-node", anchor)
+    if not why:
+        return t(" 이 회차에 단계 자체가 더 필요하면 `%s path add <id> --after %s "
+                 "--reason \"...\"` 로 더한다 (회차 한정, 동의 불필요).") \
+            % (WRAPPER_CMD, anchor)
+    # 못 더하는 이유가 **계획 승인**이면 갈 곳이 따로 있다 — 침묵하면 모델은
+    # 자기 길을 만든다(소스 읽기·`stages.json` 직접 편집). 이 경우의 답은
+    # "뒤로 가지 않는다" 원칙 그대로 다음 회차다.
+    if has_valid_evidence(con, root, lid, "plan_approved"):
+        return t(" 이 회차에 단계 자체가 더 필요하다면 지금은 더할 수 없다 — 계획 "
+                 "승인이 곧 그래프 승인이라 이후로는 고정된다. 회차를 닫고"
+                 "(`%s advance --cycle`) 다음 회차에서 그래프를 다시 짜라.") \
+            % WRAPPER_CMD
+    return ""
+
+
+def stage_row_missing_reason(con, cfg, lid):
+    """`_enter` 가 실패했을 때 **무엇을 하면 되는지**까지 말한다.
+
+    예전 문구는 "다음 단계 행이 없다 — 상태와 설정이 어긋났다" 하나였다. 사실은
+    맞지만 **다음 행동이 없다.** 이 하네스의 원칙("막을 때는 최적 행동을 함께
+    준다")을 정작 여기서 어기고 있었다.
+
+    실제로 일어난 일은 이랬다(현장 보고 ①): 회차 도중에 `stages.json` 을 고쳐
+    단계를 끼웠다. 단계 행은 **회차가 열릴 때** 만들어지므로 설정에는 8개,
+    DB 에는 7개가 됐다. 그 상태에서 `path` 는 설정을 읽어 8노드를 보여주고,
+    `path add` 는 "이미 있는 단계다"라 하고, `advance` 는 이 오류를 냈다 —
+    셋 다 같은 원인인데 **어느 것도 그 사실을 말하지 않았다.**
+
+    행이 없는 것 자체는 고장이 아니라 방어선이다(위 `_enter` 주석). 고칠 것은
+    판정이 아니라 **말**이다.
+    """
+    have = set(stage_rows(con, lid))
+    late = [s["id"] for s in cfg["stages"]
+            if s["id"] not in have and not s.get("__dyn__")]
+    if not late:
+        return t("다음 단계 행이 없다 — 상태와 설정이 어긋났다. `harness path` 로 "
+                 "이번 회차의 그래프를 확인하라.")
+    return t("설정(`stages.json`)에는 있는데 **이번 회차의 그래프에는 없는** "
+             "단계가 있다: %s. 단계 행은 회차가 열릴 때 만들어지므로, 회차 도중에 "
+             "설정에 끼운 단계는 **다음 회차부터** 반영된다. 둘 중 하나를 골라라 — "
+             "① 지금 필요하면 설정에서 그 단계를 빼고 `harness path add <id> "
+             "--after <앵커> --reason \"...\"` 로 이번 회차에 더한다(회차 한정). "
+             "② 다음 회차부터면 그대로 두고 `harness advance --cycle` 로 회차를 "
+             "닫는다.") % ", ".join(late)
 
 
 def _enter(ctx, dest_idx):

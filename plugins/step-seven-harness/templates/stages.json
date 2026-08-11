@@ -91,7 +91,7 @@
       "require": {
         "class_in_stage_write": true
       },
-      "deny": "현재 단계 {stage} 에서는 '{cls}' 클래스 경로에 쓸 수 없다 ({rel}). 허용: {allowed}. 임시 출력은 리포 밖(`/tmp`)이나 `.dev/log/` 아래(파일명 접두사 규칙)로 보내면 된다. 단계를 진행하려면 `.claude/harness/bin/harness advance`, 건너뛰려면 `... skip <stage> --reason \"...\"`."
+      "deny": "현재 단계 {stage} 에서는 '{cls}' 클래스 경로에 쓸 수 없다 ({rel}). 허용: {allowed}. 임시 출력은 리포 밖(`/tmp`)이나 `.dev/log/` 아래(파일명 접두사 규칙)로 보내면 된다. 단계를 진행하려면 `.claude/harness/bin/harness advance`, 건너뛰려면 `... skip <stage> --reason \"...\"`.{add_node}"
     },
     {
       "id": "new_toplevel",

@@ -3864,6 +3864,96 @@ BC="$(frb "bash -c \"echo 'ls .claude/harness/ 2>&1'\"")"
 check "bash -c 는 코드라 묻는다" '"ask"' "$BC"
 check_absent "그래도 막지는 않는다" '"deny"' "$BC"
 
+echo "  -- 4차 §1 회차 도중 stages.json 에 끼운 단계 (세 자리가 같은 원인을 말한다)"
+# 단계 행은 **회차가 열릴 때** 만들어진다. 회차 도중에 설정에 단계를 끼우면
+# 설정 8 · DB 7 이 되고, 예전에는 세 명령이 각자 다른 거짓말을 했다:
+#   path       → 8노드를 그냥 보여준다 (갈 수 있는 것처럼)
+#   path add   → "이미 있는 단계다 — 다른 이름을 써라" (이름 문제가 아니다)
+#   advance    → "다음 단계 행이 없다" (무엇을 하라는 말이 없다)
+LT="$(mktemp -d)"
+(cd "$LT" && git init -q . && python3 "$ENGINE" init >/dev/null)
+lt() { (cd "$LT" && python3 "$ENGINE" "$@" 2>&1) || true; }
+lt loop intent x >/dev/null; lt loop done-when y >/dev/null; lt advance >/dev/null
+python3 -c "
+import json, sys
+p = sys.argv[1] + '/.claude/harness/stages.json'
+c = json.load(open(p, encoding='utf-8'))
+i = [s['id'] for s in c['stages']].index('verification')
+c['stages'].insert(i, {'id':'review','label':'Review','summary':'적대적 리뷰',
+                       'write':['dev'],'exit_criteria':[],'stop_requires':[]})
+json.dump(c, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)" "$LT"
+LTP="$(lt path)"
+check "path 가 못 가는 노드를 구분해 보여준다" '이번 회차 그래프에 없다' "$LTP"
+check "왜 그런지와 언제 되는지를 말한다" '다음 회차부터' "$LTP"
+LTA="$(lt path add review --after execution --reason x)"
+check_absent "이름을 바꾸라는 거짓 안내를 하지 않는다" '다른 이름을 써라' "$LTA"
+check "설정에는 있지만 회차에는 없다고 말한다" '이번 회차의 그래프에는 없다' "$LTA"
+# advance 로 그 자리까지 밀고 가서 같은 원인을 같은 말로 받는지 본다
+LTPFX="$( (cd "$LT" && python3 "$ENGINE" status --json) | jq1 prefix | tr -d '"')"
+mkdir -p "$LT/.dev/plan" && printf '# p\n' > "$LT/.dev/plan/${LTPFX}p.md"
+lt advance >/dev/null; lt advance >/dev/null
+lt approve-plan ".dev/plan/${LTPFX}p.md" >/dev/null; lt advance >/dev/null
+LTADV="$(lt advance)"
+check "advance 도 같은 원인을 말한다" '이번 회차의 그래프에는 없는' "$LTADV"
+check "advance 가 두 갈래를 제시한다" 'advance --cycle' "$LTADV"
+check_absent "원시 traceback 을 내지 않는다" 'Traceback' "$LTADV"
+rm -rf "$LT"
+
+echo "  -- 4차 §2 채울 수 없는 종료 조건을 진단한다 (예전에는 완전히 조용했다)"
+DM="$(mktemp -d)"
+(cd "$DM" && git init -q . && python3 "$ENGINE" init >/dev/null)
+python3 -c "
+import json, sys
+p = sys.argv[1] + '/.claude/harness/stages.json'
+c = json.load(open(p, encoding='utf-8'))
+c['folder_rules']['dev_subdirs'] = [x for x in c['folder_rules']['dev_subdirs'] if x != 'review']
+json.dump(c, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)" "$DM"
+DMS="$( (cd "$DM" && python3 "$ENGINE" status 2>&1) )"
+check "채울 수 없는 조건을 잡는다" '이 조건은 채울 수 없다' "$DMS"
+check "어느 폴더가 없는지 말한다" "dev_subdirs 에 'review' 가 없다" "$DMS"
+check "고칠 방법을 준다" 'dev_subdirs 에 넣거나' "$DMS"
+rm -rf "$DM"
+# 오진 없음 — 갓 설치한 저장소는 조용해야 한다
+DM2="$(mktemp -d)"
+(cd "$DM2" && git init -q . && python3 "$ENGINE" init >/dev/null)
+check_absent "정상 설치에는 오진하지 않는다" '채울 수 없다' "$( (cd "$DM2" && python3 "$ENGINE" status 2>&1) )"
+# **덜어낸 것은 문제 삼지 않는다.** 조건 자체를 지우는 것은 마찰을 줄이는 정상
+# 행위다 — 템플릿과 대조하면 그 자유를 빼앗는다. 모순만 본다.
+DM3="$(mktemp -d)"
+(cd "$DM3" && git init -q . && python3 "$ENGINE" init >/dev/null)
+python3 -c "
+import json, sys
+p = sys.argv[1] + '/.claude/harness/stages.json'
+c = json.load(open(p, encoding='utf-8'))
+del c['criteria']['review_recorded']
+c['folder_rules']['dev_subdirs'] = [x for x in c['folder_rules']['dev_subdirs'] if x != 'review']
+json.dump(c, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)" "$DM3"
+check_absent "조건째로 덜어냈으면 조용하다" '채울 수 없다' \
+  "$( (cd "$DM3" && python3 "$ENGINE" status 2>&1) )"
+rm -rf "$DM3"
+rm -rf "$DM2"
+
+echo "  -- 4차 doctor · 세 번째 문"
+DR="$(mktemp -d)"
+(cd "$DR" && git init -q . && mkdir -p src && python3 "$ENGINE" init >/dev/null)
+check "doctor 가 status 와 같은 일을 한다" '자기검사' "$( (cd "$DR" && python3 "$ENGINE" doctor 2>&1) )"
+drw() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Write","tool_input":{"file_path":"src/a.py"}}' "$DR" \
+  | CLAUDE_PROJECT_DIR="$DR" python3 "$ENGINE" hook; }
+check "차단 메시지가 세 번째 문을 안내한다" 'path add' "$(drw)"
+# **안 되는 때는 말하지 않는다.** 계획 승인 뒤에는 그래프가 고정되므로
+# `path add` 를 권하면 "하라고 해서 했는데 거부당하는" 새 마찰이 된다.
+(cd "$DR" && python3 "$ENGINE" loop intent x >/dev/null 2>&1
+ python3 "$ENGINE" loop done-when y >/dev/null 2>&1
+ python3 "$ENGINE" advance >/dev/null 2>&1; python3 "$ENGINE" advance >/dev/null 2>&1
+ python3 "$ENGINE" advance >/dev/null 2>&1)
+DRPFX="$( (cd "$DR" && python3 "$ENGINE" status --json) | jq1 prefix | tr -d '"')"
+mkdir -p "$DR/.dev/plan" && printf '# p\n' > "$DR/.dev/plan/${DRPFX}p.md"
+(cd "$DR" && python3 "$ENGINE" approve-plan ".dev/plan/${DRPFX}p.md" >/dev/null 2>&1)
+DRL="$(drw)"
+check_absent "승인 뒤에는 path add 를 권하지 않는다" 'path add' "$DRL"
+check "대신 다음 회차를 가리킨다" 'advance --cycle' "$DRL"
+rm -rf "$DR"
+
 echo "  -- §7 이미 무시되는 경로에 다시 붙이지 않는다"
 FG="$(mktemp -d)"
 (cd "$FG" && git init -q .)
