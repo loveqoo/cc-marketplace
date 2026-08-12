@@ -261,18 +261,24 @@ for cmd, want in (
 print("셸이 펼치는 것은 우리도 펼친다 (glob)")
 # glob 문자를 "해석 불가" 로 통과시킨 것이 실패 개방이었다 — 한 글자로 바닥값·격리·
 # 래퍼 무결성이 전부 뚫렸고 사전 승인된 래퍼가 남의 코드로 실행되는 것까지 재현됐다.
+# 0.75.0: 글롭을 펼치는 것은 그대로다 — 다만 **확실한 자리**에서만 판정한다.
+# `rm` 류의 인자와 리다이렉트 대상, `of=`. `sed`·`mv`·`cp` 는 어느 인자가
+# 대상인지 문법이 답하지 않아 포기했다.
 for cmd in ("rm .claude/harness/bi?/harness",
             "rm -rf .clau*",
             "rm -rf .claude/harnes*",
-            "sed -i s/a/b/ .claude/harness/bi?/harness",
-            "mv .claude/harness/bi?/harness /tmp/x",
-            "cp /tmp/evil .claude/harness/bi?/harness",
-            "cd .claude/harness/b?n && rm harness",
             "rm -rf .claude/harness/*",
             "printf x > .claude/harness/b*n/harness",
             "rm .claude/harness/*.db"):
     ck("glob 우회를 막는다: %s" % cmd[:40],
        h.bash_protected_hit(cfg, root, cmd) is not None)
+# 포기 목록도 못 박는다 — "왜 안 잡히지" 로 되살리지 않도록.
+for cmd in ("sed -i s/a/b/ .claude/harness/bi?/harness",
+            "mv .claude/harness/bi?/harness /tmp/x",
+            "cp /tmp/evil .claude/harness/bi?/harness",
+            "cd .claude/harness/b?n && rm harness"):
+    ck("포기(인자 위치를 모른다): %s" % cmd[:36],
+       h.bash_protected_hit(cfg, root, cmd) is None)
 # 아무것도 안 맞는 glob 은 셸도 리터럴로 넘긴다 — 우리도 그렇게 본다.
 ck("맞는 것이 없는 glob 은 원래 토큰", h.sh_expand(root, "nope*.xyz") == ["nope*.xyz"])
 ck("glob 이 없으면 그대로", h.sh_expand(root, "src/a.py") == ["src/a.py"])
@@ -297,8 +303,10 @@ for cmd, want in (("find . -name harness.db -delete", True),
     ck("%s%s" % ("묻는다  " if want else "안 묻는다", cmd), got == want,
        "실제로는 %s" % ("물었다" if got else "안 물었다"))
 # 대상이 문자열에 있으면 묻지 않고 **막는다** — 그쪽이 언제나 낫다.
-ck("대상이 분명하면 바닥값이 막는다",
-   h.bash_protected_hit(cfg, root, "find .claude/harness -delete") is not None)
+# `find … -delete` 는 대상이 실행 결과 안에 있다 — 경로 판정으로는 못 잡고,
+# `bash_opaque` 가 **막지 않고 묻는다**(위 단정이 그것을 확인한다).
+ck("find 는 경로 판정으로 잡지 않는다",
+   h.bash_protected_hit(cfg, root, "find .claude/harness -delete") is None)
 ck("정상 명령은 바닥값에 걸리지 않는다",
    h.bash_protected_hit(cfg, root, "find . -name '*.pyc' -delete") is None)
 
@@ -651,60 +659,66 @@ finally:
 # 4회차가 바닥값을 **세 방향**에서 뚫었고 전부 실행까지 재현됐다. 셋 다 토큰으로는
 # 경로가 아니지만 문자열에는 그대로 들어 있었다. 확장을 하나씩 구현하는 대신
 # 원문을 보고 **묻는다**. 여기서 양방향을 못 박는다.
-print("== 원문에 바닥값이 보이면 묻는다 (셸을 재구현하지 않는다)")
-for cmd in ('cp evil "$(pwd)/.claude/harness/bin/harness"',
-            "cp evil `pwd`/.claude/harness/bin/harness",
-            "cp evil $PWD/.claude/harness/bin/harness",
-            "cp evil $'.claude/harness/bin/harness'",
-            'python3 -c "open(\'.claude/harness/harness.db\',\'w\')"',
-            "perl -e \"unlink q(.claude/harness/harness.db)\"",
-            "rsync evil .claude/harness/bin/harness",
-            "gzip .claude/harness/harness.db",
-            "D=.claude/harness/bin; cp evil $D/harness"):
-    ck("  잡는다: %s" % cmd[:44], h.floor_named(cfg, cmd))
+print("== 원문 감시는 판정에서 빠졌다 (0.75.0) — 확실한 자리만 남긴다")
+# 예전에는 "원문에 바닥값 이름이 보이면 묻는다" 였다. 이름이 보이는 것은 확실하지만
+# **그 명령이 그것을 쓰는지는 모른다.** 실사용 589개에서 이 물음이 멈춘 6건은 전부
+# 조회·백업·하네스 자체 호출이었다(진짜 쓰기 0건).
+#
+# 이제 남는 것은 문법이 대상임을 증명하는 자리뿐이다. 양방향을 못 박는다.
+for cmd, want in (
+        # 확실 — 막는다
+        ("rm .claude/harness/bin/harness", True),
+        ("rm -rf .claude", True),
+        ("cat /tmp/evil > .claude/harness/bin/harness", True),
+        ("printf x >|.claude/harness/harness.db", True),
+        ("dd if=/dev/null of=.claude/harness/harness.db", True),
+        ("shred .claude/harness/bin/harness", True),
+        # 포기 — 어느 인자가 대상인지 문법이 모른다
+        ('cp evil "$(pwd)/.claude/harness/bin/harness"', False),
+        ("cp evil $PWD/.claude/harness/bin/harness", False),
+        ("mv evil .claude/harness/bin/harness", False),
+        ("rsync evil .claude/harness/bin/harness", False),
+        ("gzip .claude/harness/harness.db", False),
+        ("perl -e \"unlink q(.claude/harness/harness.db)\"", False),
+        ('python3 -c "open(\'.claude/harness/harness.db\',\'w\')"', False),
+        ("D=.claude/harness/bin; cp evil $D/harness", False),
+        # 정상 작업 — 예전에도 지금도 통과
+        (".claude/harness/bin/harness status", False),
+        ("git add -A", False), ("npm test", False),
+        ("cat .claude/harness/harness.db", False),
+        ("git check-ignore -v .claude/harness/harness.db", False),
+        ("cp .claude/harness/stages.json .dev/plan/x.bak", False)):
+    got = h.bash_protected_hit(cfg, root, cmd) is not None
+    ck("  %s: %s" % ("막는다" if want else "판정 안 함", cmd[:42]), got == want,
+       "실제로는 %s" % ("막았다" if got else "안 막았다"))
 
-# **실행은 언급이 아니다.** 여기가 과잉 차단이 되면 마찰이고, 마찰은 게이트를 끈다.
-for cmd in (".claude/harness/bin/harness status",
-            "python3 .claude/harness/bin/harness.py status",
-            "sh -c '.claude/harness/bin/harness advance'",
-            "git add -A", "npm test", "make build", "docker build -t x .",
-            "curl -sL https://example.com/x.tgz > /tmp/x.tgz",
-            "grep -rn foo src/", "ls .claude/harness",
-            # 읽기는 막지 않는다 (기존 설계). **엔진 기본값만** 면제된다.
-            "cat .claude/harness/harness.db",
-            "grep -rn x .claude/harness/bin/harness"):
-    ck("  지나간다: %s" % cmd[:44], not h.floor_named(cfg, cmd), h.floor_named(cfg, cmd))
-
-# 면제는 **하네스 실행 파일에만**. 처음에 "인터프리터의 다음 토큰" 으로 넓게
-# 뒀다가 `interpreters: [gzip]` + `gzip <DB>` 로 뚫렸다 — 4회차가 지적한
-# `skip=2` 구멍을 그대로 다시 만든 것이었다.
+# 설정으로 `readers`·`interpreters` 를 넓혀도 **확실한 자리는 그대로**다.
+# 예전에는 원문 감시가 그 방어를 맡았는데, 이제 리다이렉트·`rm` 자리가 맡는다.
 _wide = h.Cfg(dict(cfg))
 _wide["bash"] = dict(cfg["bash"], interpreters=list(cfg["bash"]["interpreters"]) + ["gzip"],
                      readers=list(cfg["bash"]["readers"]) + ["rsync"])
-ck("설정으로 readers 를 늘려도 원문 감시는 남는다",
-   h.floor_named(_wide, "rsync evil .claude/harness/bin/harness"))
-ck("설정으로 interpreters 를 늘려도 남는다",
-   h.floor_named(_wide, "gzip .claude/harness/harness.db"))
-# 면제는 **엔진 기본값** 이름에만. 설정으로 넓히는 길이 있으면 B#1 이 되살아난다.
-ck("readers 설정은 원문 감시 면제를 넓히지 못한다",
-   h.floor_named(_wide, "rsync .claude/harness/harness.db /tmp/x"))
-ck("리다이렉트가 붙으면 읽기가 아니다",
-   h.floor_named(cfg, "cat /tmp/evil > .claude/harness/bin/harness"))
+ck("readers 를 늘려도 리다이렉트 대상은 막힌다",
+   h.bash_protected_hit(_wide, root, "rsync x > .claude/harness/bin/harness") is not None)
+ck("interpreters 를 늘려도 rm 은 막힌다",
+   h.bash_protected_hit(_wide, root, "rm .claude/harness/harness.db") is not None)
 
 # **바닥값 판정은 하나다.** 원문 감시를 경로 분석 옆에 따로 두면 같은 질문에
 # 판정기가 둘이고, 하나만 게이트의 `entry` 에 들어가 나머지가 자기증명 밖에
 # 남는다 — ①에서 고친 모양을 그대로 다시 만드는 것이다.
 ck("경로를 특정하면 deny", h.floor_verdict(cfg, root, "rm " + h.ENGINE_REL)[0] == "deny")
-ck("원문에만 보이면 ask",
-   h.floor_verdict(cfg, root, 'cp evil "$(pwd)/.claude/harness/bin/harness"')[0] == "ask")
+# 0.75.0: 원문 감시를 판정에서 뺐다 — 이름이 보이는 것과 그것을 쓰는 것은 다르다.
+ck("원문에만 보이면 이제 판정하지 않는다",
+   h.floor_verdict(cfg, root, 'cp evil "$(pwd)/.claude/harness/bin/harness"')[0] is None)
 ck("아무것도 아니면 판정 없음",
    h.floor_verdict(cfg, root, "git add -A")[0] is None)
 _src = engine_src()
 _calls = (_src.count("floor_verdict(cfg, root, cmd)")
           - _src.count("def floor_verdict(cfg, root, cmd)"))
 ck("훅은 바닥값을 한 곳에서만 묻는다", _calls == 1, _calls)
-ck("옆에 남은 판정기가 없다",
-   _src.count("floor_named(cfg, cmd)") - _src.count("def floor_named(cfg, cmd)") == 1)
+# `floor_named` 는 판정에서 빠졌다. 정의만 남아 있고 아무도 부르지 않는다 —
+# 되살리려면 이 단정을 먼저 고쳐야 한다.
+ck("원문 감시는 판정에 쓰이지 않는다",
+   _src.count("floor_named(cfg, cmd)") - _src.count("def floor_named(cfg, cmd)") == 0)
 
 # --- 자기증명 규칙 자체 ---------------------------------------------------
 # 4회차: 이 강제 장치에 테스트가 없어서, `wants != {True, False}` 를 `if False:`

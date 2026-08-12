@@ -171,78 +171,21 @@ BASH_OPAQUE = (
 )
 
 
-# 바닥값 경로의 **문자열 형태**. 글롭을 떼고 접두사만 남긴다.
-FLOOR_TEXT = tuple(sorted({p.rstrip("*").rstrip("/") for p in SELF_LOCK}, key=len))
-
-
-FLOOR_RE = re.compile("|".join(re.escape(p) for p in FLOOR_TEXT))
-
-
-# 경로 토큰의 **나머지**를 먼저 삼킨다. `FLOOR_TEXT` 는 짧은 것부터라
-# `.claude/harness/bin` 이 먼저 맞고, 그 뒤 `/harness` 가 남는다.
-WORD_RE = re.compile(r"""[^\s'"]*['"]?\s+([A-Za-z][\w-]*)(?:\s+([A-Za-z][\w-]*))?""")
-
-
-def _invocation(cmd, at):
-    """`at` 위치에서 이어지는 것이 **하네스 호출**인가.
-
-    `<래퍼> status`, `python3 <엔진> advance`, `sh -c '<래퍼> skip …'` 은 전부
-    실행이지 언급이 아니다. 토큰 위치로 가르려 했더니 `sh -c '<래퍼> advance'`
-    가 과잉 차단됐다(실측). "무엇이 하네스 호출인가" 의 답은 `ctrl_known` 이
-    이미 갖고 있다 — **답이 둘이면 갈린다.** 그 답을 다시 쓴다.
-    """
-    m = WORD_RE.match(cmd, at)
-    if not m:
-        return False
-    one, two = m.group(1), m.group(2)
-    return ctrl_known(one) or (bool(two) and ctrl_known("%s %s" % (one, two)))
-
-
-def floor_named(cfg, cmd):
-    """명령 **원문**이 바닥값을 이름으로 부르나. 그 이름 또는 None.
-
-    왜 원문인가. 토큰 분석은 셸이 하는 일을 다시 구현해야 하고, 4회차 리뷰가
-    그것을 세 방향에서 뚫었다 — 전부 실행까지 재현됐다:
-
-        cp evil "$(pwd)/.claude/harness/bin/harness" && <래퍼> status
-        cp evil $'.claude/harness/bin/harness'
-        python3 -c "open('.claude/harness/harness.db','w')"
-
-    셋 다 토큰으로는 경로가 아니다. 명령 치환·ANSI-C 인용·인터프리터 인라인
-    코드를 `sh_expand` 가 펼치지 않기 때문이다. 그런데 **문자열에는 그대로
-    들어 있다.** 확장을 하나씩 구현하는 길은 목록을 늘리는 길이고, 그 목록에는
-    항상 다음 항목이 남는다.
-
-    막지 않는다 — 하네스에 이미 있는 어휘로 **묻는다**. `bash_opaque` 와 같은
-    정책이고 이유도 같다: 모르면 통과가 아니라 물음이다. 바닥값을 이름으로
-    부르는 명령은 드물다. 드문 것을 사람이 한 번 보는 비용은 작다.
-
-    **실행은 언급이 아니다.** 래퍼를 부르는 것(`<래퍼> status`)과 엔진을 돌리는
-    것(`python3 <엔진> status`)은 정상 동작이라 세지 않는다.
-    """
-    for seg in BASH_SPLIT.split(cmd):
-        # 읽기는 막지 않는다 — `cat <DB>` 까지 물으면 마찰이고, 마찰은 게이트를 끈다.
-        # **엔진 기본값만** 면제한다. `readers` 설정으로는 이 면제를 넓힐 수 없다:
-        # 그 길을 열면 `readers: ["rsync"]` 한 줄로 바닥값이 다시 열린다(4회차 B#1).
-        # 리다이렉트가 붙으면 읽기가 아니다 (`cat x > <래퍼>`).
-        toks = re.findall(r"\S+", seg)
-        i = 0
-        while i < len(toks) and ASSIGN_RE.match(toks[i]):
-            i += 1
-        if (i < len(toks)
-                and os.path.basename(toks[i].strip("\"'")) in BASH_READERS_DEFAULT):
-            # 읽기 명령은 **리다이렉트 대상만** 쓴다. `>` 유무로 가르면
-            # `ls … 2>&1` 이 변경 명령이 된다 (2차 현장 보고 §1).
-            wrote = redirect_targets(toks[i:])
-            if not wrote:
-                continue
-            # 쓰는 곳이 있으면 그 자리만 본다.
-            if not any(FLOOR_RE.search(w) for w in wrote):
-                continue
-        for m in FLOOR_RE.finditer(seg):
-            if not _invocation(seg, m.end()):
-                return m.group(0)
-    return None
+# ## 원문 감시(`floor_named`)를 **지웠다** (0.75.0)
+#
+# "명령 원문에 바닥값 이름이 보이면 묻는다" 는 규칙이었다. 이름이 보이는 것은
+# 확실하지만 **그 명령이 그것을 쓰는지는 모른다.** 실사용 589개에서 이 물음이
+# 멈춘 6건은 전부 조회·백업·하네스 자체 호출이었고, 진짜 쓰기는 하나도 없었다:
+#
+#     git diff --stat …                              ← 조회
+#     python3 - <<'PY' … json.load(open('.claude/…'))  ← 읽어서 비교
+#     cp .claude/harness/stages.json .dev/plan/…bak    ← 백업
+#     <래퍼> recall "stages.json 동기화 …"             ← 검색어에 이름이 있을 뿐
+#
+# 마지막 것이 분명하다 — 회고 검색어에 파일 이름을 적었다고 사람을 세웠다.
+#
+# 함께 지운 것: `FLOOR_RE`·`FLOOR_TEXT`·`WORD_RE`·`_invocation`. 전부 이 규칙만
+# 쓰던 것이다. 죽은 코드를 남기면 다음 사람이 되살릴 자리가 된다.
 
 
 def floor_verdict(cfg, root, cmd):
@@ -270,14 +213,23 @@ def floor_verdict(cfg, root, cmd):
             "바꾸는 명령인지 하네스가 판정하지 못했다. 바닥값은 엔진과 상태이고 "
             "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 읽기라면 허용해도 "
             "된다.") % unsure
-    named = floor_named(cfg, cmd)
-    if named:
-        return "ask", named, t(
-            "이 명령의 원문에 하네스 바닥값(%s)이 보이는데, 무엇을 대상으로 "
-            "삼는지 하네스가 특정하지 못했다. 셸 치환·인용·인터프리터 인라인 "
-            "코드가 섞이면 실행 시점에야 정해진다. 바닥값은 엔진과 상태이고 "
-            "사전 승인된 래퍼를 포함하므로 사람이 봐야 한다. 경로를 그대로 "
-            "적으면 하네스가 대신 판정한다.") % named
+    # ## 원문 감시(`floor_named`)를 **판정에서 뺐다** (0.75.0)
+    #
+    # "명령 원문에 바닥값 이름이 보이면 묻는다" 는 규칙이었다. 이름이 보이는 것은
+    # 확실하지만 **그 명령이 그것을 쓰는지는 모른다** — 그 물음이 실사용에서 멈춘
+    # 6건은 전부 조회·백업·하네스 자체 호출이었고, 진짜 쓰기는 하나도 없었다:
+    #
+    #     git diff --stat …                                   ← 조회
+    #     python3 - <<'PY' … json.load(open('.claude/…')) …    ← 읽어서 비교
+    #     cp .claude/harness/stages.json .dev/plan/…bak        ← 백업
+    #     <래퍼> recall "stages.json 동기화 …"                  ← 사유 문자열에 이름이 있을 뿐
+    #
+    # 마지막 것이 특히 분명하다 — 회고 검색어에 파일 이름을 적었다고 멈춰 세웠다.
+    #
+    # 확실하지 않으면 제한하지 않는다(POLICY 10). 바닥값을 지키는 것은 남은 셋이다:
+    # 리다이렉트 대상 · `rm` 류 인자 · 그리고 경로와 무관한 **내용 검사**
+    # (`wrapper_intact` 가 매 Bash 앞에서 래퍼를 대조해 복구·거절하고, DB 손상은
+    # 게이트가 꺼졌다고 소리를 낸다 — 둘 다 실측으로 확인했다).
     return None, None, None
 
 
@@ -350,10 +302,22 @@ def bash_unresolved(cfg, cmd):
         if benign_head(cfg, "readers", head, BASH_READERS_DEFAULT) \
                 and not redirect_targets(toks[i:]):
             continue
-        # 쪼개지 못한 변경 세그먼트. `bash_writes` 는 여기서 아무 대상도 모으지
-        # 않으므로, 받아 주지 않으면 단계 규칙이 조용히 사라진다.
-        if sh_tokens(seg) is None:
-            return t("따옴표가 맞지 않아 이 명령을 토큰으로 쪼갤 수 없다")
+        # ## 쪼개지 못했다고 되묻던 규칙을 **지웠다** (0.75.0)
+        #
+        # 실사용 589개 재생에서 남은 오탐 20건이 전부 이것이었다. 그리고 20건 모두
+        # **우리가 부순 조각**에 반응한 것이다 — `BASH_SPLIT` 이 따옴표 안의
+        # `;`·`|`·개행에서도 쪼개기 때문이다:
+        #
+        #     printf 'const bad: number = "not a number";\n…'   ← 문자열 안의 ;
+        #     SP=/private/…/scratchpad ⏎ node --input-type=module -e "…"
+        #
+        # 이 물음은 위험을 감지한 적이 없다. **우리 파서의 한계를 감지했다.**
+        #
+        # 쪼개기를 인용 인식으로 고치는 길도 있었다(`shlex(punctuation_chars=True)`
+        # 로 되는 것을 확인했다). 하지만 순서가 틀렸다 — 기준은 "확실하지 않으면
+        # 제한을 포기한다" 이고, 정확하게 만드는 투자는 그 다음이다. 포기하고 나면
+        # 이 결함이 만드는 오탐도 함께 사라진다: 못 쪼갠 조각으로 아무 판정도
+        # 하지 않으니까.
         # ## 셸 확장을 되묻던 규칙을 **지웠다** (0.74.0)
         #
         # 실사용 589개 명령을 재생해 재보니 이 규칙 하나가 멈춤의 **절반 이상**
@@ -447,7 +411,13 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
                 out.append(raw.split("=", 1)[1].lstrip("<>|&"))
         return [it for it in out if it]
 
-    def protected(tok):
+    def protected(tok, contains=False):
+        """`contains` 는 **인자를 전부 지우는 명령**에서만 켠다.
+
+        `rm -rf .claude` 는 바닥값을 담은 폴더째 지운다 — 담고 있다는 것은 문자열
+        사실이라 확실하다. 반대로 `git check-ignore .claude/…` 에 같은 판정을 걸면
+        조회가 막힌다. 그래서 **명령이 인자를 지운다는 것을 아는 자리에서만** 본다.
+        """
         use = pats
         for cand in candidates(tok):
             # 문자열 그대로와 symlink 를 푼 것 **둘 다** 본다 — 별칭 경로로 바닥값을
@@ -463,21 +433,23 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
                 # 바닥값은 대소문자를 무시하고도 본다 (macOS 에서 BIN == bin 이다).
                 if self_lock_hit(rel):
                     return rel
-                # 보호 경로를 **담고 있는** 디렉터리도 변경 명령의 대상이 될 수 없다.
-                # `find .claude/harness -delete` 나 `rm -rf .claude` 가 그 경우다.
-                # 바닥값에 대해서는 설정 mutating 판정만 믿지 않는다 — `mutator_pattern`
-                # 을 `(?!)` 같은 '문법은 맞고 아무것도 안 맞는' 정규식으로 두면 이
-                # 검사가 통째로 꺼졌다. 그래서 코드 상수를 합친 `floor_mut` 로 본다.
-                low = rel.lower()
-                if any(p.lower().startswith(low + "/") for p in floor):
-                    if floor_mut:
-                        return rel
-                    # 변경 명령이 아니면(또는 모르는 명령이면) 확정하지 않고
-                    # 모아 둔다 — `floor_verdict` 가 ask 로 올린다.
-                    if rel not in unsure:
-                        unsure.append(rel)
-                if mutating and any(p.startswith(rel + "/") for p in use):
+                if contains and any(f.lower().startswith(rel.lower() + "/")
+                                    for f in floor):
                     return rel
+                # ## 담은 폴더 판정을 **모르는 명령에서는** 지웠다 (0.75.0)
+                #
+                # `.claude` 를 대상으로 삼는 명령을 전부 의심했다. 그런데 실사용
+                # 재생에서 걸린 것은 조회뿐이었다:
+                #
+                #     git check-ignore -v .claude/harness/harness.db   ← 무시되나 묻는 것
+                #     git add -n .claude/harness/                       ← dry-run
+                #     rm -rf "$COPY"   (COPY=/private/tmp/…)            ← 저장소 밖
+                #
+                # "이 명령이 이 폴더를 바꾸는가" 는 프로그램 의미론이고 우리는
+                # 모른다. 모르면 제한하지 않는다(POLICY 10).
+                #
+                # 담긴 것(`rm -rf .claude`)은 이제 `rm` 인자 판정이 받는다 — 그건
+                # 확실한 자리다.
         return None
 
     for seg in BASH_SPLIT.split(cmd):
@@ -487,10 +459,12 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
         # 앞의 `VAR=값` 은 명령이 아니라 대입이다. **값 안의 경로를 검사하고** 넘긴다.
         # 예전에는 버리기만 해서 `DB=<보호경로>; rm $DB` 가 그대로 지나갔다 — 주석은
         # "검사 대상으로 남긴다" 였는데 코드가 달랐다.
+        # **대입은 아무것도 쓰지 않는다.** 예전에는 대입값도 검사했다
+        # (`DB=<바닥값>; rm $DB` 를 잡으려고). 그런데 `D=.claude/harness/bin` 은
+        # 변수 하나를 정할 뿐이고, 그 뒤에 무엇이 오는지는 실행해야 안다 —
+        # 이름이 보인다는 이유로 막는 것은 원문 감시와 같은 종류다(0.75.0 에서
+        # 함께 지웠다). 뒤의 `rm "$D/harness"` 는 값을 모르므로 포기 목록이다.
         while toks and ASSIGN_RE.match(toks[0]):
-            hit = protected(toks[0])
-            if hit:
-                return hit, None
             toks = toks[1:]
         if not toks:
             continue
@@ -540,10 +514,50 @@ def bash_protected_scan(cfg, root, cmd, depth=0):
                 if uns and uns not in unsure:
                     unsure.append(uns)
             continue
-        for tok in toks[2 if interp else 1:]:
-            hit = protected(tok)
+        # ## 인자는 **문법이 대상임을 증명한 자리만** 본다 (0.75.0)
+        #
+        # 예전에는 모든 인자를 훑었다. 그러면 "어느 인자가 대상인가" 를 아는 척해야
+        # 하는데, 우리는 모른다. 실사용 재생이 그 대가를 보여줬다 — deny 네 건이
+        # **전부 오탐**이었다:
+        #
+        #     cp .claude/harness/bin/defaults.json .claude/harness/stages.json
+        #       → 막힌 것은 **읽는 쪽**(defaults.json)이었다. 쓰는 쪽은 고쳐도 되는
+        #         파일(stages.json)인데 이유가 뒤바뀐 채 막혔다
+        #     git check-ignore -v .claude/harness/harness.db     ← 조회
+        #     git add -n .claude/harness/                        ← dry-run
+        #     rm -rf "$COPY"  (COPY=/private/tmp/…)              ← 저장소 밖
+        #
+        # `cp` 와 `cp -t` 의 차이, `git` 하위 명령이 쓰는지 조회하는지 — 전부 문법
+        # 밖이다. 표를 만들면 그 표에 항상 다음 항목이 남는다(이미 세 번 틀렸다).
+        #
+        # 그래서 확실한 두 자리만 남긴다:
+        #   · 리다이렉트 대상   — 문법이 쓰기임을 증명한다 (위 루프가 이미 검사)
+        #   · `rm` 류의 인자    — 인자를 **전부** 지운다. 어느 것인지 물을 필요 없다
+        #
+        # 포기해도 래퍼는 안 뚫린다 — `wrapper_intact` 가 **내용**을 대조해 매 Bash
+        # 앞에서 복구하고 거절한다(실측). DB 손상도 게이트를 끄되 소리를 낸다.
+        # 신뢰를 경로가 아니라 내용에 걸어 둔 그 설계가 여기서 값을 한다.
+        # 리다이렉트 대상은 **모든 명령**에서 본다. 문법이 쓰기임을 증명하므로
+        # 명령이 무엇인지 알 필요가 없다. (예전에는 읽기 명령 가지에만 있었고,
+        # 인자 판정을 좁히자 `printf x >| <DB>` 가 빠졌다 — 실측이 잡았다.)
+        for w in redirect_targets(toks):
+            hit = protected(w)
             if hit:
                 return hit, None
+        # `of=파일` 은 **대상이 자기를 밝히는** 문법이다(dd). `cp` 처럼 몇 번째
+        # 인자인지 추측할 필요가 없어서, 리다이렉트와 같은 확실함을 가진다.
+        for tok in toks[1:]:
+            if tok.startswith("of="):
+                hit = protected(tok[3:])
+                if hit:
+                    return hit, None
+        if head in DELETES_ARGS:
+            for tok in toks[1:]:
+                if tok.startswith("-"):
+                    continue                  # 플래그는 대상이 아니다
+                hit = protected(tok, contains=True)
+                if hit:
+                    return hit, None
     return None, (unsure[0] if unsure else None)
 
 
@@ -644,6 +658,12 @@ def reader_writes(cfg, toks):
 # 이 명령들은 **마지막 경로만** 바꾼다. `cp src/a.py /tmp/b` 가 src 를 쓴다고 보면
 # 읽기만 하는 명령이 거부되고, 그 오판이 곧 마찰이다. `sed`·`perl` 도 여기 있다 —
 # 앞 인자는 파일이 아니라 식(`s/x/y/`)이다. `mv` 는 없다: 원본도 사라진다.
+# 인자를 **전부** 지우거나 비우는 명령. 어느 인자가 대상인지 물을 필요가 없어서,
+# 바닥값 판정을 확실하게 걸 수 있는 유일한 자리다. `cp`·`mv`·`ln` 은 여기 없다 —
+# 그것들은 어느 인자가 대상인지 문법이 답하지 않는다(0.75.0 에서 포기했다).
+DELETES_ARGS = ("rm", "shred", "truncate")
+
+
 BASH_TARGET_LAST = ("cp", "ln", "install", "sed", "perl")
 
 

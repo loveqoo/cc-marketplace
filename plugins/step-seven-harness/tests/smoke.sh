@@ -749,12 +749,22 @@ check "tidy 를 사용법에 적는다" 'tidy  ' "$(cli help)"
 echo "== Bash 로 하네스 자신을 건드릴 수 없다"
 check "rm 으로 DB 삭제 차단" 'Bash 로도 변경할 수 없다' \
   "$(hook "$(B 'rm .claude/harness/harness.db' default)")"
-check "sed -i 로 엔진 변경 차단" 'Bash 로도 변경할 수 없다' \
+# **포기 목록** (0.75.0). `sed`·`sqlite3`·`cp`·`mv`·`ln`·`tee` 는 어느 인자가
+# 대상인지 문법이 답하지 않는다 — 실측에서 **읽는 쪽**을 대상으로 잡았다
+# (`cp <원본> <사본>` 에서 원본이 막혔다). 확실하지 않으면 제한하지 않는다.
+# 래퍼는 경로가 아니라 **내용 검사**가 지킨다(아래 절에서 단정한다).
+check_empty "포기: sed -i 로 엔진 변경" \
   "$(hook "$(B 'sed -i s/a/b/ .claude/harness/bin/harness.py' default)")"
 check "리다이렉트로 LEARNED.md 변경 차단" 'Bash 로도 변경할 수 없다' \
   "$(hook "$(B 'echo x > .claude/harness/LEARNED.md' default)")"
-check "sqlite3 로 DB 변경 차단" 'Bash 로도 변경할 수 없다' \
+check_empty "포기: sqlite3 로 DB 변경" \
   "$(hook "$(B 'sqlite3 .claude/harness/harness.db \"UPDATE meta SET v=1\"' default)")"
+check_empty "포기: cp 로 래퍼 덮어쓰기" \
+  "$(hook "$(B 'cp evil .claude/harness/bin/harness' default)")"
+check_empty "포기: 인라인 코드로 DB" \
+  "$(hook "$(B 'python3 -c \"open(1)\"' default)")"
+check "dd of= 는 대상이 자기를 밝히므로 막는다" 'Bash 로도 변경할 수 없다' \
+  "$(hook "$(B 'dd if=/dev/null of=.claude/harness/harness.db' default)")"
 check "제어 명령을 뒤에 붙여 회피할 수 없다" 'Bash 로도 변경할 수 없다' \
   "$(hook "$(B 'rm .claude/harness/bin/harness && echo ok' default)")"
 check "allow 로도 열리지 않는다고 알린다" 'allow` 로도 열리지 않는다' \
@@ -1204,13 +1214,22 @@ check_empty "동의 불필요 명령은 조용하다 (metrics)" "$(gb "$W_ metri
 check_empty "동의 불필요 명령은 조용하다 (recall)" "$(gb "$W_ recall npm test")"
 
 echo "== Bash 보호 경로: 리다이렉트·옵션값·find 액션"
-for BAD in "find .claude/harness -name harness.db -delete" \
-           "dd if=/dev/null of=.claude/harness/harness.db" \
+# 0.75.0 — **문법이 대상임을 증명한 자리만** 막는다.
+for BAD in "dd if=/dev/null of=.claude/harness/harness.db" \
            "printf x >|.claude/harness/LEARNED.md" \
-           "find .claude/harness -name '*.py' -exec rm {} +" \
            "rm -rf .claude" \
-           "ln -sf /dev/null .claude/harness/harness.db"; do
+           "rm .claude/harness/harness.db"; do
   check "차단: $BAD" 'Bash 로도 변경할 수 없다' "$(gb "$BAD")"
+done
+# **포기 목록.** 대상이 실행 결과(`find`)나 인자 순서(`ln`)에 있어 문법이 답하지
+# 않는다. 되살리려면 도구별 표가 필요하고, 그 표는 이미 세 번 틀렸다.
+check_empty "포기: ln -sf (인자 순서를 문법이 모른다)" \
+  "$(gb "ln -sf /dev/null .claude/harness/harness.db")"
+# `find -delete`·`-exec` 는 **막지 않고 묻는다**(`bash_opaque`). 대상이 실행 결과
+# 안에 있다는 것 자체는 문법이 확정하므로, 판정이 아니라 가시성으로 남긴다.
+for ASKED in "find .claude/harness -name harness.db -delete" \
+             "find .claude/harness -name '*.py' -exec rm {} +"; do
+  check "묻는다(막지 않는다): $ASKED" '"ask"' "$(gb "$ASKED")"
 done
 # `mkdir -p .claude/hooks` 는 여기서 빠졌다. 이 절은 **바닥값**을 검사하는데 그 명령은
 # 바닥값이 아니라 **단계 규칙** 질문이고, 이제 Bash 도 그 규칙을 받는다. 아래 절에서
@@ -1281,7 +1300,7 @@ check "기록은 recall 로 다시 찾아진다" 'bash_write_seen' \
   "$( (cd "$SYMW" && python3 "$ENGINE" recall 2>&1) )"
 # 바닥값은 Bash 로도 그대로 막힌다 — 경계는 이 변경에서 하나도 약해지지 않는다.
 check "바닥값은 Bash 로도 막힌다" '"permissionDecision": "deny"' \
-  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ .claude/harness/bin/harness"}}' "$SYMW" \
+  "$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"rm .claude/harness/bin/harness"}}' "$SYMW" \
      | CLAUDE_PROJECT_DIR="$SYMW" python3 "$ENGINE" hook)"
 # 훅에서 실제로 `ask` 가 나오는지. 판정 함수만 검사하면 훅이 그 값을 안 쓸 수 있다.
 OPQ="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls | xargs rm"}}' "$SYMW" \
@@ -2502,8 +2521,12 @@ BS="$(mktemp -d)"
 bsb() { printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' "$BS" "$1" \
   | CLAUDE_PROJECT_DIR="$BS" python3 "$ENGINE" hook; }
 # 보호 경로를 직접 지정하면 패턴과 무관하게 막힌다 — fail-safe 다.
-check "보호 경로 직접 지정은 패턴과 무관하게 막힌다" '하네스 자신' \
-  "$(bsb "myrm .claude/harness/harness.db")"
+# 0.75.0: **모르는 명령의 인자는 판정하지 않는다.** `myrm` 이 인자를 지우는지
+# 우리는 모른다 — `git check-ignore <경로>`·`git add -n <경로>` 가 조회인 것과
+# 같은 이유다(실측에서 그 둘이 막혔다). 확실한 자리는 리다이렉트·`rm` 류·`of=` 다.
+check_empty "포기: 모르는 명령의 인자" "$(bsb "myrm .claude/harness/harness.db")"
+check "rm 은 인자를 전부 지우므로 막는다" '하네스 자신' \
+  "$(bsb "rm .claude/harness/harness.db")"
 # mutator_pattern 의 효과는 **바닥값이 아닌** 보호 경로의 부모에서만 관찰된다.
 # `.claude` 는 바닥값의 부모라 패턴과 무관하게 항상 막힌다(그게 요점이다).
 python3 -c "
@@ -2514,7 +2537,8 @@ cfg['folder_rules']['protected_paths'].append('vault/**')
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$BS/.claude/harness/stages.json"
 check_empty "모르는 명령의 부모 지정은 통과 (기본 패턴)" "$(bsb "myrm -rf vault")"
-check "바닥값의 부모는 패턴과 무관하게 막힌다" '하네스 자신' "$(bsb "myrm -rf .claude")"
+check "rm 은 바닥값의 부모도 막는다 (담으면 지워진다)" '하네스 자신' \
+  "$(bsb "rm -rf .claude")"
 python3 -c "
 import json, sys
 p = sys.argv[1]
@@ -2522,7 +2546,7 @@ cfg = json.load(open(p, encoding='utf-8'))
 cfg['bash']['mutator_pattern'] = r'(^|[;&|]\s*)(myrm|rm)\b'
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$BS/.claude/harness/stages.json"
-check "패턴에 넣으면 그 부모도 막는다" '하네스 자신' "$(bsb "myrm -rf vault")"
+check_empty "포기: 패턴에 넣어도 모르는 명령은 판정하지 않는다" "$(bsb "myrm -rf vault")"
 
 echo "  -- readers 도 설정이다 (읽기 명령은 막지 않는다)"
 check_empty "cat 은 보호 경로를 읽어도 통과" "$(bsb "cat .claude/harness/harness.db")"
@@ -2533,8 +2557,12 @@ cfg = json.load(open(p, encoding='utf-8'))
 cfg['bash']['readers'] = [r for r in cfg['bash']['readers'] if r != 'cat']
 json.dump(cfg, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 " "$BS/.claude/harness/stages.json"
-check "readers 에서 빼면 cat 도 막힌다" '하네스 자신' \
+# `readers` 설정은 이제 **리다이렉트 대상 검사 여부**만 가른다. 인자는 어떤
+# 명령이든 판정하지 않으므로, 목록에서 빼도 읽기는 그대로 통과한다.
+check_empty "포기: readers 에서 빼도 인자는 판정하지 않는다" \
   "$(bsb "cat .claude/harness/harness.db")"
+check "다만 리다이렉트 대상은 그대로 막는다" '하네스 자신' \
+  "$(bsb "cat x > .claude/harness/harness.db")"
 check "잘못된 정규식은 지적하고 기본값으로 돈다" '잘못된 정규식' \
   "$(python3 -c "
 import json, sys
@@ -3715,7 +3743,9 @@ check_empty "A...B 도 마찬가지" \
 check_empty "상위 폴더가 있어도 막지는 않는다" "$(frb 'touch ../a.py; touch src/a.py')"
 
 echo "  -- §3·§4 회귀: 해석하지 못하는 것은 여전히 묻는다"
-check "따옴표가 안 맞는 변경 명령은 묻는다" '쪼갤 수 없다' "$(frb 'touch "src/a.py')"
+# 0.75.0: 못 쪼갠 것을 되묻던 규칙을 지웠다 — 그 물음은 우리 파서의 한계에
+# 반응했다(실사용 오탐 20건이 전부 이것이었다).
+check_empty "포기: 쪼개지 못해도 되묻지 않는다" "$(frb 'touch "src/a.py')"
 # 변수를 썼다는 이유만으로 되묻던 규칙은 0.74.0 에서 지웠다. 실사용 589개를
 # 재생해 재보니 멈춤 126건 중 67건이 이것이었고, 대부분 이 모양이었다:
 #     SP=/private/tmp/claude-501/…/scratchpad/x.mjs
@@ -3726,7 +3756,7 @@ check_empty "변수를 썼다는 이유만으로는 되묻지 않는다" \
 check_empty "임시 경로를 변수로 빼도 통과한다 (실사용에서 가장 많던 모양)" \
   "$(frb 'SP=/private/tmp/claude-501/x/scratchpad; cp index.js "$SP/head.js"')"
 # 남은 계약: 원문에 바닥값 이름이 보이면 확장 안이라도 받는다.
-check "확장 안이라도 바닥값 이름이 보이면 받는다" '"ask"' \
+check_empty "포기: cp 는 확장 안이라도 판정하지 않는다" \
   "$(frb 'cp evil "$(pwd)/.claude/harness/harness.db"')"
 # **인라인이라는 이유만으로는 되묻지 않는다** (0.73.0 에서 규칙을 지웠다).
 # 두 번 좁혀 봤지만 정확해지지 않았다 — 조각을 잡으면 남의 조각도 잡히고,
@@ -3752,7 +3782,7 @@ check_empty "에이전트 정의 훑기" \
 check_empty "조각 조립은 놓친다 (선언된 범위 밖)" \
   "$(frb 'python3 -c "open(\".claude/harn\"+\"ess/x\",\"w\")"')"
 # 그리고 **이름 그대로 부르면 여전히 잡힌다** — 바닥값을 지키는 것은 이쪽이다.
-check "인라인이 바닥값을 이름으로 부르면 묻는다" '"ask"' \
+check_empty "포기: 인라인 코드는 판정하지 않는다" \
   "$(frb 'python3 -c "open(\".claude/harness/harness.db\",\"w\")"')"
 check "find -exec rm 은 바닥값에서 막힌다" '하네스 자신' \
   "$(frb "find .claude/harness -name '*.py' -exec rm {} +")"
@@ -3886,11 +3916,12 @@ check_empty "리다이렉트 없는 언급도 통과" \
   "$(frheredoc "needle = 'ls -la .claude/harness/'")"
 # ② 경계 — 본문이 **진짜로** 바닥값을 건드리면 그대로 받는다.
 #    이쪽이 빨개지지 않으면 위 셋은 "게이트를 껐다" 와 구분되지 않는다.
-check "본문이 DB 를 열면 묻는다" '"ask"' \
+check_empty "포기: 본문이 DB 를 열어도 통과" \
   "$(frheredoc "open('.claude/harness/harness.db','w')")"
-check "본문이 래퍼를 열면 묻는다" '"ask"' \
+# 래퍼는 내용 검사가 지킨다 — 아래 자기 잠금 절에서 변조·복구를 단정한다.
+check_empty "포기: 본문이 래퍼를 열어도 통과" \
   "$(frheredoc "open('.claude/harness/bin/harness','w')")"
-check "따옴표 없는 히어독도 받는다" '"ask"' \
+check_empty "포기: 따옴표 없는 히어독도 통과" \
   "$(frb "$(printf 'python3 - <<PY\nopen(%s.claude/harness/harness.db%s,%sw%s)\nPY' "'" "'" "'" "'")")"
 # 히어독으로 **파일을 쓰는** 것은 본문이 아니라 리다이렉트가 말한다 — 그대로 막힌다.
 check "히어독으로 래퍼를 덮어쓰면 막힌다" '"deny"' \
